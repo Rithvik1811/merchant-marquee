@@ -44,7 +44,7 @@ These are shared contracts — draft together, commit as versioned files (schema
 - [ ] `[BRAIN]` Scaffold FastAPI app + a bare LangGraph graph with one no-op node streaming a test event via `astream_events`; add `langgraph-checkpoint-postgres` dependency now
 - [ ] `[BODY]` Provision **managed Postgres-compatible DB** (PolarDB/RDS); confirm ECS can reach OSS, DB, and DashScope+Wan endpoints (latency/firewall/egress check)
 - [ ] `[BODY]` Scaffold Next.js/React/Tailwind app; WebSocket client that connects to KR's no-op endpoint and logs events
-- [ ] `[BODY]` Sketch optional seller-intake form (mood words, reference-ad link, "never do this," freeform) — pure UI, no backend dependency yet
+- [x] `[BODY]` Sketch optional seller-intake form (mood words, reference-ad link, "never do this," freeform) — pure UI, no backend dependency yet
 - [ ] `[JOINT]` Draft **C2** (co-author with KR) and first cut of **C3**
 
 **Exit criteria (both agree before Phase 1):** real Wan/HappyHorse test clips + written verdict; Qwen-Max/VL/TTS calls all return valid responses; Truth Extractor manual test passes; ECS/OSS/DB round-trip confirmed; frontend logs a live WS test event; C1/C2/C3-draft committed.
@@ -59,7 +59,7 @@ These are shared contracts — draft together, commit as versioned files (schema
 - [ ] `[BRAIN]` **Concept Agent** (4 script variants, forced-distinct framework/hook/emotional-trigger, beat timestamps, `grounding_truth_ids`)
 - [ ] `[BRAIN]` Critic Chain: **Hook-Checker** + **Pacing-Checker** (deterministic timing math)
 - [ ] `[BODY]` Wire the intake form (from Phase 0) to the real ingest endpoint
-- [ ] `[BODY]` Dashboard panel: `product_truths[]` list (proof grounding is real)
+- [x] `[BODY]` Dashboard panel: `product_truths[]` list (proof grounding is real)
 
 ### RR
 - [ ] `[BRAIN]` Wire `seller_direction` fields into `jobs`/`seller_direction` tables + C1 state (all fields nullable)
@@ -68,8 +68,8 @@ These are shared contracts — draft together, commit as versioned files (schema
 - [ ] `[BRAIN]` **Meta-Critic** (weighted composite: hook 25/pacing 20/completion 20 — now Body-Checker-backed/CTA 20/tone 15%, cross-pollinate hook+body+CTA using Body-Checker's per-variant score, re-derive contiguous beat timestamps for the merge, full reasoning trace); emit `truth_extracted`/`critic_score` events per C2
 - [ ] `[BRAIN]` **Merge Coherence Validator** *(new — TECHNICAL_DOCUMENTATION.md §5.4.7, separate node from Meta-Critic)*: (a) re-run the Pacing-Checker's deterministic timing math against the merged script's re-derived beats — one repair-and-recheck attempt, then treat as failed; (b) a blind/cold independent Qwen-Plus coherence read (no merge rationale or source-variant info in its prompt) scoring voice/POV consistency, promise-payoff match, and register-shift at the two stitch points; on failure, **route by failure type** — voice/register failures to the Copy Editor, promise-payoff failures back to the Meta-Critic naming the flagged clash — then fall back to the single highest composite-scoring variant if the routed repair's re-check still fails; append every attempt to `merge_attempts[]`/`reasoning_trace`. **This is the fix for "the Meta-Critic grades its own merge" — the pass/fail call must live in this separate node, not inside the Meta-Critic's own call.**
 - [ ] `[BRAIN]` **Copy Editor** *(new — TECHNICAL_DOCUMENTATION.md §5.4.8, required repair node, not optional)*: a Qwen-Plus call that fires when the Merge Coherence Validator flags a voice/register-consistency failure at the hook→body or body→CTA seam. Constrained, in-place polish only — may edit only the flagged transition text, must preserve every `grounding_truth_ids` claim and the single CTA verb, must stay within ~±10% of the original seam's word count so beat timing holds. Distinct node from both the Concept Agent (the writer) and the Meta-Critic (the merge-builder) — this is a copy-edit, not a rewrite. Output includes a before/after `original_seam_text`/`revised_seam_text` record for the trace. The patched merge is sent back through the Merge Coherence Validator for a full re-check (same retry slot as the existing swap path, not a new loop); a second failure falls back to the single highest composite-scoring variant exactly as the existing fallback does. Promise-payoff failures (missing content, not a voice mismatch) continue to use the existing Meta-Critic swap-to-second-best-piece path instead — the Copy Editor is never used for that failure type.
-- [ ] `[BODY]` Minimal job-submission form (photos + one-line brief + optional intake) → ingest stub
-- [ ] `[BODY]` Dashboard panel: critic reasoning trace + per-variant score table (now including the completion axis + a merge-attempts/validator-verdict view — including which repair path fired, Copy Editor seam polish or Meta-Critic swap, with before/after seam text when a copy-edit occurred — so a retry or fallback is visible, not hidden)
+- [x] `[BODY]` Minimal job-submission form (photos + one-line brief + optional intake) → ingest stub
+- [x] `[BODY]` Dashboard panel: critic reasoning trace + per-variant score table (now including the completion axis + a merge-attempts/validator-verdict view — including which repair path fired, Copy Editor seam polish or Meta-Critic swap, with before/after seam text when a copy-edit occurred — so a retry or fallback is visible, not hidden)
 
 **Exit criteria:** real brief → 6+ product truths → 4 valid grounded script variants, each with a real completion/body score → one merged winning script whose merge has been independently re-validated (pacing re-check + blind coherence read passed, or a visible repair — Copy Editor seam polish or Meta-Critic swap, per which failure fired — followed by re-validation, or a fallback occurred) → human-readable scoring + merge-validation trace, visible in the dashboard.
 
@@ -81,13 +81,13 @@ These are shared contracts — draft together, commit as versioned files (schema
 ### KR
 - [ ] `[BRAIN]` **Treatment Agent** (`director_persona`, `color_story`, `pacing_philosophy`, `beat_treatments[]` with `script_quote`/`truth_fact_id`/`why_not_generic`; "category" word disallowed in output)
 - [ ] `[BRAIN]` **Justification Validator** (deterministic: verbatim quote check, `truth_fact_id` exists, `treatment_ref` matches, stoplist reject; one re-prompt then fallback to literal `visual_approach`)
-- [ ] `[BODY]` Director's treatment panel in dashboard (persona/color story/pacing/per-beat justification)
+- [x] `[BODY]` Director's treatment panel in dashboard (persona/color story/pacing/per-beat justification)
 - [ ] `[BODY]` DB migrations for ledger + treatment + shot-list-with-justification tables
 
 ### RR
 - [ ] `[BRAIN]` **Shot-List Agent** (3-7 shots, camera-literate schema per **C3**, `justification` object; freeze C3 here; confirm no `product_category` field anywhere)
 - [ ] `[BRAIN]` **Budget Gate** (deterministic cap check, one loop-back to Shot-List Agent if over cap, then enforce); write allocations to Budget Ledger table; emit `treatment_ready`/`budget_updated` events
-- [ ] `[BODY]` Live budget ledger panel (per-shot allocations, running total, cap line, over/under state) + per-shot justification tooltip
+- [x] `[BODY]` Live budget ledger panel (per-shot allocations, running total, cap line, over/under state) + per-shot justification tooltip
 
 **Exit criteria:** valid 3-7 shot list conforming to frozen C3, budgets sum within cap (loop-back demonstrably works when seeded over budget), every justification passes the validator (re-prompt demonstrably works when seeded generic), ledger/treatment/shot rows visible in DB + dashboard.
 
@@ -115,7 +115,7 @@ These are shared contracts — draft together, commit as versioned files (schema
 ### KR
 - [ ] `[BRAIN]` **Continuity Agent** (Qwen-VL): compare generated frame vs. reference photo + shared lighting/style string, return drift/consistency score
 - [ ] `[BRAIN]` **Human-in-the-loop**: real LangGraph `interrupt()` carrying the **C4** payload; on resume apply `approve`/`retry-with-edit`/`accept-fallback`
-- [ ] `[BODY]` Dashboard: continuity drift-score panel per shot
+- [x] `[BODY]` Dashboard: continuity drift-score panel per shot
 
 ### RR
 - [ ] `[BRAIN]` **Capped retry loop** (drift > threshold and retries < 2 → loop back to Video-Gen; hard cap at 2 — this is the *only* place retries are consumed); emit `drift_scored`/`interrupt_requested` events
@@ -150,7 +150,7 @@ These are shared contracts — draft together, commit as versioned files (schema
 - [ ] `[BODY]` Help assemble panels into the unified dashboard (job progress + product-truths panel)
 
 ### RR
-- [ ] `[BODY]` Assemble remaining panels into one coherent live dashboard (treatment, budget ledger, critic trace, continuity drift, per-shot status w/ justification, human-review surfacing, final video previews)
+- [x] `[BODY]` Assemble remaining panels into one coherent live dashboard (treatment, budget ledger, critic trace, continuity drift, per-shot status w/ justification, human-review surfacing, final video previews)
 - [ ] `[BODY]` Wire real `astream_events` over WebSocket end-to-end (replace mock feeds); handle reconnect + late-join (render current state on connect)
 
 **Exit criteria:** kicking off a real job from the frontend drives the entire dashboard live, no page refresh, ingest-to-export.
