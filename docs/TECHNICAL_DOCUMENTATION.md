@@ -41,11 +41,11 @@ Track 2 asks for an autonomous system that handles the full creative production 
 | Demonstrate narrative ability | The Concept Agent produces four structurally distinct scripts, each using a different copywriting framework, hook type, and emotional trigger; the Critic Chain scores and cross-pollinates them into one winning narrative |
 | Multimodal orchestration | Text (brief → script) → image (product photos, reference frames) → video (Wan/HappyHorse) → speech (Qwen TTS) → final assembled cut |
 | Maximize output quality under a limited budget | An explicit per-shot cost budget is enforced by a deterministic Budget Gate with a hard cap, streamed live to a cost dashboard, with graceful degradation (Ken-Burns fallback) when a shot cannot be generated |
-| Agent negotiation / disagreement resolution the track wants judges to see | The Critic Chain runs four parallel specialist checkers whose scores are reconciled by a Meta-Critic that cross-pollinates the best hook, body, and CTA across variants — a visible, auditable negotiation, not a black box |
+| Agent negotiation / disagreement resolution the track wants judges to see | The Critic Chain runs five parallel specialist checkers whose scores are reconciled by a Meta-Critic that cross-pollinates the best hook, body, and CTA across variants, then an independent Merge Coherence Validator re-checks that merge before it is accepted — a visible, auditable negotiation with a genuine second opinion, not a black box and not a single agent grading its own work |
 
 ### 1.3 What the System Produces
 
-For each job, ProductCut outputs a finished short-form product ad in **three aspect ratios** — 9:16 (TikTok / Reels / Shorts), 1:1 (feed), and 16:9 (YouTube) — plus a full transparency breakdown: the four candidate scripts, every critic score, the merge justification, the director's treatment, the per-shot justification trace, the per-shot budget ledger, and the continuity drift scores. The transparency breakdown is a first-class deliverable, not a debug artifact: it is what makes the system's autonomous creative decisions legible to a judge (and, in production, to a seller who wants to understand why the system made the choices it made).
+For each job, ProductCut outputs a finished short-form product ad in **three aspect ratios** — 9:16 (TikTok / Reels / Shorts), 1:1 (feed), and 16:9 (YouTube) — plus a full transparency breakdown: the four candidate scripts, every critic score, the merge justification and its independent coherence/pacing re-check, the director's treatment, the per-shot justification trace, the per-shot budget ledger, and the continuity drift scores. The transparency breakdown is a first-class deliverable, not a debug artifact: it is what makes the system's autonomous creative decisions legible to a judge (and, in production, to a seller who wants to understand why the system made the choices it made).
 
 ### 1.4 Two Extensions: Script-Driven Direction and Chat-Based Revision
 
@@ -63,7 +63,7 @@ A prior research pass identified a failure mode called **"the Price of Format"**
 The core architectural decision is the choice of orchestration framework. ProductCut's pipeline is **not** a free-form multi-agent conversation. It is a directed acyclic graph (DAG) with five specific structural properties that the framework must model natively:
 
 1. **A conditional retry loop.** The Continuity Agent can send a shot back to the Video-Gen Node for re-generation, but only up to a hard cap of 2 retries, after which it escalates to human review.
-2. **A scoring / merge step with a visible reasoning trace.** The Critic Chain must produce an auditable record of how four candidate scripts were scored and merged into one — this trace is a demo deliverable, not an implementation detail.
+2. **A scoring / merge step with a visible reasoning trace, plus an independent re-check of the merge's own output.** The Critic Chain must produce an auditable record of how four candidate scripts were scored and merged into one, and the merge itself must be re-validated by a node other than the one that built it (Section 5.4.7) before it is accepted — this trace is a demo deliverable, not an implementation detail.
 3. **Per-step budget / cost tracking with hard caps.** Every node that spends money (video generation especially) must debit a shared ledger, and a gate must be able to reject a plan that exceeds the cap.
 4. **Parallel fan-out.** Multiple shots generate concurrently, then rejoin for assembly.
 5. **Realtime progress streaming to a frontend.** The budget ledger, critic reasoning, and drift scores stream live to the dashboard while the graph runs.
@@ -125,7 +125,7 @@ Three new components (Section 5.16) implement this:
 | **Frontend** | Next.js 14, React, Tailwind | Live dashboard consuming WebSocket events (budget ledger, critic trace, drift scores); post-generation view adds a chat panel and a diff/preview panel for edits |
 | **Backend / Orchestration** | FastAPI (Python) + **LangGraph** | LangGraph is the chosen orchestration framework — see Section 2 for the full justification |
 | **Orchestration durability** | LangGraph **Postgres checkpointer** (`langgraph-checkpoint-postgres`) | Persists a checkpoint after every node on the same managed Postgres instance as application data; this is what makes both crash-resume and chat-edit forking work without extra infrastructure |
-| **LLM / Reasoning** | Qwen (Qwen-Max / Qwen-Plus) via DashScope OpenAI-compatible endpoint | Product Truth Extractor's text-side reasoning, Concept Agent, Critic Chain checkers, Meta-Critic, Treatment Agent, Shot-List Agent, Edit Router, Edit Interpreter |
+| **LLM / Reasoning** | Qwen (Qwen-Max / Qwen-Plus) via DashScope OpenAI-compatible endpoint | Product Truth Extractor's text-side reasoning, Concept Agent, Critic Chain checkers, Meta-Critic, Merge Coherence Validator, Copy Editor, Treatment Agent, Shot-List Agent, Edit Router, Edit Interpreter |
 | **Vision** | Qwen-VL via DashScope | Product Truth Extractor (photo → specific facts), Continuity Agent (product-identity drift + cross-shot style-consistency detection) |
 | **Speech** | Qwen TTS / CosyVoice via DashScope | Voiceover synthesis + caption timing |
 | **Video Generation** | Wan / HappyHorse (Tongyi Wanxiang / Alibaba video model family) | **Image-to-video only, never pure text-to-video** |
@@ -151,14 +151,24 @@ flowchart TD
 
     CA --> HC[Hook-Checker]
     CA --> PC[Pacing-Checker - deterministic timing math]
+    CA --> BC[Body-Checker - completion / structural fit]
     CA --> CC[CTA-Checker]
     CA --> TC[Tone-Checker]
     HC --> MC[Meta-Critic - weighted aggregate + cross-pollinate merge]
     PC --> MC
+    BC --> MC
     CC --> MC
     TC --> MC
 
-    MC -->|winning script + reasoning trace| TA[Treatment Agent - Qwen<br/>director persona, color story,<br/>per-beat justification vs script+truths]
+    MC -->|merge candidate| CV{Merge Coherence Validator - independent re-check}
+    CV -->|voice/register fail, attempts<1| CE[Copy Editor - constrained seam polish]
+    CE --> CV
+    CV -->|promise-payoff fail, attempts<1| MC
+    CV -->|fails again either path| FBV[Fallback: highest single composite variant]
+    CV -->|pass| WIN[winning_script finalized]
+    FBV --> WIN
+
+    WIN -->|winning script + reasoning trace| TA[Treatment Agent - Qwen<br/>director persona, color story,<br/>per-beat justification vs script+truths]
     TA --> SL[Shot-List Agent - Qwen<br/>camera-literate schema<br/>+ required per-shot justification]
     SL --> JV{Justification Validator}
     JV -->|quote/fact not found, re-prompt| SL
@@ -177,7 +187,7 @@ flowchart TD
     CTY -->|pass| ASM
     FB --> ASM[Assembly Agent - ffmpeg]
 
-    MC --> VOX[Voiceover + Caption Agent - Qwen TTS<br/>synced to beat timestamps]
+    WIN --> VOX[Voiceover + Caption Agent - Qwen TTS<br/>synced to beat timestamps]
     VOX --> ASM
 
     ASM --> FMT[Format Export Node - ffmpeg<br/>9:16 / 1:1 / 16:9]
@@ -193,6 +203,8 @@ flowchart TD
 
     BL -.->|live ledger stream| FE
     MC -.->|reasoning trace stream| FE
+    CV -.->|merge validation trace stream| FE
+    CE -.->|seam before/after stream| FE
     CTY -.->|drift scores stream| FE
     ER -.->|routing decision stream| FE
 
@@ -204,7 +216,7 @@ flowchart TD
     OUT --> OSS
 ```
 
-**Reading the diagram.** Solid arrows are graph edges (control/data flow). Dashed arrows are live streaming channels to the frontend via `astream_events` → WebSocket. The `Budget Gate` and `Justification Validator` (diamonds) and `interrupt: Human Review` / `interrupt: Preview/Confirm` (`HR`, `PV`) are the decision points that can loop, pause, or fork the graph. The Voiceover branch (`MC → VOX → ASM`) runs in parallel with the entire video-generation branch, because voiceover depends only on the finalized script, not on the rendered shots. The **chat-revision loop** (`FE → ER → EI → PV → FORK`) is drawn re-entering at the Concept Agent, but `FORK`'s actual re-entry point is whatever `entry_node` the Edit Router chose — Concept, Treatment, Shot-List, or Assembly — never the whole graph from Ingest. Everything inside the `Alibaba Cloud` subgraph is a managed cloud resource (Budget Ledger table, Object Storage, Job/State DB, and now the LangGraph checkpoint tables that live in the same Postgres instance).
+**Reading the diagram.** Solid arrows are graph edges (control/data flow). Dashed arrows are live streaming channels to the frontend via `astream_events` → WebSocket. The `Budget Gate`, `Justification Validator`, and **`Merge Coherence Validator`** (diamonds) and `interrupt: Human Review` / `interrupt: Preview/Confirm` (`HR`, `PV`) are the decision points that can loop, pause, or fork the graph. **The Merge Coherence Validator (`CV`) is a distinct node from the Meta-Critic (`MC`)** — it receives the Meta-Critic's merge candidate but is never the same call/context that produced it, which is what makes its pass/fail judgment an independent check rather than the merge-writer grading its own work. On failure, `CV` routes by **which** sub-check flagged: a voice/register seam failure loops to the **Copy Editor (`CE`)**, a distinct constrained-repair node (Section 5.4.8) that polishes only the flagged transition and hands the patched merge straight back to `CV` for re-validation; a promise-payoff failure loops to `MC` for one bounded retry (the existing swap-to-second-best-piece behavior), also returning to `CV`. Either path falls back to the single highest composite-scoring variant (`FBV`) on a second failure, and only the node downstream of that decision (`WIN`) is treated as the actual finalized script. The Voiceover branch (`WIN → VOX → ASM`) runs in parallel with the entire video-generation branch, because voiceover depends only on the finalized, validated script, not on the rendered shots. The **chat-revision loop** (`FE → ER → EI → PV → FORK`) is drawn re-entering at the Concept Agent, but `FORK`'s actual re-entry point is whatever `entry_node` the Edit Router chose — Concept, Treatment, Shot-List, or Assembly — never the whole graph from Ingest. Everything inside the `Alibaba Cloud` subgraph is a managed cloud resource (Budget Ledger table, Object Storage, Job/State DB, and now the LangGraph checkpoint tables that live in the same Postgres instance).
 
 ---
 
@@ -274,9 +286,11 @@ Each script must additionally contain: a **single named pain point** (not a vagu
 
 **Failure handling.** If the model returns fewer than four variants, malformed JSON, duplicated frameworks/hooks, or fewer than 2 `grounding_truth_ids` per variant, the node re-prompts once with the specific violation called out. Persistent malformation degrades to the best N valid variants (minimum 2) so the Critic Chain still has something to compare; a single valid variant short-circuits the critic negotiation and proceeds with that variant flagged as un-negotiated in the reasoning trace.
 
-### 5.4 Critic Chain — 4 parallel specialist checkers + 1 aggregator
+### 5.4 Critic Chain — 5 parallel specialist checkers + 1 aggregator + 1 independent post-merge validator + 1 constrained repair node
 
-This is the pipeline's **agent-negotiation / disagreement-resolution** centerpiece — the component the Track 2 brief explicitly wants judges to *see*. Rather than one monolithic critic, four specialists score the four candidate scripts along orthogonal axes in parallel, and a Meta-Critic reconciles them. The output is an auditable scoring trace and a merge justification, never a black-box pick.
+This is the pipeline's **agent-negotiation / disagreement-resolution** centerpiece — the component the Track 2 brief explicitly wants judges to *see*. Rather than one monolithic critic, five specialists score the four candidate scripts along orthogonal axes in parallel, and a Meta-Critic reconciles them into a cross-pollinated merge candidate. That candidate is then re-checked by a sixth component — the Merge Coherence Validator — that is architecturally separate from the Meta-Critic, so the one agent that builds the merge is never the only one that judges it. When the validator flags a voice/register seam problem specifically, a seventh component — the Copy Editor (Section 5.4.8) — performs a constrained polish of that seam, in the same repair role a professional copy editor plays on a stitched piece, before the merge goes back through the validator. The output is an auditable scoring trace, a merge justification, and an independent pass/fail record, never a black-box pick.
+
+**Why a fifth checker and a sixth validator, not just "trust the Meta-Critic."** Two gaps in the original four-checker design turned out to matter in practice. First, Hook-Checker scores the opening line and CTA-Checker scores the close, but nothing scored the beats in between — the part of the script actually responsible for paying off the hook's promise, escalating (not repeating) the case for the product, and landing the script's declared `emotional_trigger`. A script can have a 5/5 hook and a 5/5 CTA while its middle beats say the same thing three ways or never deliver on what the hook promised, and the composite score would never reflect that. Second, the cross-pollination merge stitches pieces from three *independently written* scripts — each deliberately built in a different framework, hook type, and emotional trigger, per Section 5.3's enforced-diversity rule — and the only thing checking whether that stitch reads as one coherent voice was the Meta-Critic itself, immediately after building it. Real editorial practice does not let the editor who made a cut be the only person who signs off on it; a second, independent read — often specifically a fresh, cold read by someone uninvolved in the edit — is what catches voice seams and unpaid promises that the person who just assembled the piece is primed to overlook. Sections 5.4.3 and 5.4.7 below close these two gaps.
 
 #### 5.4.1 Hook-Checker — Qwen
 
@@ -286,29 +300,92 @@ This is the pipeline's **agent-negotiation / disagreement-resolution** centerpie
 
 **Purpose.** Validate timing math with guaranteed correctness. It confirms the beat timestamps **sum to the target length**, that **each beat is within the 2–3s / 3–5s pacing window** per the rule, and that each **voiceover line fits its beat duration** at a spoken rate of **~2.3 words/second**. Because timing correctness is arithmetic, not judgment, it is code — an LLM would be a strictly worse choice here. **Output:** `{variant_id: {pacing_score, violations[]}}`, where violations name the exact offending beat and metric.
 
-#### 5.4.3 CTA-Checker — Qwen
+#### 5.4.3 Body-Checker — Qwen, with a deterministic redundancy pre-pass *(new)*
+
+**Purpose.** Score whether the script's **body** — the beats between the hook and the CTA — is actually doing its job, rather than being invisible to the Critic Chain the way it currently is. Concretely, it checks four things a creative director would read the middle of a script for: **(1) promise-payoff match** — does the body substantively develop the specific claim or pain the hook named, rather than just restating it in different words; **(2) non-redundancy** — does each beat add new information/proof, or does it repeat a beat that already made the same point; **(3) throughline** — is there one problem and one product promise carried consistently, or does a competing claim sneak in partway through; **(4) emotional-trigger fidelity** — does the body's content plausibly land the script's declared `emotional_trigger` (curiosity, recognition, FOMO, tribal identity, transformation/aspiration, relief), or is the trigger just a label with nothing in the beats actually earning it. Concretely: a **weak** body pays off "Your coffee is cold in 12 minutes. Mine isn't." with a beat that just re-asserts the claim ("Mine stays warmer, way longer") — no new proof, no escalation. A **strong** body earns it with a beat that supplies the specific mechanism behind the claim, tied to an actual product truth ("Mine isn't — because of the double-wall vacuum seal (t3), not a thicker wall").
+
+**Model / API.** Qwen, scoring call (not generation).
+
+**Input.** For each variant: `beats[1:-1]` (every beat except the hook, `beats[0]`, and the CTA, the last beat — the same hook/CTA convention already implicit in the Hook-Checker's and CTA-Checker's inputs, so no new schema field is required), plus `framework`, `emotional_trigger`, `grounding_truth_ids`, and `product_truths[]` for context on what a body beat's claims should be traceable to.
+
+**Deterministic pre-pass (the part that must be guaranteed, not judged).** Before the LLM call, a pure-code step computes pairwise lexical/semantic overlap between every pair of body beat lines (cheap token-overlap ratio, or a single embedding-similarity pass) and flags any pair above a fixed threshold as a candidate redundant pair. This mirrors the Pacing-Checker's philosophy: *literal* repetition is mechanically detectable and should never be left to LLM sampling variance. The flagged pairs are passed into the LLM prompt as evidence the checker must weigh in on — it does not have to rediscover obvious repetition from scratch, and it is not allowed to silently overrule an unambiguous overlap flag without saying why.
+
+**Output contract.** `{variant_id: {completion_score (1-5), redundant_beat_pairs: [[i, j]], promise_payoff_match: bool, emotional_trigger_landed: bool, justification}}`. This score is what fills the previously-undefined "Completion / structural fit" axis in the Meta-Critic's weighted composite below, and — just as importantly — it is what gives the cross-pollination merge an actual **"best body"** signal to select on, closing the gap where the merge picked a best body with nothing having scored bodies at all.
+
+**Side benefit, not a substitute for real grounding checks.** Because this checker is given `product_truths[]` for context, it can flag a body beat whose "proof" doesn't trace to any cited truth — a partial, incidental check against ungrounded claims in the script's middle. This does **not** turn the Critic Chain into a fact-checker (the hook and CTA remain unverified against `product_truths[]`), so it should not be read as closing that broader gap — only as a modest side effect of giving one checker truth-context it didn't have before.
+
+#### 5.4.4 CTA-Checker — Qwen
 
 **Purpose.** Score **call-to-action clarity**. A good CTA is a single concrete verb plus a destination ("Tap to shop the autumn set"); a bad CTA is vague, missing, or competes with a second CTA. **Input:** each script's CTA line and surrounding closing beats. **Output:** `{variant_id: {cta_score, justification}}`. The checker specifically penalizes multiple competing CTAs, since split calls-to-action measurably depress conversion.
 
-#### 5.4.4 Tone-Checker — Qwen
+#### 5.4.5 Tone-Checker — Qwen
 
 **Purpose.** Score **brand / tone fit against the seller's one-line brief and any `seller_direction`**. If the brief says *"cozy autumn vibe"* or the intake names mood words like *"quiet, tactile"*, a hard-sell, high-urgency script scores lower on tone even if its hook is strong. If `seller_direction.never_do` is set, the checker also hard-fails any script that violates it. **Input:** the brief, `seller_direction`, and each full script. **Output:** `{variant_id: {tone_score, justification, never_do_violation: bool}}`. This is the axis that keeps the merged result faithful to the seller's stated intent rather than optimizing purely for aggression.
 
-#### 5.4.5 Meta-Critic — Qwen
+#### 5.4.6 Meta-Critic — Qwen
 
 **Purpose.** Aggregate and, critically, **cross-pollinate**. The Meta-Critic computes a **weighted composite** score per variant:
 
-| Axis | Weight |
-|---|---|
-| Hook | 25% |
-| Pacing | 20% |
-| Completion / structural fit | 20% |
-| CTA | 20% |
-| Tone | 15% |
+| Axis | Weight | Checker |
+|---|---|---|
+| Hook | 25% | Hook-Checker (5.4.1) |
+| Pacing | 20% | Pacing-Checker (5.4.2) |
+| Completion / structural fit | 20% | Body-Checker (5.4.3) |
+| CTA | 20% | CTA-Checker (5.4.4) |
+| Tone | 15% | Tone-Checker (5.4.5) |
 
-Any variant with `never_do_violation = true` is excluded from consideration before weighting, regardless of composite score. Then — the **advanced feature** — instead of picking a single variant wholesale, it **merges the best-scoring hook + best-scoring body + best-scoring CTA across all four variants into one winning script**. This mirrors how professional ad teams A/B-test hooks independently of body copy: the strongest opening might live in variant 2 while the strongest close lives in variant 4, and a wholesale pick would throw away one of them.
+Every axis in this table now has a checker backing it — the "Completion / structural fit" row previously had no defined source and was the least-anchored 20% of the composite; it is now the Body-Checker's `completion_score`.
 
-**Output contract.** The winning merged script **plus the full scoring trace and merge justification** — which axis-winner came from which variant, and why the merge is coherent. This trace streams live to the frontend (dashed edge `MC -.-> FE` in the diagram) so the negotiation is visible in the demo, not hidden. **Failure handling:** if cross-pollination would produce an incoherent script (e.g., a hook and body with clashing framing), the Meta-Critic falls back to the highest single composite-scoring variant and records that fallback in the trace.
+Any variant with `never_do_violation = true` is excluded from consideration before weighting, regardless of composite score. Then — the **advanced feature** — instead of picking a single variant wholesale, it **merges the best-scoring hook + best-scoring body (per the Body-Checker's `completion_score`) + best-scoring CTA across all four variants into one winning script**, re-deriving contiguous beat timestamps for the merged sequence so it still targets the correct `target_length_sec` (borrowed beats arrive with three different original timelines, which do not line up on their own). This mirrors how professional ad teams A/B-test hooks independently of body copy: the strongest opening might live in variant 2 while the strongest close lives in variant 4, and a wholesale pick would throw away one of them.
+
+**Output contract.** A **merge candidate**: the stitched script, which axis-winner came from which variant, and a merge rationale. **Critically, the Meta-Critic no longer has the final word on whether its own merge is coherent** — that self-grading was the weak link in the original design (the node that just built the merge is not a reliable judge of whether it reads as one voice). Instead, the merge candidate is handed to the **Merge Coherence Validator (5.4.7)**, a separate node, for an independent pass/fail check before anything downstream treats it as the winning script. This trace streams live to the frontend (dashed edge `MC -.-> FE` in the diagram) so the negotiation — including any retries or fallback the validator triggers — is visible in the demo, not hidden.
+
+#### 5.4.7 Merge Coherence Validator — independent post-merge check *(new)*
+
+**Purpose.** Close the second gap in the original design: nothing re-validated the merged script's timing math (the merge bypassed the Pacing-Checker entirely), and nothing coherence-checked the stitch *except* the agent that had just built it. This node runs after the Meta-Critic and is deliberately **not** the Meta-Critic — it receives the merge candidate but shares no call/context with the reasoning that produced it, which is what makes its judgment an actual second opinion rather than the same model re-confirming its own work in a different sentence.
+
+**Two sub-checks, run in order:**
+
+1. **Deterministic pacing re-check (cheap, runs first).** Re-runs the exact Pacing-Checker logic from 5.4.2 against the merged script's re-derived beat timestamps: do they sum to `target_length_sec`, does each beat fit its 2–3s/3–5s window, does each voiceover line fit its beat at ~2.3 words/second. This is arithmetic, not judgment, so it is code, exactly like 5.4.2. It is not redundant paperwork — beats borrowed from three variants with three different original timelines are exactly the kind of thing that plausibly fails re-assembled arithmetic even when every source variant individually passed.
+2. **Independent LLM coherence read (only if the pacing re-check passes).** A **blind, cold read**: the model is given only the merged script's text and beats — **not** the merge rationale, **not** which piece came from which variant, **not** the Meta-Critic's own reasoning — and scores it against a checklist deliberately different in kind from the axis rubrics used to build the merge: **voice/POV consistency** across the stitch points, **promise-payoff match** (does the borrowed body actually pay off the borrowed hook's specific claim), and **register/transition smoothness** at the two seams (hook→body, body→CTA), flagging the beat index of any jarring shift. This mirrors the real editorial practice of a second, uninvolved reviewer reading a stitched piece cold — often specifically reading it as if hearing it for the first time — rather than the person who made the cut re-reading their own work.
+
+**Model / API.** Qwen-Plus — a scoring/classification task, not open-ended generation, and deliberately a separate call from the Meta-Critic's Qwen-Max merge call (cheaper, and structurally independent — not just a different prompt in the same context).
+
+**Output contract.** `{passed: bool, pacing_recheck: {passed, violations[]}, coherence_score (1-5), voice_consistency: bool, promise_payoff_match: bool, register_shift_flags: [beat_index], justification}`.
+
+**Failure handling — bounded retry, then the existing fallback, never a self-grade.** This follows the same "deterministic check + capped retry, then deterministic fallback" shape as every other loop in the system (Budget Gate, Justification Validator, Continuity). The one retry slot below is now **routed by failure type**, not a single repair path:
+- **Pacing re-check fails** → one deterministic repair attempt (proportionally re-time the merged beats to fit the pacing windows and target length, the same "reduce to fit" spirit as the Budget Gate's one loop-back) → re-check once. If it still fails, treat it as a merge failure and fall through to the retry/fallback path below.
+- **Coherence read fails on voice/register** (a `register_shift_flags` entry or `voice_consistency = false`, with `promise_payoff_match = true`) → **one retry, routed to the Copy Editor (Section 5.4.8)**, which performs a constrained polish of only the flagged seam, then the patched merge returns to this same validator for a full re-check. This is a "how it's said" failure, and a copy-edit repairs it directly at the seam rather than re-rolling to a differently-voiced alternative piece.
+- **Coherence read fails on promise-payoff** (`promise_payoff_match = false`, regardless of `register_shift_flags`) → **one retry**, routed back to the Meta-Critic with the specific flagged clash named (e.g., "body from v1 does not pay off the hook from v2's specific claim") so the retry swaps in the *second*-best-scoring piece for whichever axis was flagged. This is a "what is being said" failure — missing content or mechanism — which a copy-edit cannot manufacture without inventing new claims, so the swap remains the right repair here.
+- **Second failure of either sub-check** (including a failed Copy Editor re-validation, or a failed swap re-validation) → falls back to the **single highest composite-scoring variant** (already fully valid — it individually passed every checker in its original, unmerged form, so no re-validation is needed) exactly as the original design's fallback did, except the decision to fall back is now made by the independent validator, not by the Meta-Critic (or the Copy Editor) marking its own homework.
+- Every attempt (merge candidate, pacing re-check result, coherence read result, which repair path was taken, the repair's before/after where applicable, retry-or-fallback decision) is appended to the reasoning trace, so a demo run that hits a retry or a fallback is not a hidden failure — it is a visible, auditable instance of exactly the "agent disagreement resolution" the track wants judges to see, arguably a *better* demo moment than a merge that silently succeeds.
+
+Only once the Merge Coherence Validator returns `passed: true` (on the first attempt, after a repaired retry, or via fallback) is the script written to `winning_script` and released downstream to the Treatment Agent and the Voiceover branch.
+
+#### 5.4.8 Copy Editor — Qwen-Plus, constrained seam repair *(new)*
+
+**Purpose.** A cross-pollinated merge stitches pieces that were each written for a *different* script — different framework, different hook type, different emotional trigger (Section 5.3's enforced-diversity rule guarantees this). When the Merge Coherence Validator's blind coherence read flags a **voice/register-consistency** problem at one of the two stitch points, the honest repair is not "try a different pre-written piece that also wasn't written to fit this hook" — it is what a professional copy editor actually does to a stitched piece: **polish the seam itself**, in place, without touching the substance. The Copy Editor is that node. It is deliberately **not** the Concept Agent: the Concept Agent's job is free generation of maximally distinct scripts from scratch, which is the wrong tool for a small, constrained, in-place edit — asking the writer to "revise" would reopen the door to the same open-ended generation the rest of the merge path is designed to avoid, and its output would carry none of the guarantees (grounding, non-redundancy, pacing) that got the original piece chosen in the first place. A copy editor, by professional convention, touches prose and transitions; they do not rewrite content or introduce new claims — which is exactly the scope this node is held to.
+
+**Concretely:** a **weak** repair would be re-writing the whole borrowed body paragraph in the hook's voice (this is a rewrite, not a copy-edit, and it invalidates the Body-Checker's score on that piece). A **strong** repair takes a seam like a clipped, direct-address hook ("Your coffee is cold in 12 minutes. Mine isn't.") stitched to a body written in a warmer, third-person register ("Many people find their drinks losing warmth too quickly...") and smooths only the transition clause so the body's opening line picks up the hook's direct address ("Yours does too — here's why mine doesn't:") while every downstream claim, fact, and beat is left untouched.
+
+**Input contract.** The merged script's full text and beats, the specific seam(s) flagged by `register_shift_flags` (beat index of the jarring shift), and the `grounding_truth_ids` + CTA verb that must survive the edit untouched.
+
+**Output contract.** `{merged_script_patched, seams_edited: [beat_index], original_seam_text, revised_seam_text, justification}` — a **before/after** record of exactly what changed, so the repair is auditable rather than an opaque re-write.
+
+**Constraints (enforced in the prompt, then checked deterministically before re-validation):**
+- May modify **only** the transition text at the flagged seam(s) (the last line of one borrowed piece and/or the first line of the next) — not the full body, not the hook, not the CTA line itself.
+- Must **preserve every factual claim and every cited `grounding_truth_ids`** already present in the merged script — no new claims, no dropped truths.
+- Must **preserve the single CTA verb** — the Copy Editor never touches CTA content, only (if flagged) the body→CTA transition phrasing.
+- Must stay within roughly **±10% of the original seam's word count**, so the re-derived beat timestamps from the merge (Section 5.4.6) still hold without a further pacing re-derivation.
+
+**Model / API.** Qwen-Plus, one call — scoped/constrained generation, not open-ended rewriting (the same reasoning that puts the Merge Coherence Validator's coherence read on Qwen-Plus rather than Qwen-Max applies here: this is a bounded, checklist-shaped task, not the kind of open-ended creative generation Qwen-Max is reserved for in the Concept Agent).
+
+**Routing — which failure goes to the Copy Editor vs. the existing swap.** The Merge Coherence Validator's failure handling (Section 5.4.7) now branches on **which** part of the coherence read failed, because the two failure types call for genuinely different repairs:
+- **`register_shift_flags` non-empty / `voice_consistency = false`** (a voice/register seam problem) → **Copy Editor.** This is a "how it's said" problem at a specific, localized seam, which is precisely what a polish pass fixes — and swapping in a second-best piece doesn't reliably fix it, since that piece was written for yet another script's voice.
+- **`promise_payoff_match = false`** (the borrowed body doesn't substantively pay off the borrowed hook's specific claim) → **existing swap-to-second-best-scoring-piece behavior, unchanged.** This is a "what is being said" problem — missing content or a missing mechanism — which a copy-edit cannot manufacture without inventing new claims, which is out of scope by design. A different body genuinely might pay off the hook where a polished version of the *same* body still would not, so the Meta-Critic swap (Section 5.4.7) remains the right tool here.
+- If **both** conditions are flagged on the same merge candidate, the swap path takes precedence (fixing the content gap first), since a copy-edit on a seam whose underlying body is about to be replaced is wasted work.
+
+**After the Copy Editor runs.** The patched merge is sent back through the **same Merge Coherence Validator** for one re-check (both sub-checks: pacing re-check, then the blind coherence read again) before it is accepted — the Copy Editor never marks its own work as sufficient, exactly the same "never a self-grade" principle that governs every other check in this pipeline. This re-check consumes the **same single retry slot** already defined in Section 5.4.7's failure handling — the Copy Editor path does not add a new loop or a new cap; it defines *what happens during* that existing retry when the flagged failure is a voice/register seam. If the re-validation still fails, that is the "second failure" already defined in 5.4.7, and the pipeline falls back to the single highest composite-scoring original variant exactly as before.
 
 ### 5.5 Treatment Agent — Qwen via DashScope *(new)*
 
@@ -440,7 +517,7 @@ Any shot failing 1–4 triggers a **single re-prompt naming the exact violating 
 
 ### 5.14 Output
 
-**Purpose.** Finalize the job. Pushes the **final videos in all three formats to OSS**, marks the job **complete in the DB**, and emits the final event to the frontend, which then displays the results **plus the full cost and reasoning breakdown** (the four scripts, critic scores, merge justification, the director's treatment, per-shot justifications, budget ledger, and drift scores). This closing transparency payload is what turns an autonomous black box into a demoable, auditable showrunner — and it is also the state the chat-revision subsystem (Section 5.16) treats as its starting checkpoint.
+**Purpose.** Finalize the job. Pushes the **final videos in all three formats to OSS**, marks the job **complete in the DB**, and emits the final event to the frontend, which then displays the results **plus the full cost and reasoning breakdown** (the four scripts, critic scores, merge justification and its independent validator verdict, the director's treatment, per-shot justifications, budget ledger, and drift scores). This closing transparency payload is what turns an autonomous black box into a demoable, auditable showrunner — and it is also the state the chat-revision subsystem (Section 5.16) treats as its starting checkpoint.
 
 ### 5.15 SellerDirection & Truth/Treatment Recap *(schema note, not a node)*
 
@@ -526,10 +603,24 @@ script_variants[]: {
     target_length_sec
 }
 
-critic_scores{ variant_id: { hook, pacing, cta, tone, composite, justification, never_do_violation } }
+critic_scores{ variant_id: {
+    hook, pacing,
+    completion,                     // NEW — Body-Checker's completion_score (5.4.3), fills the previously-undefined axis
+    completion_detail: { redundant_beat_pairs[], promise_payoff_match, emotional_trigger_landed },   // NEW
+    cta, tone, composite, justification, never_do_violation
+} }
 
-winning_script
-reasoning_trace
+merge_attempts[]: {                 // NEW — Section 5.4.6/5.4.7/5.4.8, one entry per merge attempt (usually 1, up to 2 + fallback)
+    attempt_number, hook_source_variant, body_source_variant, cta_source_variant,
+    merged_script,
+    pacing_recheck: { passed, violations[] },
+    coherence_check: { passed, coherence_score, voice_consistency, promise_payoff_match, register_shift_flags[], justification },
+    copy_edit: { seams_edited[], original_seam_text, revised_seam_text, justification },  // NEW — Section 5.4.8, populated only when the Copy Editor ran on this attempt
+    outcome: "accepted | copy_edited_then_accepted | retried | fell_back_to_variant"
+}
+
+winning_script                      // only set once the Merge Coherence Validator returns passed:true, or the fallback variant is selected
+reasoning_trace                     // now includes merge_attempts[] alongside critic_scores, so a retry/fallback is part of the visible trace, not hidden
 
 treatment: {                        // NEW — Section 5.5
     director_persona, color_story, pacing_philosophy,
@@ -569,7 +660,7 @@ version_history[]: { branch_id, parent_branch_id, created_at, summary }
 
 **Notes on key fields.**
 - `product_truths[]`, `treatment`, and `shot_list[].justification` together are the mechanical backbone of "script-driven, not category-driven" direction (Section 2.4) — every one of them is validated against the others by the Justification Validator before the Budget Gate runs.
-- `critic_scores` and `reasoning_trace` together form the streamed negotiation trace — they are populated by the Critic Chain and read by the frontend live.
+- `critic_scores`, `merge_attempts[]`, and `reasoning_trace` together form the streamed negotiation trace — they are populated by the Critic Chain, the Meta-Critic, the Merge Coherence Validator, and the Copy Editor, and read by the frontend live. `merge_attempts[]` is what makes the "no self-grading" fix inspectable: a reader of the trace can see the Meta-Critic's candidate, the independent validator's pacing/coherence verdict on it, which repair path was taken when it failed (a Copy Editor seam polish with its before/after text, or a Meta-Critic swap), and whether a retry or fallback followed — separate entries from separate nodes, not one node's unopposed say-so.
 - `shot_list[].retry_count` is where the Continuity retry cap is enforced; the conditional edge back to Video-Gen reads this field, so the loop is bounded by state, not by ad-hoc counters.
 - `budget_ledger` is updated by the Shot-List Agent (allocations), the Budget Gate (approval), and the Video-Gen Node (actual spend), and streamed to the dashboard throughout.
 - `human_review_queue` holds shots parked by a Continuity `interrupt()` awaiting seller resolution; the graph resumes from its checkpoint when an entry is resolved.
@@ -612,12 +703,13 @@ ProductCut treats robustness as a demo feature, not an afterthought: every failu
 - **Video-gen hard failure (API error / timeout).** Routes **immediately to the Ken-Burns fallback**, and **does not consume a Continuity retry.** Infrastructure failures and quality failures are handled by different mechanisms, so an outage doesn't burn the quality-retry budget.
 - **Continuity drift.** Capped at **2 retries** back to Video-Gen. On exhaustion, escalates to a **human-review `interrupt()`** — a **real pause/resume via LangGraph's checkpointer**, not a dead-end flag. The seller resolves it (approve / edit-and-retry / accept fallback) and the graph resumes from the checkpoint.
 - **Budget overrun at the shot-list stage.** **One** loop back to the Shot-List Agent with an explicit "reduce" instruction, then a **hard accept** of whatever fits — **never an infinite loop.**
+- **Merge coherence/pacing failure (new).** The Meta-Critic's cross-pollinated merge is re-checked by the **independent** Merge Coherence Validator (Section 5.4.7), never by the Meta-Critic itself. A failed deterministic pacing re-check gets **one** proportional re-timing repair, then one re-check. A failed independent coherence read is repaired by **whichever node fits the failure**, not a single undifferentiated retry: a voice/register seam problem (`register_shift_flags` / `voice_consistency = false`) goes to the **Copy Editor** (Section 5.4.8) for a constrained, in-place polish of only the flagged transition — preserving every cited fact, truth ID, and the CTA verb — before returning to the validator for re-check; a promise-payoff problem (`promise_payoff_match = false`) goes back to the Meta-Critic naming the specific flagged clash, so the retry swaps the flagged piece for its second-best-scoring alternative, not a blind re-roll. Either repair path consumes the same single bounded retry — this is not a second loop layered on top, it is what happens *inside* the one retry slot the validator already allows. A second failure of either sub-check (including a failed Copy Editor re-validation) **falls back to the single highest composite-scoring variant** — already individually valid, since it passed every checker unmerged — the same "bounded retry, then safe deterministic fallback" shape as every other loop in the system, except here the fallback decision is made by a node that never wrote the thing it is judging.
 - **Justification/grounding failure (new).** A shot whose `justification` fails the deterministic validator (Section 5.6) gets **one** targeted re-prompt naming the exact violation; on a second failure it falls back to the treatment's literal `visual_approach` text for that beat (already quote-grounded) rather than blocking the job — the same "bounded retry, then safe deterministic fallback" shape as every other loop in the system.
 - **Chat-edit routing ambiguity (new).** If the Edit Router's confidence is below threshold, it does not guess a scope — it asks a clarifying question in chat. This prevents a misrouted edit from silently re-rendering the wrong shot and spending budget on the wrong fix.
 - **Chat-edit re-render failure (new).** A forked branch's Video-Gen or Continuity failure is handled by the **same** fallback/retry/interrupt machinery as a first-pass run (Sections 5.9, 5.10) — no separate error-handling path was built for edits, which keeps the failure surface to one set of mechanisms.
 - **Checkpoint-backed durability.** LangGraph's **checkpointer persists state at every node**, so a crashed or flaky run **resumes instead of restarting from scratch.** This same mechanism doubles as a **demo-day safety net** (a **pre-warmed cached run** can be resumed/replayed if live generation is flaky during the presentation) and as the **substrate for chat-edit forking** — one persistence mechanism serves crash-recovery, demo replay, and scoped revision.
 
-The throughline: every loop in the system (retry, budget, review, justification, edit-routing) has a hard cap or a human off-ramp, and every intermediate state is checkpointed — so the worst case is a slightly degraded ad delivered on time, never a hung or lost run, and a chat edit that goes wrong never costs more than the one shot it touched.
+The throughline: every loop in the system (retry, budget, review, justification, merge validation, edit-routing) has a hard cap or a human off-ramp, and every intermediate state is checkpointed — so the worst case is a slightly degraded ad delivered on time, never a hung or lost run, and a chat edit that goes wrong never costs more than the one shot it touched.
 
 ---
 
@@ -662,8 +754,8 @@ The hackathon weights four criteria. Below, each of ProductCut's features maps e
 
 | Criterion | Weight | ProductCut features that satisfy it |
 |---|---|---|
-| **Technical Depth & Engineering** | **30%** | LangGraph DAG with a **bounded conditional retry loop** (Continuity → Video-Gen, capped at 2); **parallel fan-out via `Send()`**; **deterministic Budget Gate** with a hard cap and single reduce-loop; **checkpointer-backed resume** after crash; genuine **`interrupt()` pause/resume** human-in-the-loop; a **deterministic Justification Validator** that mechanically checks LLM output against source text before it's accepted; **checkpoint-fork-based scoped re-execution** for chat edits (re-running only downstream nodes, not the whole graph); deterministic ffmpeg Assembly and multi-format Export; clean split of relational state (Postgres) vs. blobs (OSS) |
-| **Innovation & AI Creativity** | **30%** | The **Critic Chain** — four parallel specialist checkers reconciled by a **Meta-Critic that cross-pollinates** the best hook + body + CTA across variants; **constraint-enforced script diversity**; a **Product Truth Extractor** that grounds every downstream agent in specific, checkable product facts instead of category assumptions; a **Treatment Agent** that reasons from narrative-beat function to camera grammar (not product category to camera grammar), modeled on a real director's treatment; a **justification-forced shot schema** that structurally blocks template reuse; a **chat-based revision subsystem** (Edit Router + Edit Interpreter + Preview/Confirm) that performs surgical, cost-aware re-generation instead of a blind full re-run |
+| **Technical Depth & Engineering** | **30%** | LangGraph DAG with a **bounded conditional retry loop** (Continuity → Video-Gen, capped at 2); **parallel fan-out via `Send()`**; **deterministic Budget Gate** with a hard cap and single reduce-loop; **checkpointer-backed resume** after crash; genuine **`interrupt()` pause/resume** human-in-the-loop; a **deterministic Justification Validator** that mechanically checks LLM output against source text before it's accepted; an **independent Merge Coherence Validator** that re-runs the Pacing-Checker's timing math and a blind coherence read against the Meta-Critic's own merge output before accepting it, with a capped retry **routed by failure type** to either the **Copy Editor** (constrained seam repair) or the Meta-Critic (piece swap) and a deterministic fallback; **checkpoint-fork-based scoped re-execution** for chat edits (re-running only downstream nodes, not the whole graph); deterministic ffmpeg Assembly and multi-format Export; clean split of relational state (Postgres) vs. blobs (OSS) |
+| **Innovation & AI Creativity** | **30%** | The **Critic Chain** — five parallel specialist checkers (including a **Body-Checker** scoring promise-payoff, redundancy, and emotional-trigger fidelity) reconciled by a **Meta-Critic that cross-pollinates** the best hook + body + CTA across variants, then handed to an **independent post-merge validator** rather than self-graded, whose voice/register failures are repaired by a dedicated **Copy Editor** — a constrained, professionally-scoped seam-polish node distinct from both the writer (Concept Agent) and the merge-builder (Meta-Critic) — rather than a blind re-roll; **constraint-enforced script diversity**; a **Product Truth Extractor** that grounds every downstream agent in specific, checkable product facts instead of category assumptions; a **Treatment Agent** that reasons from narrative-beat function to camera grammar (not product category to camera grammar), modeled on a real director's treatment; a **justification-forced shot schema** that structurally blocks template reuse; a **chat-based revision subsystem** (Edit Router + Edit Interpreter + Preview/Confirm) that performs surgical, cost-aware re-generation instead of a blind full re-run |
 | **Problem Value & Impact** | **25%** | A **named niche** (Etsy/Shopify sellers) with a real cost-savings story ($300–$1,500 studio ads → automated); output in **three ready-to-post aspect ratios**; **graceful degradation** (Ken-Burns fallback) so a seller always gets a finished ad; a **live cost dashboard** that makes spend transparent and bounded; a **post-generation chat revision** feature that mirrors how a real seller would actually work with a freelance editor ("make the hook punchier") without paying for a full re-shoot |
 | **Presentation & Documentation** | **15%** | This complete technical document; the **mermaid architecture diagram**; the **live-streaming dashboard** (budget ledger, critic reasoning trace, drift scores, edit-router decisions) that makes the autonomous decisions watchable in real time; the closing **transparency breakdown** (four scripts, all critic scores, merge justification, director's treatment, per-shot justifications, ledger, drift scores) surfaced to the frontend; a **diff-style preview** before any chat-driven re-render |
 
