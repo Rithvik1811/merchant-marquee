@@ -14,7 +14,7 @@ Do not treat it as a stable contract.
 from __future__ import annotations
 
 import logging
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -46,14 +46,14 @@ def _envelope(event_type: str, job_id: str, payload: Any) -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Compile the graph once at startup; keep any DB connection open for life."""
-    app.state.exit_stack = ExitStack()
+    app.state.exit_stack = AsyncExitStack()
     logger.info("Building Phase 0 LangGraph graph...")
-    app.state.graph = build_graph(exit_stack=app.state.exit_stack)
+    app.state.graph = await build_graph(exit_stack=app.state.exit_stack)
     logger.info("Graph compiled and ready.")
     try:
         yield
     finally:
-        app.state.exit_stack.close()
+        await app.state.exit_stack.aclose()
         logger.info("Shutdown: released graph resources.")
 
 
