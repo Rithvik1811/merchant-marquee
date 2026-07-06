@@ -1,0 +1,44 @@
+# ProductCut backend — Python dependencies
+# Create the environment with uv:
+#   uv venv
+#   uv pip install -r requirements.txt
+
+# --- Orchestration ---------------------------------------------------------
+langgraph>=0.2.60
+langgraph-checkpoint-postgres>=2.0.13
+langchain-core>=0.3.28
+
+# --- Web server / API -------------------------------------------------------
+fastapi>=0.115.6
+uvicorn[standard]>=0.34.0
+websockets>=13.1
+python-multipart>=0.0.20   # required by FastAPI for file (product photo) uploads
+pydantic>=2.10.4
+pydantic-settings>=2.7.1
+
+# --- Qwen Cloud / DashScope (LLM, vision, TTS, video-gen) -------------------
+openai>=1.58.1              # used against DashScope's OpenAI-compatible endpoint (chat + Qwen-VL)
+dashscope>=1.20.14          # native SDK: Wan/HappyHorse video synthesis + CosyVoice TTS task polling
+
+# --- Database ----------------------------------------------------------------
+psycopg[binary]>=3.2.3      # Postgres driver (LangGraph checkpointer + application tables)
+sqlalchemy>=2.0.36
+
+# --- Alibaba Cloud ------------------------------------------------------------
+oss2>=2.19.1                # Object Storage Service (product photos, shot clips, final videos)
+alibabacloud-ecs20140526>=4.1.5   # optional: only needed if provisioning/inspecting ECS from code
+
+# --- Media handling -----------------------------------------------------------
+ffmpeg-python>=0.2.0         # thin wrapper over the ffmpeg CLI for Assembly / Format Export nodes
+Pillow>=11.1.0               # product photo preprocessing/validation before Truth Extractor
+
+# --- HTTP / async utilities ----------------------------------------------------
+httpx>=0.28.1
+tenacity>=9.0.0              # retry/backoff for Qwen and video-gen API calls
+
+# --- Config / dev ---------------------------------------------------------------
+python-dotenv>=1.0.1
+
+# --- Testing --------------------------------------------------------------------
+pytest>=8.3.4
+pytest-asyncio>=0.25.2
