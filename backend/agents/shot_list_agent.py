@@ -34,15 +34,23 @@ Coherence Validator (pacing re-check before its blind coherence read) — and
 re-prompting a Call A failure re-runs only the tiny justification object, not the
 whole shot list, so it converges faster and cheaper.
 
-JUSTIFICATION VALIDATOR OWNERSHIP. The real, production Justification Validator
-is KR's separate deterministic module (docs/BUILD_TASKS.md Phase 2, `[BRAIN]
-Justification Validator`). `_default_validate_justifications` in THIS file is
-RR's LOCAL STAND-IN for that contract — it exists only so the Shot-List Agent is
-fully functional and testable today without waiting on KR, exactly the pattern
-Phase 1 used for independent node testing. It is injected via the
-`validate_justifications` parameter, so dropping in KR's real module later is a
-one-line change (import it and pass it, or change the default). The stand-in is
-NOT a claim of ownership over KR's task.
+JUSTIFICATION VALIDATOR OWNERSHIP. KR's real, production Justification Validator
+(`agents.justification_validator.validate_justifications`, shared with Treatment
+Agent) is now WIRED IN as this module's default -- the swap flagged as a one-line
+change below has happened. `_default_validate_justifications` in THIS file is
+RR's LOCAL STAND-IN, kept (not deleted) because it's still directly unit-tested
+by this file's own test suite as a reference implementation of the same contract,
+and remains available via the `validate_justifications` injection point for
+anyone testing this module without KR's dependency. It is NOT the active default
+anymore and is NOT a claim of ownership over KR's task.
+
+Confirmed compatible on integration: KR's `validate_justifications` takes the
+identical positional signature `(justifications, winning_script, product_truths,
+treatment)` this module always called with. The one real difference is the result
+key -- KR's `ValidationResult` uses `shot_id_or_beat_index` (shared with Treatment
+Agent's beat validation), not this module's own stand-in's `shot_id` -- so
+`_build_call_a_reprompt` below reads either key (see its docstring). No other
+code path in this module reads a validator result's identifier field.
 
 ANTI-GENERICNESS. There is deliberately no `product_category` field anywhere in
 the Shot contract (a category field is the seam a lookup-table shortcut would
@@ -73,6 +81,9 @@ from openai import AsyncOpenAI
 from pydantic import ValidationError
 
 from agents._retry import create_completion
+from agents.justification_validator import (
+    validate_justifications as _kr_validate_justifications,
+)
 from graph.shot_schema import (
     BeatRole,
     CameraMove,
@@ -586,14 +597,16 @@ async def generate_shot_list(
     winning_script: WinningScript,
     treatment: Treatment,
     product_truths: list[ProductTruth],
-    validate_justifications: Callable[..., list[dict]] = _default_validate_justifications,
+    validate_justifications: Callable[..., list[dict]] = _kr_validate_justifications,
     client: Optional[AsyncOpenAI] = None,
 ) -> list[Shot]:
     """Run the Shot-List Agent: Call A -> validate (-> one bounded Call A re-prompt
     -> per-shot treatment fallback) -> Call B -> assemble -> structural validate.
 
-    `validate_justifications` defaults to RR's local stand-in but is injectable so
-    KR's real Justification Validator drops in without touching this function. The
+    `validate_justifications` defaults to KR's real, shared Justification
+    Validator (`agents.justification_validator.validate_justifications`) but stays
+    injectable -- tests pass RR's local stand-in (`_default_validate_justifications`
+    above) or any other conforming callable without touching this function. The
     job is never blocked: a shot that can't be validated after one re-prompt falls
     back to its treatment beat's grounded justification rather than being dropped.
     """
