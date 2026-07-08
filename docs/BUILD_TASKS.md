@@ -131,18 +131,22 @@ These are shared contracts — draft together, commit as versioned files (schema
 ## Phase 4 — Continuity Agent + Human-in-the-Loop Review
 *Goal: catch visual drift, auto-retry within a hard cap, escalate to a real human-review interrupt when exhausted.*
 
+**Phase 4 scope note:** all `[BRAIN]` tasks (both KR's and RR's) were built together in one pass, since the Continuity Agent's scoring and the Continuity Gate's retry/interrupt logic are tightly coupled (the Gate reads the Agent's drift scores directly) and a capped retry loop is fundamentally a graph-topology feature that can only be verified against the real compiled graph. `[BODY]` tasks (dashboard drift panel, Human-review UI) are explicitly deferred — brain-only this pass.
+
 ### KR
-- [ ] `[BRAIN]` **Continuity Agent** (Qwen-VL): compare generated frame vs. reference photo + shared lighting/style string, return drift/consistency score
-- [ ] `[BRAIN]` **Human-in-the-loop**: real LangGraph `interrupt()` carrying the **C4** payload; on resume apply `approve`/`retry-with-edit`/`accept-fallback`
+- [x] `[BRAIN]` **Continuity Agent** (Qwen-VL): compare generated frame vs. reference photo + shared lighting/style string, return drift/consistency score — `backend/agents/continuity_agent.py`, tests in `backend/tests/test_continuity_agent.py`. Scores only `status=="passed"` shots (skips Ken-Burns fallback clips — drift is definitionally near-zero there), extracts a real midpoint frame via ffmpeg, one Qwen-VL call per shot, writes `generated_shots[shot_id].drift_score` in `[0.0, 1.0]` (`DRIFT_THRESHOLD=0.35`, env-overridable). A per-shot scoring failure records the worst-case score rather than silently passing.
+- [x] `[BRAIN]` **Human-in-the-loop**: real LangGraph `interrupt()` carrying the **C4** payload; on resume apply `approve`/`retry-with-edit`/`accept-fallback` — `backend/agents/continuity_gate.py`, tests in `backend/tests/test_continuity_gate.py` + `test_continuity_loop_e2e.py` + `test_phase4_integration_edge_cases.py`. Real pause/resume verified against LangGraph 1.2.7 (not mocked), including multi-shot review in one batch and multi-round review on the same shot. Two real issues found by independent adversarial review and resolved: (1) the `interrupt_requested` live event double-fires across a pause/resume cycle — a known, documented LangGraph gotcha class with no clean in-node fix (committed state is unaffected; flagged clearly, locked in by a test, real fix needs graph-driving-layer support — see deferred note below); (2) a human `"approve"` wasn't durable across a *later* retry-loop pass driven by a different shot — fixed with a durable per-clip `continuity_approved` marker.
 - [ ] `[BODY]` Dashboard: continuity drift-score panel per shot
 
 ### RR
-- [ ] `[BRAIN]` **Capped retry loop** (drift > threshold and retries < 2 → loop back to Video-Gen; hard cap at 2 — this is the *only* place retries are consumed); emit `drift_scored`/`interrupt_requested` events
+- [x] `[BRAIN]` **Capped retry loop** (drift > threshold and retries < 2 → loop back to Video-Gen; hard cap at 2 — this is the *only* place retries are consumed, grep-confirmed); emit `drift_scored`/`interrupt_requested` events — same files as above. Verified via a real compiled-graph run counting actual Wan calls that a retry loop regenerates *only* the flagged shot (`video_gen_node.py` gained a small, necessary `status=="pending"` fan-out filter + a `generated_shots` merge fix, both required so the retry loop doesn't blindly re-bill every shot on every pass).
 - [ ] `[BODY]` **Human-review UI**: surface the interrupt (shot + drift score + candidate frames from OSS), offer the 3 actions, post resume payload per C4
 
-**Scope-cut fallback (decide by start of phase, not mid-build):** if short on time, degrade to "flag only, no auto-retry/interrupt" — documented, not silently dropped.
+**Scope-cut fallback (decide by start of phase, not mid-build):** N/A — full auto-retry/interrupt was built, not the flag-only degrade.
 
-**Exit criteria:** a drifting shot triggers up to 2 auto-regens; exhausted retries raise a real interrupt that pauses, surfaces in UI, and resumes correctly on all 3 human choices (or the documented flag-only fallback).
+**Deferred follow-up (RR/KR, needs the WS/dashboard-driving layer, out of this pass's scope):** the `interrupt_requested` event fires twice per reviewed shot (see note above) — the real fix is detecting a genuinely-new pause by diffing `graph.get_state(config)` at the layer that actually drives the graph (e.g. `app/main.py`'s WS handler) and synthesizing the live notification from there, rather than from inside `continuity_gate_node`. Revisit when the Human-review UI / WS wiring is built.
+
+**Exit criteria — BRAIN half met, BODY half open:** a drifting shot triggers up to 2 auto-regens (verified) → exhausted retries raise a real interrupt that pauses (verified) and resumes correctly on all 3 human choices (verified). The "surfaces in UI" clause is NOT met — no dashboard/Human-review UI was built this pass (explicitly out of scope). Full phase exit criteria stays open until that body work lands.
 
 ---
 

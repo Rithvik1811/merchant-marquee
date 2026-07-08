@@ -17,7 +17,7 @@ import pytest
 
 from graph.build import build_graph
 from tests._fakes import make_content_routed_sync_openai, make_fake_async_openai
-from tests._phase3_graph import patch_phase3_boundaries
+from tests._phase3_graph import patch_continuity_boundaries, patch_phase3_boundaries
 
 GOOD_FACTS = [
     ("a hairline scratch runs diagonally across the lower left corner of the lid", "imperfection"),
@@ -380,6 +380,7 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
         make_fake_async_openai([SHOT_LIST_CALL_A_PAYLOAD, SHOT_LIST_CALL_B_PAYLOAD]),
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
+    patch_continuity_boundaries(monkeypatch)  # Phase 4: clean drift, loop ends at once
 
     graph = await build_graph()
     initial_state = {
@@ -411,6 +412,7 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
         "merge_validated",
         "budget_updated",
         "shot_generated",
+        "drift_scored",  # Phase 4: Continuity Agent scored every real clip
     }, event_names
     truth_event = next(e for e in custom_events if e["name"] == "truth_extracted")
     assert truth_event["data"]["count"] == len(GOOD_FACTS)

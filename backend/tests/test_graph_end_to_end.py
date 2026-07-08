@@ -44,7 +44,7 @@ from agents.budget_gate import RATE_1080P
 from agents.video_gen_node import FALLBACK_REQUESTED_STATUS, SUCCESS_STATUS
 from graph.build import build_graph
 from tests._fakes import make_content_routed_sync_openai, make_fake_async_openai
-from tests._phase3_graph import patch_phase3_boundaries
+from tests._phase3_graph import patch_continuity_boundaries, patch_phase3_boundaries
 from tests.test_graph_build import (
     CHECKER_ROUTES,
     CONCEPT_AGENT_PAYLOAD,
@@ -89,6 +89,7 @@ async def test_full_pipeline_ingest_through_ken_burns_fallback(monkeypatch):
         make_fake_async_openai([SHOT_LIST_CALL_A_PAYLOAD, SHOT_LIST_CALL_B_PAYLOAD]),
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
+    patch_continuity_boundaries(monkeypatch)  # Phase 4 (§5.10): clean drift, no retry loop
 
     graph = await build_graph()
     initial_state = {
@@ -115,6 +116,7 @@ async def test_full_pipeline_ingest_through_ken_burns_fallback(monkeypatch):
         "merge_validated",
         "budget_updated",
         "shot_generated",
+        "drift_scored",  # Phase 4: Continuity Agent scored every real clip
     }, event_names
 
     values = (await graph.aget_state(config)).values
@@ -208,6 +210,7 @@ async def test_full_pipeline_video_gen_failure_routes_to_ken_burns_without_block
         make_fake_async_openai([SHOT_LIST_CALL_A_PAYLOAD, SHOT_LIST_CALL_B_PAYLOAD]),
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=True)
+    patch_continuity_boundaries(monkeypatch)  # Phase 4 (§5.10): clean drift, no retry loop
 
     graph = await build_graph()
     initial_state = {

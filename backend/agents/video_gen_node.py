@@ -191,6 +191,27 @@ contract, not an assumption pending agreement:
   * No `generated_shots[shot_id]` entry is written for a handed-off shot --
     there is no video to reference yet. Ken-Burns should write that entry
     itself once its own pan/zoom clip exists.
+
+PHASE 4 (Continuity retry loop -- two small, surgical production changes here).
+When this node was wired into graph/build.py it ran exactly once per job. Phase 4
+adds a Continuity retry cycle (agents/continuity_gate.py:
+`... -> continuity_gate -> [loop back to video_gen if any shot is now "pending"]`),
+which means this node can now run MORE than once, and the second pass must NOT
+blindly regenerate every shot. Two minimal changes make it loop-safe:
+  A. `_dispatch` now fans out `Send()` ONLY for shots whose `status == "pending"`
+     (the value shots arrive with, and the value the Continuity Gate resets a
+     retrying shot to). Every other shot ("passed"/"fallback"/"fallback_requested"
+     /"review") is passed through unchanged by `_join`'s existing else-branch --
+     the same "pass through non-matching shots untouched" posture
+     ken_burns_fallback_node uses. Without this, a retry loop would re-hit the Wan
+     API (real money) for shots that already passed.
+  B. The node wrapper now MERGES its new GeneratedShot entries INTO the incoming
+     `state["generated_shots"]` instead of returning only the newly-generated
+     ones. `generated_shots` is an overwrite-semantics field; on a retry pass
+     `generate_videos` only produces entries for the one(s) being regenerated, so
+     returning just those would clobber every already-generated shot's entry.
+     Merging preserves them (mirrors ken_burns_fallback_node). First-pass state
+     has no entries, so this is a no-op there and existing tests are unaffected.
 """
 from __future__ import annotations
 
@@ -224,6 +245,10 @@ FAILURE_TYPE_BUDGET_EXCEEDED = "budget_exceeded"
 FALLBACK_REQUESTED_STATUS = "fallback_requested"
 # Already a real, frozen Shot.status value -- used on success.
 SUCCESS_STATUS = "passed"
+# The frozen "(re-)generate this shot" status -- the value shots arrive with from
+# the Shot-List Agent AND the value the Continuity Gate resets a retrying shot to.
+# Used by the fan-out filter (Phase 4, see module docstring's PHASE 4 note).
+PENDING_STATUS = "pending"
 
 # Typical observed latency was 42-99s per 5s clip (docs/DERISK_VIDEO_GEN_RESULT.md
 # §2); this gives generous margin above that range. Env-overridable per the
@@ -491,6 +516,12 @@ async def generate_videos(
         return {"generated_shots": {shot_id: generated}}
 
     def _dispatch(state: _VideoGenGraphState) -> list[Send]:
+        # PHASE 4 retry-loop filter (see module docstring's PHASE 4 note): only
+        # fan out Send() for shots that still need (re-)generation -- status
+        # "pending". Every other shot ("passed"/"fallback"/"fallback_requested"/
+        # "review") is left for `_join` to pass through untouched, so a Continuity
+        # retry loop regenerates ONLY the shot(s) the Gate reset to "pending"
+        # instead of blindly re-hitting Wan for every shot on every pass.
         return [
             Send(
                 "single_shot",
@@ -502,6 +533,7 @@ async def generate_videos(
                 },
             )
             for shot in state.get("shots", [])
+            if shot.get("status") == PENDING_STATUS
         ]
 
     def _join(state: _VideoGenGraphState) -> dict:
@@ -627,6 +659,13 @@ async def video_gen_node(
         trace_note += f" {n_handed_off} shot(s) handed off for Ken-Burns fallback."
     return {
         "shot_list": shots,
-        "generated_shots": generated,
+        # PHASE 4: merge INTO existing generated_shots rather than replacing it.
+        # With the retry-loop filter above, a re-generation pass only produces
+        # entries for the shot(s) being retried; `generated_shots` is an
+        # overwrite-semantics field, so returning just those would wipe every
+        # already-generated shot's entry. Merging preserves them (same posture as
+        # ken_burns_fallback_node). On the first pass state has none, so this is a
+        # no-op there -- existing tests are unaffected.
+        "generated_shots": {**state.get("generated_shots", {}), **generated},
         "reasoning_trace": state.get("reasoning_trace", "") + trace_note,
     }
