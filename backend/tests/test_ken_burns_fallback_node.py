@@ -379,3 +379,142 @@ def test_output_spec_constants_match_wan_target():
     assert FPS == 30
     assert WIDTH == 1920
     assert HEIGHT == 1080
+
+
+# ---------------------------------------------------------------------------
+# REAL ffmpeg verification -- everything above this line fakes/mocks the
+# render step entirely, which means the actual `zoompan` filter-chain (the
+# part most likely to have a real syntax/argument bug -- ffmpeg filter
+# arguments are notoriously easy to get subtly wrong) had ZERO execution
+# coverage. This machine has real ffmpeg/ffprobe on PATH and the real
+# ffmpeg-python/oss2 packages installed (confirmed), so there is no excuse
+# not to actually run it. Skips gracefully (not silently) if ffmpeg/ffprobe
+# are unavailable in some other environment, so this suite stays portable
+# without weakening verification on a machine that DOES have them.
+# ---------------------------------------------------------------------------
+import json
+import shutil
+import subprocess
+
+from agents.ken_burns_fallback_node import _run_ffmpeg_ken_burns
+
+_HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+_skip_no_ffmpeg = pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg/ffprobe not on PATH")
+
+
+def _make_test_image(tmp_path, color: str = "blue", size: str = "640x480") -> str:
+    """A real static image via ffmpeg's own lavfi color source -- no Pillow
+    dependency needed just to produce a one-frame PNG for the render input."""
+    path = str(tmp_path / "source.png")
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={color}:s={size}:d=1",
+         "-frames:v", "1", path],
+        check=True, capture_output=True,
+    )
+    return path
+
+
+def _ffprobe(path: str) -> dict:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "format=duration:stream=codec_type,codec_name,width,height",
+         "-of", "json", path],
+        check=True, capture_output=True, text=True,
+    )
+    return json.loads(result.stdout)
+
+
+@_skip_no_ffmpeg
+@pytest.mark.parametrize(
+    "camera_move",
+    ["push_in", "pull_back", "pan", "tilt_up", "orbit", "rack_focus", "static", "totally_unknown_move"],
+)
+def test_real_ffmpeg_render_produces_valid_video_for_every_camera_move(tmp_path, camera_move):
+    """The actual gap this test closes: `_run_ffmpeg_ken_burns` (the real
+    zoompan filter-chain) had never once been executed against real ffmpeg in
+    this suite before -- every other test fakes `render_ken_burns_clip`
+    entirely. Runs the real render for all 8 camera_move paths (7 named +
+    1 unrecognized, exercising the `static` fallback) and verifies each
+    output is a genuinely valid MP4: exact requested duration, exact target
+    resolution, h264 video + aac audio streams both present."""
+    image_path = _make_test_image(tmp_path)
+    z, x, y = ken_burns_expressions(camera_move, frames=60)
+    out_path = str(tmp_path / f"{camera_move}.mp4")
+    duration = 2.0
+
+    _run_ffmpeg_ken_burns(image_path, out_path, duration, z, x, y)
+
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 0
+
+    probe = _ffprobe(out_path)
+    assert abs(float(probe["format"]["duration"]) - duration) < 0.2
+
+    video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    audio_stream = next((s for s in probe["streams"] if s["codec_type"] == "audio"), None)
+    assert video_stream["codec_name"] == "h264"
+    assert video_stream["width"] == WIDTH
+    assert video_stream["height"] == HEIGHT
+    assert audio_stream is not None, "Wan clips carry audio -- a silent track must be present"
+    assert audio_stream["codec_name"] == "aac"
+
+
+@_skip_no_ffmpeg
+def test_render_ken_burns_clip_real_end_to_end_with_local_reference_photo(tmp_path):
+    """The full `render_ken_burns_clip` path (reference-photo resolution +
+    real ffmpeg render), not just the inner ffmpeg call -- using a local file
+    path as the resolved reference image so no network download is needed,
+    exercising the same defensive local-path branch
+    `test_render_ken_burns_clip_uses_local_image_without_download` already
+    covers with a FAKE render; this one is the real-ffmpeg counterpart."""
+    image_path = _make_test_image(tmp_path, color="green", size="800x600")
+    shot = _shot("s1", camera_move="push_in", duration_sec=1.5, reference_image_id="photo_1")
+
+    out_path = render_ken_burns_clip(shot, [image_path])
+    try:
+        assert os.path.exists(out_path)
+        probe = _ffprobe(out_path)
+        assert abs(float(probe["format"]["duration"]) - 1.5) < 0.2
+        video_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+        assert video_stream["width"] == WIDTH and video_stream["height"] == HEIGHT
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
+@_skip_no_ffmpeg
+@pytest.mark.asyncio
+async def test_generate_ken_burns_fallbacks_real_render_fake_upload_end_to_end(tmp_path):
+    """`generate_ken_burns_fallbacks` with a REAL ffmpeg render but a FAKE
+    `upload_fn` (no real OSS credentials needed/available) -- confirms the
+    local path handed to the uploader is a real, non-empty, valid video file
+    (not just a placeholder), and that it's cleaned up afterward."""
+    image_path = _make_test_image(tmp_path)
+    shot = _fallback_requested_shot("s1", camera_move="pan", duration_sec=1.5, reference_image_id="photo_1")
+    other = _shot("s2", status="passed")
+
+    captured_paths: dict[str, str] = {}
+
+    def _capturing_upload(local_path: str, shot_id: str) -> str:
+        # Verify the file is real and valid BEFORE it would be cleaned up.
+        assert os.path.exists(local_path)
+        assert os.path.getsize(local_path) > 0
+        probe = _ffprobe(local_path)
+        assert abs(float(probe["format"]["duration"]) - 1.5) < 0.2
+        captured_paths[shot_id] = local_path
+        return f"http://oss.example.com/fallback/{shot_id}.mp4"
+
+    updated_shots, new_entries = await generate_ken_burns_fallbacks(
+        [shot, other], [image_path], upload_fn=_capturing_upload
+    )
+
+    assert captured_paths == {"s1": captured_paths["s1"]}  # exactly one real render happened
+    # The rendered clip is cleaned up by the caller after upload.
+    assert not os.path.exists(captured_paths["s1"])
+
+    s1 = next(s for s in updated_shots if s["shot_id"] == "s1")
+    assert s1["status"] == FALLBACK_STATUS
+    assert new_entries["s1"]["video_uri"] == "http://oss.example.com/fallback/s1.mp4"
+    assert new_entries["s1"]["duration_sec_used"] == 1.5
+    s2 = next(s for s in updated_shots if s["shot_id"] == "s2")
+    assert s2 == other  # untouched pass-through
