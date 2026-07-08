@@ -53,3 +53,21 @@ def patch_phase3_boundaries(monkeypatch, *, fail_shot_s2: bool = False) -> None:
         return f"http://oss.example.com/jobs/{job_id}/shots/{shot_id}/{filename}"
 
     monkeypatch.setattr("agents.ken_burns_fallback_node.upload_video_to_oss", _fake_upload)
+
+
+def patch_continuity_boundaries(monkeypatch, *, drift_score: float = 0.0) -> None:
+    """Fake the Continuity Agent's per-shot scoring unit (§5.10 -- ffmpeg frame
+    extraction + the Qwen-VL call), so a full-graph test can run through the
+    Continuity Agent/Gate without real network or ffmpeg.
+
+    Defaults to a clean, within-threshold `drift_score` so every scored shot
+    passes, the Continuity Gate leaves them all "passed", and the retry loop ends
+    immediately with no interrupt -- i.e. the full pipeline reaches END exactly as
+    it did before Phase 4 wired Continuity in. Tests that want to exercise the
+    retry/interrupt path fake `_score_one_shot` themselves (see
+    tests/test_continuity_loop_e2e.py)."""
+
+    async def _fake_score_one_shot(shot, entry, product_photos, client, extract):  # noqa: ARG001
+        return drift_score, "clean match (test fake)"
+
+    monkeypatch.setattr("agents.continuity_agent._score_one_shot", _fake_score_one_shot)

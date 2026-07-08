@@ -1,9 +1,10 @@
 """
-Phase 1-3: LangGraph graph -- Product Truth Extractor -> Concept Agent -> 5 parallel
+Phase 1-4: LangGraph graph -- Product Truth Extractor -> Concept Agent -> 5 parallel
 Critic Chain checkers -> Meta-Critic -> Merge Coherence Validator -> (Copy Editor
 loop-back | Meta-Critic swap retry | fallback) -> winning_script finalized ->
 Treatment Agent -> Shot-List Agent -> Budget Gate -> Video-Gen Node -> Ken-Burns
-Fallback Node.
+Fallback Node -> Continuity Agent -> Continuity Gate -> (retry loop back to
+Video-Gen | END).
 
 The full Critic Chain (§5.4) is wired end to end, including the Merge Coherence
 Validator (§5.4.7) and Copy Editor (§5.4.8). `winning_script` is set by
@@ -12,8 +13,20 @@ merge_validator_node on EITHER a full pass ("finalize") or a terminal fallback
 the single highest composite-scoring original variant, not a degraded/partial
 result), so BOTH route into Treatment Agent rather than only "finalize". Phase 2
 (Treatment Agent §5.5, Shot-List Agent §5.6, Budget Gate §5.7) and Phase 3
-(Video-Gen Node §5.8, Ken-Burns Fallback Node §5.9) are wired in after it --
-nothing downstream of Ken-Burns (Continuity, Voiceover, Assembly) is wired yet.
+(Video-Gen Node §5.8, Ken-Burns Fallback Node §5.9) are wired in after it.
+
+Phase 4 (§5.10) adds the Continuity Agent (Qwen-VL drift scoring) and the
+Continuity Gate (capped retry + human-in-the-loop) after Ken-Burns, plus a
+CONDITIONAL LOOP: the Gate's `route_after_continuity_gate` sends the run back to
+`video_gen` whenever it reset any drifted shot to "pending" (an automatic retry,
+or a human `retry_with_edit`), else to END. This is the pipeline's first real
+cycle: `video_gen -> ken_burns_fallback -> continuity_agent -> continuity_gate ->
+(loop back to video_gen for retrying shots | finish)`. The Gate is also where the
+graph genuinely `interrupt()`s for a retry-exhausted shot -- pause/resume that
+REQUIRES the checkpointer below (nothing downstream of Continuity -- Voiceover,
+Assembly, Export -- is wired yet). Unlike prior phases, Phase 4 wires itself into
+this file directly: a retry loop is a graph-topology feature that can only be
+exercised in the compiled graph.
 
 Checkpointer selection is graceful:
   - if DATABASE_URL is set  -> AsyncPostgresSaver (real durable checkpoints)
@@ -48,6 +61,8 @@ from langgraph.graph import END, START, StateGraph
 from agents.body_checker import body_checker_node
 from agents.budget_gate import budget_gate_node
 from agents.concept_agent import concept_agent_node
+from agents.continuity_agent import continuity_agent_node
+from agents.continuity_gate import continuity_gate_node, route_after_continuity_gate
 from agents.copy_editor import copy_editor_node
 from agents.cta_tone_checkers import cta_checker_node, tone_checker_node
 from agents.hook_checker import hook_checker_node
@@ -105,11 +120,24 @@ def _build_uncompiled() -> StateGraph:
     builder.add_node("budget_gate", budget_gate_node)
     builder.add_node("video_gen", video_gen_node)
     builder.add_node("ken_burns_fallback", ken_burns_fallback_node)
+    builder.add_node("continuity_agent", continuity_agent_node)
+    builder.add_node("continuity_gate", continuity_gate_node)
     builder.add_edge("treatment_agent", "shot_list_agent")
     builder.add_edge("shot_list_agent", "budget_gate")
     builder.add_edge("budget_gate", "video_gen")
     builder.add_edge("video_gen", "ken_burns_fallback")
-    builder.add_edge("ken_burns_fallback", END)
+    # Phase 4 (§5.10): Continuity scores drift, then the Gate decides retry /
+    # human-review / pass. The Gate's conditional edge closes the retry cycle --
+    # back to video_gen for any shot still needing a pass ("pending" retry, or
+    # "fallback_requested" from a human accept_fallback so it reaches Ken-Burns),
+    # else END. See route_after_continuity_gate for why fallback_requested loops.
+    builder.add_edge("ken_burns_fallback", "continuity_agent")
+    builder.add_edge("continuity_agent", "continuity_gate")
+    builder.add_conditional_edges(
+        "continuity_gate",
+        route_after_continuity_gate,
+        {"video_gen": "video_gen", "end": END},
+    )
 
     builder.add_conditional_edges(
         "merge_validator",

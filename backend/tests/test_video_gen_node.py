@@ -308,6 +308,61 @@ async def test_mixed_success_and_failure_across_parallel_shots():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 retry-loop filter: only "pending" shots are (re-)sent to Wan.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_only_pending_shots_are_dispatched_to_wan():
+    sent: list[str] = []
+
+    async def fake_generate(*, image_url, prompt, negative_prompt, duration_sec, resolution):
+        sent.append(image_url)
+        return "http://oss.example.com/clip.mp4"
+
+    # A already-passed shot (from a prior pass) alongside one pending retry shot.
+    passed_shot = {**_shot("s_passed"), "status": SUCCESS_STATUS}
+    pending_shot = _shot("s_pending")  # _shot defaults status="pending"
+
+    updated_shots, generated = await generate_videos(
+        [passed_shot, pending_shot], TRUTHS, TREATMENT, PRODUCT_PHOTOS, generate_fn=fake_generate
+    )
+
+    # Only the pending shot hit the Wan API; the passed shot was NOT re-sent.
+    assert len(sent) == 1
+    assert set(generated.keys()) == {"s_pending"}
+    by_id = {s["shot_id"]: s for s in updated_shots}
+    # The passed shot passes through the join step completely untouched.
+    assert by_id["s_passed"]["status"] == SUCCESS_STATUS
+    assert by_id["s_pending"]["status"] == SUCCESS_STATUS
+
+
+@pytest.mark.asyncio
+async def test_node_merges_new_clips_into_existing_generated_shots(monkeypatch):
+    """A retry pass must not wipe already-generated shots' entries."""
+    async def fake_generate(**kwargs):
+        return "http://wan.example.com/fresh.mp4"
+
+    monkeypatch.setattr("agents.video_gen_node._call_wan_video_gen", fake_generate)
+    monkeypatch.setattr(
+        "agents.video_gen_node.persist_remote_video_to_oss",
+        lambda url, job_id, shot_id, filename="shot.mp4", *, bucket=None, download_fn=None: f"http://oss/{shot_id}.mp4",
+    )
+
+    # State already carries s1's clip (passed on a prior pass); s2 is a pending retry.
+    passed_shot = {**_shot("s1"), "status": SUCCESS_STATUS}
+    pending_shot = _shot("s2")
+    state = _base_state([passed_shot, pending_shot])
+    state["generated_shots"] = {"s1": {"video_uri": "http://oss/s1_old.mp4", "attempt": 1, "drift_score": 0.9}}
+
+    result = await RunnableLambda(video_gen_node).ainvoke(state)
+
+    gen = result["generated_shots"]
+    # s1's prior entry is preserved (not clobbered); s2's fresh entry is added.
+    assert gen["s1"]["video_uri"] == "http://oss/s1_old.mp4"
+    assert gen["s1"]["drift_score"] == 0.9
+    assert gen["s2"]["video_uri"] == "http://oss/s2.mp4"
+
+
+# ---------------------------------------------------------------------------
 # video_gen_node wrapper: OSS persistence + shot_generated events
 # ---------------------------------------------------------------------------
 def _base_state(shots):
