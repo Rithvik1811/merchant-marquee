@@ -328,6 +328,42 @@ def test_prompt_falls_back_to_form_factor_anchor_alone_when_no_cited_truth_match
 
 
 # ---------------------------------------------------------------------------
+# video-gen-fidelity PHASE 4 fix: drop the redundant per-shot "Product detail"
+# clause from Subject on human-interaction shots (confirmed redundant with
+# Action/Motion's own required verbatim contact-fact mention -- see
+# agents/shot_list_agent.py's HUMAN-INTERACTION SHOTS rule -- and confirmed as
+# the single largest section pushing real shots past Wan's 1,500-char hard
+# truncation ceiling in a live run; see _build_prompt's own comment).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("shot_type", ["product_in_hand", "worn_in_use"])
+def test_human_interaction_shots_omit_redundant_product_detail_clause(shot_type):
+    shot = _shot("s1", shot_type=shot_type)
+    prompt = _build_prompt(shot, TRUTHS_WITH_FORM_FACTOR, TREATMENT)
+    # The form_factor anchor (the actual identity-fix content) still leads.
+    assert FORM_FACTOR_TRUTH["fact"] in prompt
+    # But the redundant per-shot micro-fact restatement is gone.
+    assert "Product detail:" not in prompt
+    assert "double-wall stainless seam" not in prompt
+
+
+def test_non_human_shots_keep_product_detail_clause_regression():
+    """Regression: this fix is scoped to human-interaction shot_types only --
+    an ordinary shot's Subject line is unchanged."""
+    shot = _shot("s1", shot_type="macro_detail")
+    prompt = _build_prompt(shot, TRUTHS_WITH_FORM_FACTOR, TREATMENT)
+    assert "Product detail: double-wall stainless seam." in prompt
+
+
+def test_human_interaction_shot_with_no_form_factor_falls_back_to_generic_subject():
+    """With no form_factor truth present at all, a human-interaction shot's
+    Subject falls back to the generic reference-photo line rather than an
+    empty string -- never silently drop Subject to nothing."""
+    shot = _shot("s1", shot_type="product_in_hand")
+    prompt = _build_prompt(shot, TRUTHS, TREATMENT)
+    assert "Subject: The product shown in the reference photo." in prompt
+
+
+# ---------------------------------------------------------------------------
 # video-gen-fidelity PHASE 1: hard 1,400-char prompt budget, enforced (not just
 # warned about) -- cuts Quality, then compresses Mood, then trims Lighting, in
 # that order, stopping as soon as it fits; never lets the server silently
@@ -397,18 +433,38 @@ def test_prompt_budget_drops_all_three_sections_in_order_when_needed(caplog):
     assert any("Quality, Mood (compressed), Lighting (trimmed)" in w for w in warnings)
 
 
-def test_prompt_budget_never_silently_exceeds_when_action_alone_is_huge(caplog):
-    """When the shot's own description is so long that even dropping every
-    cuttable section (Quality/Mood/Lighting) can't bring it under budget, the
-    grounded content (Subject/Action/Camera/Composition) is still never cut --
-    instead this is flagged loudly (never silently handed to Wan's server-side
-    truncation)."""
+def test_prompt_action_tail_gets_trimmed_when_it_is_the_overflow_source(caplog):
+    """video-gen-fidelity PHASE 4 fix: when the shot's own description is so
+    long that dropping every cuttable section (Quality/Mood/Lighting) still
+    isn't enough, Action/Motion's own tail is now trimmed (last resort) rather
+    than left whole and silently handed to Wan's server-side truncation --
+    confirmed against a real live overflow (derisk/outputs/
+    full_pipeline_live_vikr_postfix.log, shot s3, a hero shot at 1999 chars
+    pre-trim)."""
     shot = _shot("s1")
     shot["description"] = "A very long action description. " * 60  # pushes well over budget alone
     with caplog.at_level("WARNING"):
         prompt = _build_prompt(shot, TRUTHS, TREATMENT)
+    assert len(prompt) <= PROMPT_CHAR_BUDGET
+    assert shot["description"] not in prompt  # trimmed, not kept whole
+    assert "A very long action description." in prompt  # at least the first sentence survives
+    assert any(
+        "Action/Motion (trimmed tail)" in r.message and "s1" in r.message for r in caplog.records
+    )
+
+
+def test_prompt_budget_never_silently_exceeds_when_even_first_sentence_is_huge(caplog):
+    """Genuine last-resort case: _trim_description_tail always keeps at least
+    the description's first "sentence" -- if that alone (no sentence-ending
+    punctuation to trim at) is still enormous, the prompt can still exceed
+    budget. Confirms this is flagged loudly, never silently truncated or
+    crashed on."""
+    shot = _shot("s1")
+    shot["description"] = "an enormous run-on action description with no sentence breaks at all " * 30
+    with caplog.at_level("WARNING"):
+        prompt = _build_prompt(shot, TRUTHS, TREATMENT)
     assert len(prompt) > PROMPT_CHAR_BUDGET
-    assert shot["description"] in prompt  # Action/Motion content itself was never cut
+    assert shot["description"] in prompt  # single unsplittable "sentence" -- never cut
     assert any(
         "approaching Wan's" in r.message and "s1" in r.message for r in caplog.records
     )

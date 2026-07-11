@@ -310,6 +310,36 @@ _IDENTITY_PROTECTION_CLAUSE = (
 # human-interaction shot's Action/Motion text.
 _ACTION_URGENCY_CLAUSE = " The action begins immediately and completes before the clip ends."
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _trim_description_tail(description: str, max_len: int) -> str:
+    """video-gen-fidelity PHASE 4 fix, last-resort tier: drop trailing
+    sentences from `description` (the shot's own Action/Motion content, e.g.
+    a hero shot's legitimately-longer 120-180 word arc) until it fits within
+    `max_len` -- always keeps at least the first sentence, never returns an
+    empty string. Only reached when Quality/Mood/Lighting cuts and the
+    redundant-Subject-clause drop (is_human_shot) still weren't enough --
+    confirmed a real, live-occurring gap: a hero shot's Cast + full-length
+    Action/Motion + Composition's identity clause can exceed even Wan's
+    1,500-char hard truncation ceiling on their own (derisk/outputs/
+    full_pipeline_live_vikr_postfix.log: shot s3, 1999 chars pre-trim).
+    Trimming HERE (Action/Motion sits before Composition/Mood in render
+    order) is strictly better than leaving it to Wan's own silent truncation,
+    which would otherwise cut into -- or entirely drop -- the never-cut
+    Composition identity-protection clause instead.
+    """
+    sentences = _SENTENCE_SPLIT_RE.split(description.strip())
+    if len(sentences) <= 1:
+        return description  # nothing to drop -- return verbatim, not just .strip()'d
+    kept = sentences[0]
+    for sentence in sentences[1:]:
+        candidate = f"{kept} {sentence}"
+        if len(candidate) > max_len:
+            break
+        kept = candidate
+    return kept
+
 # The mirror-image fix for the CTA close: here we WANT the motion to resolve
 # into stillness by the end, not keep moving into an abrupt trim (Phase 3
 # fixes the trim-side half of that same failure in assembly_agent.py).
@@ -420,6 +450,7 @@ def _resolve_reference_image_url(reference_image_id: str, product_photos: list[s
 def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Optional[Treatment]) -> str:
     truths_by_id = {t["truth_id"]: t for t in product_truths}
     truth = truths_by_id.get(shot["justification"]["truth_fact_id"])
+    is_human_shot = shot["shot_type"] in _HUMAN_INTERACTION_SHOT_TYPES
 
     # v8 fix (Meta Quest -> "phone on a stand" wrong-object bug): lead the
     # Subject line with the holistic whole-object form_factor anchor fact
@@ -430,14 +461,31 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
     # isolated micro-fact alone under-specifies the subject as a whole object
     # -- exactly what let the i2v model collapse toward a common
     # training-data composition instead of the actual product shape.
+    #
+    # video-gen-fidelity PHASE 4 fix: on a human-interaction shot, DROP the
+    # "Product detail: {fact}" clause here -- confirmed redundant, not just
+    # assumed: agents/shot_list_agent.py's HUMAN-INTERACTION SHOTS rule
+    # requires Call B to "name the EXACT contact point using the
+    # human-contact fact cited above, verbatim" inside Action/Motion, so the
+    # cited truth is already restated there for every human-interaction shot
+    # by construction. Keeping a second copy in Subject only cost budget for
+    # zero new information -- confirmed against a real live run
+    # (derisk/outputs/full_pipeline_live_vikr_session.log) where this
+    # redundant clause was the single largest section of two shots (s2/s3,
+    # 604/613 chars each) that still overflowed Wan's 1,500-char hard
+    # truncation ceiling (1515/1509 chars) even after every other cuttable
+    # section (Quality dropped, Mood compressed, Lighting trimmed) was
+    # already exhausted. The form_factor anchor itself (the actual identity
+    # fix) is untouched -- only the redundant per-shot restatement is cut.
     form = next((t for t in product_truths if t["category"] == "form_factor"), None)
     anchor = f"The product: {form['fact']} " if form else ""
-    subject = (
-        f"{anchor}Product detail: {truth['fact']}." if truth
-        else (anchor.strip() or "The product shown in the reference photo.")
-    )
-
-    is_human_shot = shot["shot_type"] in _HUMAN_INTERACTION_SHOT_TYPES
+    if is_human_shot:
+        subject = anchor.strip() or "The product shown in the reference photo."
+    else:
+        subject = (
+            f"{anchor}Product detail: {truth['fact']}." if truth
+            else (anchor.strip() or "The product shown in the reference photo.")
+        )
 
     # Cast section (video-gen-fidelity story-arc fix). Text-only i2v prompting
     # cannot lock FACIAL identity across independent Wan generations, but it
@@ -457,15 +505,22 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
     if is_human_shot and treatment:
         cast_line = (treatment.get("character_anchor") or "").strip()
 
-    action = shot["description"]
+    # `_action_suffix` tracked separately from the base description (not just
+    # concatenated straight into `action`) so the video-gen-fidelity PHASE 4
+    # last-resort trim below can shorten the shot's own (possibly
+    # hero-length) description tail without ever eating into this short,
+    # never-cut motion-completion/stillness clause.
+    description = shot["description"]
+    _action_suffix = ""
     if is_human_shot:
         # Counters both the i2v static-start bias and a clip that's still
         # mid-motion when it cuts off (see _ACTION_URGENCY_CLAUSE's own comment).
-        action += _ACTION_URGENCY_CLAUSE
+        _action_suffix += _ACTION_URGENCY_CLAUSE
     if shot["shot_type"] == "cta_endcard":
         # Opposite problem, same mechanism -- here the clip should visibly
         # SETTLE by the end rather than just stop (see _CTA_STILLNESS_CLAUSE).
-        action += _CTA_STILLNESS_CLAUSE
+        _action_suffix += _CTA_STILLNESS_CLAUSE
+    action = description + _action_suffix
 
     if shot["camera_move"] == "static":
         camera = _FIXED_CAMERA_PHRASING
@@ -583,6 +638,27 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
         dropped.append("Lighting (trimmed)")
         prompt = _render(sections)
 
+    if len(prompt) > PROMPT_CHAR_BUDGET:
+        # video-gen-fidelity PHASE 4, last-resort tier: every genuinely-generic
+        # section is already gone/compressed, and this shot's own description
+        # is still too long to fit -- confirmed live-occurring for a hero shot
+        # (120-180 word allowance by design) and for a long cited-fact Subject
+        # line alike (see _trim_description_tail's docstring). Trim
+        # Action/Motion's OWN tail (never the short, never-cut urgency/
+        # stillness suffix) rather than leave the overflow to Wan's silent
+        # server-side truncation, which would otherwise cut into whatever
+        # comes after Action/Motion in render order -- including the
+        # never-cut Composition identity-protection clause.
+        overage = len(prompt) - PROMPT_CHAR_BUDGET
+        target_len = max(len(description) - overage, 1)
+        trimmed_description = _trim_description_tail(description, target_len)
+        if len(trimmed_description) < len(description):
+            for s in sections:
+                if s[0] == "Action/Motion":
+                    s[1] = trimmed_description + _action_suffix
+            dropped.append("Action/Motion (trimmed tail)")
+            prompt = _render(sections)
+
     if dropped:
         logger.warning(
             "Video-Gen Node: shot %s prompt exceeded the %d-char budget -- cut "
@@ -591,12 +667,12 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
             shot["shot_id"], PROMPT_CHAR_BUDGET, ", ".join(dropped), len(prompt),
         )
     if len(prompt) > PROMPT_CHAR_BUDGET:
-        # Even after every cuttable section is gone, the grounded content
-        # itself (Subject/Action/Camera/Composition) is still too long -- this
-        # can genuinely happen with a very long shot.description. We never cut
-        # those sections (they're the shot's actual content), so flag it: the
-        # tail may still be silently dropped by Wan's server-side 1,500-char
-        # truncation, and this is the one case we can't prevent that ourselves.
+        # Even after every cuttable section (including Action/Motion's own
+        # tail above) is gone, Subject/Cast/Camera/Composition alone are still
+        # too long -- these are never cut (they carry the shot's non-
+        # negotiable identity-fix content) so flag it: the tail may still be
+        # silently dropped by Wan's server-side 1,500-char truncation, and
+        # this is the one case we can't prevent that ourselves.
         logger.warning(
             "Video-Gen Node: shot %s prompt is still %d chars after all budget "
             "cuts -- approaching Wan's 1,500-char server-side truncation limit.",
