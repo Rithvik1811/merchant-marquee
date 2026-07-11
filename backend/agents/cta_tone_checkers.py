@@ -98,31 +98,50 @@ class ToneCheckResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 _CTA_SYSTEM_PROMPT = """\
-You are a direct-response advertising critic. Score ONLY the call-to-action (CTA) \
-clarity of each short-form video ad script, on an integer scale of 1 to 5.
+You are a direct-response advertising critic. Score the call-to-action (CTA) \
+of each short-form video ad script, on an integer scale of 1 to 5.
 
 A CTA is the closing ask that tells the viewer exactly what to do next. Judge \
-clarity and singularity, NOT how exciting the product is.
+clarity/singularity of the ask AND whether it lands as an EARNED close, NOT \
+how exciting the product is.
 
 Rubric (calibrated with exemplars):
-- 5 — One concrete action verb + one specific destination, unmistakable.
-      STRONG: "Tap to shop the autumn set."  /  "Swipe up to grab yours today."
-- 4 — Single clear ask, slightly generic destination or verb.
-      e.g. "Shop now at the link below." (clear verb, vague-ish destination)
-- 3 — Present but soft/vague; the viewer knows there is an ask but not a crisp
-      next step. e.g. "Check it out." / "Learn more." (no destination, weak verb)
+- 5 — One concrete action verb + one specific destination, unmistakable, AND
+      it reads as the natural conclusion of the beat just before it (a
+      connective, a callback, or a direct pickup of what was just said) rather
+      than a cold restart.
+      STRONG: "...the leather already looks broken in, right where you grab
+      it. So go make it yours." (the CTA explicitly picks up "grab it" ->
+      "make it yours")
+- 4 — Single clear ask, slightly generic destination/verb, but still bridged
+      to the line before it. e.g. "Shop now at the link below." following a
+      beat that set up why, even if the destination itself is vague-ish.
+- 3 — Present but soft/vague, OR clear but with a weak/incidental bridge; the
+      viewer knows there is an ask but the transition or the destination is
+      fuzzy. e.g. "Check it out." / "Learn more." (no destination, weak verb)
 - 2 — Vague AND weak, or buried so the ask is barely a CTA at all.
 - 1 — MISSING (script just ends), OR two or more COMPETING calls-to-action that
       split the viewer's attention.
       WEAK (competing): "Tap to shop the set — or visit our site to book a
       styling call, and don't forget to follow us!" (three asks = split intent)
 
+SCORE DOWN RULE (disconnected/abrupt close): if the CTA line is a bare command
+that shares no thread with the beat immediately before it -- no connective
+("so"/"that's why"/"now"), no callback to what was just said -- cap the score
+at 3 regardless of how clear the ask itself is. A clear ask that arrives as a
+jump-cut still reads as tacked-on, not earned.
+      WEAK (abrupt, capped at 3 even though the ask is clear): "...It's already
+      getting darker right where her hands grab it. Grab yours before the next
+      batch sells out." (the CTA doesn't pick up anything from the line before
+      it -- it just starts a new, unrelated imperative)
+
 HARD RULE: multiple competing CTAs must be penalised heavily (score 1-2), even if
 each individual ask is well-phrased. Split calls-to-action measurably depress
 conversion — one ad, one ask. Say so in the justification when you see it.
 
 You are given, per variant: the CTA line (the last beat) and the closing beats
-around it for context. Score the CTA, not the whole script.
+around it for context. Score the CTA AND its transition from the beat before it,
+not the whole script.
 
 Return ONLY a JSON object of this exact shape:
 {"results": [{"variant_id": "<id>", "cta_score": <int 1-5>, "justification": "<one or two sentences naming the concrete reason>"}]}
