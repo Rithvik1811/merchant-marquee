@@ -421,13 +421,13 @@ async def test_node_happy_path_writes_voiceover_and_trace(monkeypatch):
     state = {
         "job_id": "job-node-1",
         "winning_script": _winning_script(["hi"]),
-        "reasoning_trace": "",
+        "voiceover_reasoning_trace": "",
     }
     result = await RunnableLambda(voiceover_caption_agent_node).ainvoke(state)
 
     assert result["voiceover"]["audio_uri"] == "https://oss.example.invalid/a.mp3"
-    assert "synthesized 1 caption beat(s)" in result["reasoning_trace"]
-    assert "silent" not in result["reasoning_trace"]
+    assert "synthesized 1 caption beat(s)" in result["voiceover_reasoning_trace"]
+    assert "silent" not in result["voiceover_reasoning_trace"]
 
 
 @pytest.mark.asyncio
@@ -442,11 +442,11 @@ async def test_node_trace_mentions_degradation_when_present(monkeypatch):
 
     monkeypatch.setattr("agents.voiceover_caption_agent.generate_voiceover", fake_generate)
 
-    state = {"job_id": "job-node-2", "winning_script": _winning_script(["hi"]), "reasoning_trace": ""}
+    state = {"job_id": "job-node-2", "winning_script": _winning_script(["hi"]), "voiceover_reasoning_trace": ""}
     result = await RunnableLambda(voiceover_caption_agent_node).ainvoke(state)
 
-    assert "1 beat(s) silent" in result["reasoning_trace"]
-    assert "api_error" in result["reasoning_trace"]
+    assert "1 beat(s) silent" in result["voiceover_reasoning_trace"]
+    assert "api_error" in result["voiceover_reasoning_trace"]
 
 
 @pytest.mark.asyncio
@@ -459,7 +459,7 @@ async def test_node_emits_vo_ready_event(monkeypatch):
 
     monkeypatch.setattr("agents.voiceover_caption_agent.generate_voiceover", fake_generate)
 
-    state = {"job_id": "job-node-3", "winning_script": _winning_script(["a", "b"]), "reasoning_trace": ""}
+    state = {"job_id": "job-node-3", "winning_script": _winning_script(["a", "b"]), "voiceover_reasoning_trace": ""}
     events = [
         e
         async for e in RunnableLambda(voiceover_caption_agent_node).astream_events(state, version="v2")
@@ -485,7 +485,7 @@ async def test_node_vo_ready_event_flags_degraded_true(monkeypatch):
 
     monkeypatch.setattr("agents.voiceover_caption_agent.generate_voiceover", fake_generate)
 
-    state = {"job_id": "job-node-4", "winning_script": _winning_script(["a"]), "reasoning_trace": ""}
+    state = {"job_id": "job-node-4", "winning_script": _winning_script(["a"]), "voiceover_reasoning_trace": ""}
     events = [
         e
         async for e in RunnableLambda(voiceover_caption_agent_node).astream_events(state, version="v2")

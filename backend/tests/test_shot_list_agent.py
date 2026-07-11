@@ -149,6 +149,15 @@ async def test_happy_path_produces_valid_shot_list():
     assert all("product_category" not in s for s in shots)
 
 
+def test_negative_prompt_boilerplate_includes_v8_object_substitution_terms():
+    """v8 fix (Meta Quest -> "phone on a stand" wrong-object bug): the empirically
+    observed failure mode's specific tokens must be present, appended (not
+    replacing) the original identity-first terms, which must stay first."""
+    assert NEGATIVE_PROMPT_BOILERPLATE.startswith("warped label, distorted logo")
+    for term in ("object substitution", "different object", "smartphone", "phone on a stand"):
+        assert term in NEGATIVE_PROMPT_BOILERPLATE
+
+
 @pytest.mark.asyncio
 async def test_call_a_reprompt_fires_and_repairs_bad_justification():
     bad = [

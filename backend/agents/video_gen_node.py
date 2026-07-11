@@ -34,6 +34,19 @@ from free text except where noted:
                     truth_fact_id lookup). A concrete factual anchor, not an
                     invented product name (ProductCutState has no product-name
                     field at all -- only brief/product_photos).
+  * Cast          <- treatment.character_anchor VERBATIM (video-gen-fidelity
+                    story-arc fix, graph/state.py Treatment v10) -- ONLY on
+                    human-interaction shots (shot_type product_in_hand /
+                    worn_in_use), ONLY when the treatment actually carries one
+                    (a script implying no person never gets a fabricated Cast
+                    section). Placed immediately after Subject, before
+                    Action/Motion -- never paraphrased, never trimmed by the
+                    char-budget cutter below (same never-cut status as
+                    _IDENTITY_PROTECTION_CLAUSE). Funded without raising the
+                    overall PROMPT_CHAR_BUDGET: Quality is dropped and Mood is
+                    compressed UNCONDITIONALLY on every human-interaction
+                    shot (not just as the overflow fallback) -- see
+                    `_build_prompt`'s own comments for the exact mechanism.
   * Action/Motion <- shot.description VERBATIM. The Shot-List Agent (§5.6 Call
                     B) already wrote this as the shot's 80-120 word action/
                     motion narrative, itself grounded in the same cited fact
@@ -46,13 +59,15 @@ from free text except where noted:
   * Lighting      <- shot.lighting (the one shared lighting/style string
                     reused across every shot in the job, per C1).
   * Composition   <- shot.shot_type (hook_hero/macro_detail/lifestyle_context/
-                    hero_reframe/cta_endcard/product_in_hand -- the v2 C3
-                    addition) + shot.framing + a text_overlay_zone reservation
-                    note. When shot_type is "product_in_hand" (the
-                    human-interaction composition), an explicit POSITIVE
-                    continuity clause is appended ("natural hand interaction
-                    with five anatomically correct fingers... product stays
-                    centered, no scene cut") -- per
+                    hero_reframe/cta_endcard/product_in_hand/worn_in_use --
+                    product_in_hand is the v2 C3 addition, worn_in_use the v4
+                    C3 addition) + shot.framing + a text_overlay_zone
+                    reservation note. When shot_type is "product_in_hand" or
+                    "worn_in_use" (the human-interaction compositions), an
+                    explicit POSITIVE continuity clause is appended ("natural
+                    hand interaction with five anatomically correct fingers...
+                    product stays centered, no scene cut", extended with a
+                    scale-lock and an occlusion-continuity clause) -- per
                     docs/DERISK_VIDEO_GEN_RESULT.md §6, this positive
                     instruction (not the negative prompt alone) is what
                     empirically stopped the product-vanishing failure mode
@@ -263,8 +278,73 @@ _QUALITY_BOILERPLATE = (
     "high detail, natural color, no artifacts"
 )
 
-# shot_type value naming the human-interaction composition (C3 v2 addition).
-_HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand"})
+# video-gen-fidelity PHASE 1 fix. Root cause (confirmed against a real failed
+# job, derisk/outputs/full_pipeline_live_result.json + our own logged warning
+# "shot s4 prompt is 2388 chars, approaching Wan's 1,500-char server-side
+# truncation limit"): the old code only WARNED above 1,400 chars and then let
+# Wan's server silently truncate the tail -- which was routinely
+# Mood/Quality/part of Composition. A silent server-side truncation gives zero
+# visibility into what was lost. This module now enforces the budget itself,
+# cutting deliberately (and logging exactly what got cut) instead of leaving
+# that to an opaque server-side cutoff.
+PROMPT_CHAR_BUDGET = 1400
+
+# Compressed identity-protection clause -- the SAME four protections the old
+# multi-clause version had (scale-lock, occlusion-continuity, anatomy,
+# anti-cut), compressed to ~30 words. The old version cost ~330 chars by
+# itself; per-shot it was ALSO being duplicated by the Shot-List Agent's Call B
+# writing near-identical language into shot.description (see
+# agents/shot_list_agent.py's Call B system prompt fix, same branch) -- so a
+# human-interaction shot was paying for this protection twice. This one
+# instance, in Composition, is now the only copy.
+_IDENTITY_PROTECTION_CLAUSE = (
+    "Throughout: the product keeps its exact shape, size, color and "
+    "material, stays fully recognizable when partially covered and stays "
+    "in frame; hands have five natural fingers; no scene cut."
+)
+
+# Counters i2v models' documented bias toward under-motion early in a clip
+# (the rendered motion "leaks" from the static reference image and takes time
+# to depart from it -- NeurIPS 2024 "Conditional Image Leakage in I2V
+# Diffusion," arXiv:2406.15735) plus mid-motion endings -- appended to every
+# human-interaction shot's Action/Motion text.
+_ACTION_URGENCY_CLAUSE = " The action begins immediately and completes before the clip ends."
+
+# The mirror-image fix for the CTA close: here we WANT the motion to resolve
+# into stillness by the end, not keep moving into an abrupt trim (Phase 3
+# fixes the trim-side half of that same failure in assembly_agent.py).
+_CTA_STILLNESS_CLAUSE = (
+    " All motion resolves in the final second: the product comes to rest "
+    "perfectly still on a clean, centered composition and holds, as if "
+    "posing for an end card."
+)
+
+# Alibaba's own Wan prompt guide uses "fixed camera" as its term for camera
+# stillness, and separately warns that a weak/empty prompt produces "a static
+# camera in an undefined void" -- i.e. this model family plausibly conflates
+# SCENE stillness with CAMERA stillness. The old phrasing ("static") was
+# ambiguous between the two; this is explicit that only the camera is meant to
+# hold still.
+_FIXED_CAMERA_PHRASING = (
+    "Fixed camera on a tripod; the camera does not move. The subject moves "
+    "naturally and completes the described action fully within the clip."
+)
+
+# v8 fix: DashScope's `prompt_extend` silently defaults to `true` when omitted,
+# letting an internal, opaque LLM prompt-rewriter re-describe the reference
+# image in text before generation -- a plausible amplifier of the Meta Quest ->
+# "phone on a stand" bug (an image-aware rewriter can mis-describe an ambiguous
+# photo, and we'd never see what it wrote). Now that the prompt carries a real
+# form_factor subject anchor (_build_prompt above), the prompt is self-
+# sufficient, so the default flips to OFF. Env-overridable per this codebase's
+# "flag, don't hardcode forever" pattern (budget_gate.py's DEFAULT_JOB_BUDGET_CAP).
+DEFAULT_PROMPT_EXTEND = os.getenv("VIDEO_GEN_PROMPT_EXTEND", "false").lower() in ("1", "true")
+
+# shot_type values naming the human-interaction composition (C3 v2 addition of
+# "product_in_hand", C3 v4 addition of "worn_in_use" -- the wider, person-in-
+# motion composition). Hand-kept in sync with agents/shot_list_agent.py's own
+# `HUMAN_INTERACTION_SHOT_TYPES` (that module's docstring notes the same).
+_HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
 
 
 class VideoGenTimeoutError(Exception):
@@ -340,10 +420,58 @@ def _resolve_reference_image_url(reference_image_id: str, product_photos: list[s
 def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Optional[Treatment]) -> str:
     truths_by_id = {t["truth_id"]: t for t in product_truths}
     truth = truths_by_id.get(shot["justification"]["truth_fact_id"])
-    subject = f"Product detail: {truth['fact']}." if truth else "The product shown in the reference photo."
+
+    # v8 fix (Meta Quest -> "phone on a stand" wrong-object bug): lead the
+    # Subject line with the holistic whole-object form_factor anchor fact
+    # (agents/product_truth_extractor.py's FORM-FACTOR ANCHOR), BEFORE the
+    # per-shot micro-fact. Leading tokens carry the most weight in this
+    # module's own documented prompt-construction posture (see the
+    # human-interaction positive-clause precedent above), and a single
+    # isolated micro-fact alone under-specifies the subject as a whole object
+    # -- exactly what let the i2v model collapse toward a common
+    # training-data composition instead of the actual product shape.
+    form = next((t for t in product_truths if t["category"] == "form_factor"), None)
+    anchor = f"The product: {form['fact']} " if form else ""
+    subject = (
+        f"{anchor}Product detail: {truth['fact']}." if truth
+        else (anchor.strip() or "The product shown in the reference photo.")
+    )
+
+    is_human_shot = shot["shot_type"] in _HUMAN_INTERACTION_SHOT_TYPES
+
+    # Cast section (video-gen-fidelity story-arc fix). Text-only i2v prompting
+    # cannot lock FACIAL identity across independent Wan generations, but it
+    # CAN reliably hold wardrobe color / hair / a named setting when pinned
+    # once (Treatment.character_anchor, agents/treatment_agent.py v10) and
+    # reused VERBATIM here -- never paraphrased, never trimmed by the
+    # char-budget cutter below (same never-cut status as
+    # _IDENTITY_PROTECTION_CLAUSE, for the identical reason: this is the one
+    # lever that keeps a human-interaction shot visually consistent with every
+    # OTHER independently-generated human-interaction shot in the same ad).
+    # Applies to every human-interaction shot, hero or faceless -- a faceless
+    # shot still benefits from matching wardrobe/setting/palette, per the
+    # research synthesis's point that Cast text "carries perceived identity
+    # through clothing/palette" even without a face in frame. Absent (no
+    # section at all) when the script implies no person -- never fabricated.
+    cast_line = ""
+    if is_human_shot and treatment:
+        cast_line = (treatment.get("character_anchor") or "").strip()
 
     action = shot["description"]
-    camera = shot["camera_move"].replace("_", " ")
+    if is_human_shot:
+        # Counters both the i2v static-start bias and a clip that's still
+        # mid-motion when it cuts off (see _ACTION_URGENCY_CLAUSE's own comment).
+        action += _ACTION_URGENCY_CLAUSE
+    if shot["shot_type"] == "cta_endcard":
+        # Opposite problem, same mechanism -- here the clip should visibly
+        # SETTLE by the end rather than just stop (see _CTA_STILLNESS_CLAUSE).
+        action += _CTA_STILLNESS_CLAUSE
+
+    if shot["camera_move"] == "static":
+        camera = _FIXED_CAMERA_PHRASING
+    else:
+        camera = shot["camera_move"].replace("_", " ")
+
     lighting = shot["lighting"]
 
     composition = f"{shot['shot_type'].replace('_', ' ')}, {shot['framing'].replace('_', ' ')} framing"
@@ -352,26 +480,129 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
             f", reserve the {shot['text_overlay_zone'].replace('_', ' ')} empty "
             "for a composited caption/CTA"
         )
-    if shot["shot_type"] in _HUMAN_INTERACTION_SHOT_TYPES:
+    if is_human_shot:
         # Positive continuity clause -- docs/DERISK_VIDEO_GEN_RESULT.md §6 found
         # this (not the negative prompt alone) is what actually prevents the
-        # product vanishing during human-interaction shots.
-        composition += (
-            ". Natural hand interaction with five anatomically correct fingers "
-            "per hand; product stays centered in frame, no scene cut"
+        # product vanishing during human-interaction shots. Compressed (PHASE 1
+        # fix) to the single _IDENTITY_PROTECTION_CLAUSE -- same four
+        # protections, far fewer characters; deliberately placed in Composition
+        # (added before the budget-cut pass below, and Composition is never one
+        # of the sections that pass cuts) so it survives even if Quality/Mood/
+        # Lighting all get cut.
+        composition += f". {_IDENTITY_PROTECTION_CLAUSE}"
+
+    mood_full = (
+        f"{treatment['director_persona']}; {treatment['pacing_philosophy']}"
+        if treatment else "understated, product-forward"
+    )
+
+    sections: list[list[str]] = [["Subject", subject]]
+    if cast_line:
+        # Immediately after Subject, before Action/Motion -- high in the
+        # prompt per Wan's documented front-token-weighting, but after the
+        # product anchor (product identity is the harder, already-solved
+        # constraint and must keep the leading position).
+        sections.append(["Cast", cast_line])
+    sections += [
+        ["Action/Motion", action],
+        ["Camera", camera],
+        ["Lighting", lighting],
+        ["Composition", composition],
+        ["Mood", mood_full],
+        ["Quality", _QUALITY_BOILERPLATE],
+    ]
+
+    def _render(secs: list[list[str]]) -> str:
+        return "\n".join(f"{name}: {value}" for name, value in secs)
+
+    dropped: list[str] = []
+    quality_dropped = False
+    mood_compressed = False
+
+    def _compress_mood() -> None:
+        # Compress Mood to a single short clause -- not the full
+        # director_persona + pacing_philosophy dump. First sentence/clause of
+        # director_persona alone, further capped to 8 words: a persona with no
+        # early "." or ";" (free-form prose) must still shrink meaningfully,
+        # not just drop the (already-absent) pacing_philosophy half.
+        persona = (treatment or {}).get("director_persona", "") if treatment else ""
+        short_mood = persona.split(".")[0].split(";")[0].strip()
+        short_mood = " ".join(short_mood.split()[:8]) or "understated, product-forward"
+        for s in sections:
+            if s[0] == "Mood":
+                s[1] = short_mood
+
+    # Fund the new Cast section WITHOUT raising PROMPT_CHAR_BUDGET
+    # (video-gen-fidelity story-arc fix): on every human-interaction shot,
+    # Quality is dropped and Mood is compressed UNCONDITIONALLY here, not
+    # merely as the overflow fallback below. Both are already usually the
+    # first things the overflow path cuts on a human shot's typically-longer
+    # prompt anyway (Quality is pure boilerplate; Mood is the whole ad's
+    # generic directorial voice, not this shot's specific content) -- making
+    # that deterministic rather than incidental is what pays for Cast.
+    if is_human_shot:
+        if any(s[0] == "Quality" for s in sections):
+            sections = [s for s in sections if s[0] != "Quality"]
+            quality_dropped = True
+        _compress_mood()
+        mood_compressed = True
+        logger.info(
+            "Video-Gen Node: shot %s is a human-interaction shot -- Quality "
+            "dropped and Mood compressed unconditionally to fund the Cast "
+            "section (not an overflow cut; see module docstring).",
+            shot["shot_id"],
         )
 
-    mood = f"{treatment['director_persona']}; {treatment['pacing_philosophy']}" if treatment else "understated, product-forward"
+    prompt = _render(sections)
 
-    return (
-        f"Subject: {subject}\n"
-        f"Action/Motion: {action}\n"
-        f"Camera: {camera}\n"
-        f"Lighting: {lighting}\n"
-        f"Composition: {composition}\n"
-        f"Mood: {mood}\n"
-        f"Quality: {_QUALITY_BOILERPLATE}"
-    )
+    # Hard budget enforcement (PHASE 1 fix) -- Subject/Cast/Action/Camera/
+    # Composition are never touched here (they carry the shot's actual
+    # grounded content); only the three genuinely-generic-across-every-shot
+    # sections are cut, in this order, stopping as soon as it fits. Quality/
+    # Mood are skipped here if the human-interaction funding above already
+    # handled them -- `quality_dropped`/`mood_compressed` prevent this from
+    # double-logging (or, for Quality, a harmless but misleading no-op filter)
+    # the same cut twice under two different reasons.
+    if len(prompt) > PROMPT_CHAR_BUDGET and not quality_dropped:
+        sections = [s for s in sections if s[0] != "Quality"]
+        dropped.append("Quality")
+        prompt = _render(sections)
+
+    if len(prompt) > PROMPT_CHAR_BUDGET and not mood_compressed:
+        _compress_mood()
+        dropped.append("Mood (compressed)")
+        prompt = _render(sections)
+
+    if len(prompt) > PROMPT_CHAR_BUDGET:
+        # Trim Lighting to its first clause -- still names the light quality,
+        # drops the rest of the shared, per-job-identical detail.
+        trimmed_lighting = lighting.split(",")[0].split(".")[0].strip()
+        for s in sections:
+            if s[0] == "Lighting":
+                s[1] = trimmed_lighting
+        dropped.append("Lighting (trimmed)")
+        prompt = _render(sections)
+
+    if dropped:
+        logger.warning(
+            "Video-Gen Node: shot %s prompt exceeded the %d-char budget -- cut "
+            "deliberately (never left to Wan's server-side truncation): %s. "
+            "Final length %d chars.",
+            shot["shot_id"], PROMPT_CHAR_BUDGET, ", ".join(dropped), len(prompt),
+        )
+    if len(prompt) > PROMPT_CHAR_BUDGET:
+        # Even after every cuttable section is gone, the grounded content
+        # itself (Subject/Action/Camera/Composition) is still too long -- this
+        # can genuinely happen with a very long shot.description. We never cut
+        # those sections (they're the shot's actual content), so flag it: the
+        # tail may still be silently dropped by Wan's server-side 1,500-char
+        # truncation, and this is the one case we can't prevent that ourselves.
+        logger.warning(
+            "Video-Gen Node: shot %s prompt is still %d chars after all budget "
+            "cuts -- approaching Wan's 1,500-char server-side truncation limit.",
+            shot["shot_id"], len(prompt),
+        )
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -385,10 +616,17 @@ async def _call_wan_video_gen(
     negative_prompt: str,
     duration_sec: float,
     resolution: str,
+    seed: Optional[int] = None,
 ) -> str:
     """Submit + wait for one Wan2.6-i2v-us generation. Returns the video URL on
     success. Raises VideoGenTimeoutError / VideoGenAPIError on failure -- never
     retries (that policy lives in the caller / Continuity Agent later, not here).
+
+    `seed` is optional (for future A/B testing and this fix's own reproducibility
+    during manual verification) -- omitted entirely when None so today's random-
+    seed production behavior is unchanged. NOTE (DashScope's own documented
+    caveat, verbatim): "Even with the same seed, results may differ" -- do not
+    assume this gives exact determinism.
     """
     dashscope.api_key = os.environ["DASHSCOPE_API_KEY"]
     video_base_url = os.getenv("DASHSCOPE_VIDEO_BASE_URL")
@@ -396,16 +634,23 @@ async def _call_wan_video_gen(
         dashscope.base_http_api_url = video_base_url
     model = os.environ["MODEL_VIDEO"]
 
+    call_kwargs = dict(
+        model=model,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        img_url=image_url,
+        duration=int(round(duration_sec)),
+        resolution=resolution,
+        # v8 fix: explicit, not DashScope's silent default -- see
+        # DEFAULT_PROMPT_EXTEND's module-level comment for why.
+        prompt_extend=DEFAULT_PROMPT_EXTEND,
+    )
+    if seed is not None:
+        call_kwargs["seed"] = seed
+
     try:
         response = await asyncio.wait_for(
-            AioVideoSynthesis.call(
-                model=model,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                img_url=image_url,
-                duration=int(round(duration_sec)),
-                resolution=resolution,
-            ),
+            AioVideoSynthesis.call(**call_kwargs),
             timeout=DEFAULT_WAIT_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError as exc:
@@ -472,6 +717,12 @@ async def generate_videos(
     """
     fn: GenerateFn = generate_fn or _call_wan_video_gen
 
+    # Optional, for future A/B testing and this fix's own reproducibility during
+    # manual verification -- unset by default, which preserves today's random-
+    # seed production behavior exactly (see `seed` note on _call_wan_video_gen).
+    _seed_env = os.getenv("VIDEO_GEN_SEED")
+    seed: Optional[int] = int(_seed_env) if _seed_env else None
+
     async def _single_shot_node(payload: dict) -> dict:
         shot: Shot = payload["shot"]
         shot_id = shot["shot_id"]
@@ -489,13 +740,16 @@ async def generate_videos(
         prompt = _build_prompt(shot, payload.get("product_truths", []), payload.get("treatment"))
 
         try:
-            video_url = await fn(
+            call_kwargs = dict(
                 image_url=image_url,
                 prompt=prompt,
                 negative_prompt=shot["negative_prompt"],
                 duration_sec=duration,
                 resolution=resolution,
             )
+            if seed is not None:
+                call_kwargs["seed"] = seed
+            video_url = await fn(**call_kwargs)
         except VideoGenTimeoutError as exc:
             logger.warning("Video-Gen Node: shot %s timed out -- handing off, retry_count untouched: %s", shot_id, exc)
             return {"failures": [{"shot_id": shot_id, "failure_reason": {"type": FAILURE_TYPE_TIMEOUT, "detail": str(exc)}}]}

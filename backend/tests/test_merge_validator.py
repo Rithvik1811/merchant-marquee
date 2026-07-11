@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from agents.merge_validator import (
     CoherenceRead,
     _cta_window_intersection,
+    check_pronoun_consistency,
     derive_seam_flags,
     repair_pacing,
     route_after_merge_validation,
@@ -307,6 +308,133 @@ def test_derive_seam_flags_no_body_beats_returns_empty():
     )
     read = CoherenceRead(**_coherence_payload(voice_consistency=False, register_shift_flags=[]))
     assert derive_seam_flags(candidate, read) == []
+
+
+# ===========================================================================
+# check_pronoun_consistency -- deterministic pronoun-thread seam check
+# (video-gen-fidelity story-arc fix).
+# ===========================================================================
+
+
+def _mk_pronoun_mismatch_hook_body_candidate() -> MergeCandidate:
+    # Word counts kept low enough to pass check_pacing's 2.3 words/sec window
+    # for each beat's duration (same posture as _mk_clean_candidate's own
+    # short lines) -- this fixture is testing the pronoun check, not pacing.
+    beats = [
+        _beat(0, 3, "She grabs it and leaves.", "hook", "v1"),
+        _beat(3, 6, "He never looks back again.", "body", "v2"),
+        _beat(6, 9, "The seam holds up well.", "body", "v2"),
+        _beat(9, 13, "Tap now.", "cta", "v3"),
+    ]
+    return MergeCandidate(
+        hook_source_variant_id="v1", body_source_variant_id="v2", cta_source_variant_id="v3",
+        merged_beats=beats, merged_text=" ".join(b.line for b in beats), target_length_sec=13,
+    )
+
+
+def _mk_pronoun_mismatch_body_cta_candidate() -> MergeCandidate:
+    beats = [
+        _beat(0, 3, "She grabs it and leaves.", "hook", "v1"),
+        _beat(3, 6, "The grip finds the seam.", "body", "v2"),
+        _beat(6, 9, "Her hand never lets go.", "body", "v2"),
+        _beat(9, 13, "Tap now -- he did too.", "cta", "v3"),
+    ]
+    return MergeCandidate(
+        hook_source_variant_id="v1", body_source_variant_id="v2", cta_source_variant_id="v3",
+        merged_beats=beats, merged_text=" ".join(b.line for b in beats), target_length_sec=13,
+    )
+
+
+def _mk_pronoun_consistent_candidate() -> MergeCandidate:
+    beats = [
+        _beat(0, 3, "She grabs it and leaves.", "hook", "v1"),
+        _beat(3, 6, "Her grip finds the seam.", "body", "v2"),
+        _beat(6, 9, "Her hand never lets go.", "body", "v2"),
+        _beat(9, 13, "Tap now -- she already did.", "cta", "v3"),
+    ]
+    return MergeCandidate(
+        hook_source_variant_id="v1", body_source_variant_id="v2", cta_source_variant_id="v3",
+        merged_beats=beats, merged_text=" ".join(b.line for b in beats), target_length_sec=13,
+    )
+
+
+def _mk_pronoun_they_mixed_with_she_candidate() -> MergeCandidate:
+    # "they" is treated as gender-neutral and must never be flagged against
+    # a specific gendered reference to the same person elsewhere.
+    beats = [
+        _beat(0, 3, "They grab it and leave.", "hook", "v1"),
+        _beat(3, 6, "Her grip finds the seam.", "body", "v2"),
+        _beat(6, 9, "The seam holds up well.", "body", "v2"),
+        _beat(9, 13, "Tap now.", "cta", "v3"),
+    ]
+    return MergeCandidate(
+        hook_source_variant_id="v1", body_source_variant_id="v2", cta_source_variant_id="v3",
+        merged_beats=beats, merged_text=" ".join(b.line for b in beats), target_length_sec=13,
+    )
+
+
+def test_pronoun_check_flags_hook_body_mismatch():
+    flags = check_pronoun_consistency(_mk_pronoun_mismatch_hook_body_candidate())
+    assert len(flags) == 1
+    assert flags[0].seam == "hook_body"
+    assert flags[0].editable_beat_index == 1  # first body beat
+    assert "she" in flags[0].evidence.lower() or "he" in flags[0].evidence.lower()
+
+
+def test_pronoun_check_flags_body_cta_mismatch():
+    flags = check_pronoun_consistency(_mk_pronoun_mismatch_body_cta_candidate())
+    assert len(flags) == 1
+    assert flags[0].seam == "body_cta"
+    assert flags[0].editable_beat_index == 2  # last body beat
+
+
+def test_pronoun_check_passes_consistent_thread():
+    assert check_pronoun_consistency(_mk_pronoun_consistent_candidate()) == []
+
+
+def test_pronoun_check_never_flags_they_against_a_gendered_pronoun():
+    assert check_pronoun_consistency(_mk_pronoun_they_mixed_with_she_candidate()) == []
+
+
+def test_pronoun_check_no_body_beats_returns_empty():
+    beats = [_beat(0, 3, "She grabs it.", "hook", "v1"), _beat(3, 6, "He taps now.", "cta", "v3")]
+    candidate = MergeCandidate(
+        hook_source_variant_id="v1", body_source_variant_id="v1", cta_source_variant_id="v3",
+        merged_beats=beats, merged_text="she he", target_length_sec=6,
+    )
+    assert check_pronoun_consistency(candidate) == []
+
+
+def test_pronoun_check_no_pronouns_anywhere_returns_empty():
+    assert check_pronoun_consistency(_mk_clean_candidate()) == []
+
+
+def test_validate_pronoun_mismatch_fails_without_llm_call(monkeypatch):
+    """Mirrors test_validate_pacing_fails_even_after_repair_no_llm_call: a
+    deterministic pronoun mismatch must skip the coherence read entirely,
+    same as a pacing failure does."""
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _RaiseOnConstruct)
+
+    result = validate_merge_candidate(_mk_pronoun_mismatch_hook_body_candidate())
+
+    assert result.passed is False
+    assert result.failure_kind == "voice_register"
+    assert len(result.seam_flags) == 1
+    assert result.seam_flags[0].seam == "hook_body"
+    assert result.coherence_score is None
+    assert "pronoun" in result.justification.lower()
+
+
+def test_validate_pronoun_consistent_candidate_still_calls_llm(monkeypatch):
+    """Regression: a candidate with a real, consistent pronoun thread must
+    proceed to the LLM coherence read exactly as before this fix."""
+    payload = json.dumps(_coherence_payload())
+    monkeypatch.setattr("agents.critic_llm.OpenAI", make_fake_sync_openai([payload]))
+
+    result = validate_merge_candidate(_mk_pronoun_consistent_candidate())
+
+    assert result.passed is True
+    assert result.failure_kind is None
 
 
 # ===========================================================================

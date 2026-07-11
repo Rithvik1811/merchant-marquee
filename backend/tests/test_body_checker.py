@@ -373,3 +373,54 @@ def test_check_body_invalid_entry_raises_value_error(monkeypatch):
 
     with pytest.raises(ValueError, match="v1"):
         check_body(VARIANTS)
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry-on-validation-failure (call_qwen_json_validated, video-gen-
+# fidelity branch fix). Reproduces the REAL production incident: a live
+# full-pipeline run returned `redundant_pairs` instead of the schema's
+# `redundant_beat_pairs` -- BodyCheckResult's extra="forbid" rejected it, and
+# with no retry path the whole graph run died. These prove the fix.
+# ---------------------------------------------------------------------------
+def _payload_with_wrong_field_name(entries: list[dict]) -> str:
+    """Same shape as `_payload`, but each entry uses the WRONG field name
+    (`redundant_pairs`) instead of `redundant_beat_pairs` -- reproduces the
+    exact real failure verbatim (see derisk/outputs/full_pipeline_live_v2.log)."""
+    bad_entries = []
+    for e in entries:
+        bad = dict(e)
+        bad["redundant_pairs"] = bad.pop("redundant_beat_pairs")
+        bad_entries.append(bad)
+    return json.dumps({"results": bad_entries})
+
+
+def test_check_body_retries_once_on_wrong_field_name_and_recovers(monkeypatch):
+    """First response has the wrong field name (extra="forbid" rejects it);
+    second (re-prompted) response uses the correct field name and succeeds.
+    Proves the retry actually fires and recovers, and that recovery costs
+    exactly 2 calls -- not more."""
+    good_entries = [_result_entry("v1"), _result_entry("v2")]
+    fake = FakeSyncOpenAIClient([
+        _payload_with_wrong_field_name(good_entries),
+        _payload(good_entries),
+    ])
+    _patch_client(monkeypatch, fake)
+
+    result = check_body(VARIANTS)
+
+    assert fake.call_count == 2, "one failed attempt + one successful re-prompt"
+    assert set(result.keys()) == {"v1", "v2"}
+
+
+def test_check_body_raises_clearly_after_max_attempts_exhausted(monkeypatch):
+    """Every attempt returns the wrong field name -> the retry is bounded (not
+    infinite, does not hang) and raises the real ValueError clearly after
+    max_attempts (2) -- not silently degrading, not swallowing the error."""
+    good_entries = [_result_entry("v1"), _result_entry("v2")]
+    fake = FakeSyncOpenAIClient([_payload_with_wrong_field_name(good_entries)])
+    _patch_client(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="redundant_pairs|v1|v2"):
+        check_body(VARIANTS)
+
+    assert fake.call_count == 2, "bounded at max_attempts=2, not retried forever"

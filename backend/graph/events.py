@@ -23,7 +23,7 @@ Scope note: the Phase 0 scaffold in app/main.py also emits `run.started` /
 (`on_chain_start`, etc.). Those are transport/lifecycle scaffolding, NOT part of
 this frozen business-event contract, and are deliberately excluded here.
 
-version: 4
+version: 5
   - v2: added "merge_validated" event type + MergeValidatedPayload (§5.4.7's
         dashed `CV -.-> FE` streaming edge in the architecture diagram) so a
         merge-candidate retry/fallback is visible on the live stream, not hidden.
@@ -46,6 +46,22 @@ version: 4
         sync with whoever builds the dashboard's VO panel; see
         agents/voiceover_caption_agent.py's module docstring for the fuller
         rationale.
+  - v5: added "master_cut_ready" event type + MasterCutReadyPayload (Phase 5,
+        §5.12's Assembly Agent -- the fan-in join of the voiceover branch and
+        the continuity retry loop, see graph/build.py's module docstring).
+        Fires once per job, only after both upstream branches have settled
+        (the Assembly node is registered `defer=True` in graph/build.py, so
+        -- unlike `interrupt_requested`'s documented double-fire across a
+        pause/resume cycle, continuity_gate.py's own KNOWN LIMITATION -- this
+        event fires exactly once, verified against a real compiled-graph
+        test). PROPOSED ADDITIVE CHANGE, same posture as v3's
+        "fallback_requested" and v4's "vo_ready": no event fired when the
+        finished master cut itself became available (the existing
+        `job_complete`/JobCompletePayload is Assembly+Export's COMBINED
+        signal per its own docstring, and Export, §5.13, is not built yet) --
+        flagged here, pending a sync with whoever builds the dashboard's
+        Assembly panel. `total_duration_sec` is the ffprobe'd (real, not
+        planned) duration of the finished mezzanine.
 """
 from __future__ import annotations
 
@@ -84,6 +100,7 @@ EventType = Literal[
     "job_complete",
     "merge_validated",
     "vo_ready",
+    "master_cut_ready",
 ]
 
 
@@ -179,6 +196,16 @@ class VoReadyPayload(TypedDict):
     degraded: bool  # True when >=1 beat's TTS synthesis permanently failed (silent gap, captions-only for that beat)
 
 
+class MasterCutReadyPayload(TypedDict):
+    """Assembly Agent (5.12) finished stitching every real/fallback shot clip,
+    the voiceover audio, and the burned captions into one finished master-cut
+    MP4 -- fires once per job, after the Assembly fan-in join settles (see
+    graph/build.py's module docstring)."""
+    uri: str  # mirrors state.master_cut_uri, C1
+    shot_count: int  # number of REAL segments actually rendered (held-frame gaps don't add one)
+    total_duration_sec: float  # ffprobe'd (real, not planned) duration of the finished mezzanine
+
+
 EventPayload = Union[
     NodeStartedPayload,
     TruthExtractedPayload,
@@ -192,6 +219,7 @@ EventPayload = Union[
     JobCompletePayload,
     MergeValidatedPayload,
     VoReadyPayload,
+    MasterCutReadyPayload,
 ]
 
 
@@ -249,5 +277,6 @@ __all__ = [
     "JobCompletePayload",
     "MergeValidatedPayload",
     "VoReadyPayload",
+    "MasterCutReadyPayload",
     "build_event",
 ]

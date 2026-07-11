@@ -60,7 +60,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, conlist, field_validator
 
-from agents.critic_llm import call_qwen_json
+from agents.critic_llm import call_qwen_json_validated
 from graph.state import ProductCutState, ProductTruth, ScriptVariant
 
 logger = logging.getLogger("productcut.critics.body")
@@ -490,9 +490,21 @@ def check_body(
         sum(1 for p in payload if p["candidate_redundant_pairs"]),
     )
 
-    raw = call_qwen_json(_BODY_SYSTEM_PROMPT, user_prompt, model=model)
     expected = {v["variant_id"] for v in variants}
-    validated = _validate_results(raw, expected)
+    # call_qwen_json_validated (not the bare call_qwen_json) -- a real live run
+    # (video-gen-fidelity branch) found the model can return a plausible-but-
+    # wrong field name (`redundant_pairs` instead of `redundant_beat_pairs`),
+    # which BodyCheckResult's extra="forbid" rejects outright; with no retry
+    # path that killed the whole graph run on a one-off phrasing slip. This
+    # gives _validate_results one bounded re-prompt naming the exact error
+    # before surfacing it, mirroring every other content-failure retry in this
+    # codebase (see agents/critic_llm.py's call_qwen_json_validated docstring).
+    validated = call_qwen_json_validated(
+        _BODY_SYSTEM_PROMPT,
+        user_prompt,
+        lambda raw: _validate_results(raw, expected),
+        model=model,
+    )
     return {vid: _apply_hard_cap(res).model_dump() for vid, res in validated.items()}
 
 

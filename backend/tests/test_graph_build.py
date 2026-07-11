@@ -17,7 +17,12 @@ import pytest
 
 from graph.build import build_graph
 from tests._fakes import make_content_routed_sync_openai, make_fake_async_openai
-from tests._phase3_graph import patch_continuity_boundaries, patch_phase3_boundaries
+from tests._phase3_graph import (
+    patch_assembly_boundaries,
+    patch_continuity_boundaries,
+    patch_phase3_boundaries,
+    patch_voiceover_boundaries,
+)
 
 GOOD_FACTS = [
     ("a hairline scratch runs diagonally across the lower left corner of the lid", "imperfection"),
@@ -33,7 +38,13 @@ FOUR_GOOD_VARIANTS = [
         "variant_id": "v1",
         "text": "Scratched already? This one shrugs it off. Tap to shop.",
         "framework": "hook_problem_product_cta",
-        "hook_type": "pattern interrupt",
+        # Backstory-First fix (video-gen-fidelity): "pattern interrupt" is now a
+        # story/curiosity hook_type judged on a human-moment marker, not a
+        # number/contrast marker (agents/concept_agent.py's _STORY_HOOK_TYPES).
+        # This hook line has no person in it -- it earns its pass via the
+        # contrast marker "not", so "contrarian / myth-busting" (a claim-led
+        # type) is the accurate label, not a re-engineered fixture.
+        "hook_type": "contrarian / myth-busting",
         "emotional_trigger": "curiosity",
         "grounding_truth_ids": ["t1", "t4"],
         "beats": [{"t_start": 0, "t_end": 3, "line": "Scratched already? Not this one."},
@@ -381,6 +392,8 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
     patch_continuity_boundaries(monkeypatch)  # Phase 4: clean drift, loop ends at once
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
 
     graph = await build_graph()
     initial_state = {
@@ -404,7 +417,8 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
     # the merge candidate's pacing re-check fails unrepairably here and
     # merge_validator routes straight to the fallback, which still sets a real,
     # usable winning_script -- see test_graph_merge_validator.py for that path's
-    # dedicated assertions.
+    # dedicated assertions. vo_ready (Phase 5) now also fires -- Voiceover runs as
+    # a parallel branch off the same merge_validator "fallback" route.
     event_names = {e["name"] for e in custom_events}
     assert event_names == {
         "truth_extracted",
@@ -413,6 +427,8 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
         "budget_updated",
         "shot_generated",
         "drift_scored",  # Phase 4: Continuity Agent scored every real clip
+        "vo_ready",  # Phase 5: Voiceover + Caption Agent's parallel branch
+        "master_cut_ready",  # Phase 5: Assembly Agent's fan-in join
     }, event_names
     truth_event = next(e for e in custom_events if e["name"] == "truth_extracted")
     assert truth_event["data"]["count"] == len(GOOD_FACTS)
@@ -429,4 +445,7 @@ async def test_truth_extractor_and_concept_agent_run_chained_in_graph(monkeypatc
     assert 3 <= len(values["shot_list"]) <= 7, "shot_list_agent did not produce 3-7 shots"
     assert values["budget_ledger"]["cap"] > 0, "budget_gate did not build a ledger"
     assert len(values["generated_shots"]) == len(values["shot_list"]), "video_gen + ken_burns did not produce one clip per shot"
+    # Phase 5: the Assembly Agent fan-in join ran exactly once, after both the
+    # voiceover branch and the (trivial, single-pass here) continuity loop settled.
+    assert "master_cut_uri" in values, "assembly_agent did not run"
     assert all(s["status"] in ("passed", "fallback") for s in values["shot_list"])

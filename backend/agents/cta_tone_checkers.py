@@ -46,7 +46,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
-from agents.critic_llm import call_qwen_json
+from agents.critic_llm import call_qwen_json_validated
 from graph.state import ProductCutState, ScriptVariant, SellerDirection
 
 logger = logging.getLogger("productcut.critics.cta_tone")
@@ -151,6 +151,10 @@ handmade feel" with mood words like "calm, sensory, understated":
 The mismatch direction matters: a hard-sell / high-urgency script scores LOW when
 the brief/mood words call for something calmer, and vice-versa. Explain the
 specific mismatch (or match) in the justification.
+
+A line that reads like a product-catalog or image-caption visual description
+rather than something a person would say to camera is off-voice -- score it
+down regardless of brand fit.
 
 NEVER-DO HARD GATE:
 - If seller_direction includes a "never_do" constraint, set "never_do_violation":
@@ -293,9 +297,17 @@ def check_cta(
     )
     logger.info("CTA-Checker scoring %d variant(s)", len(variants))
 
-    raw = call_qwen_json(_CTA_SYSTEM_PROMPT, user_prompt, model=model)
     expected = {v["variant_id"] for v in variants}
-    validated = _validate_results(raw, CtaCheckResult, expected, axis="CTA")
+    # call_qwen_json_validated, not the bare call_qwen_json -- see
+    # agents/critic_llm.py's docstring: a real live run found this class of
+    # call had zero retry on a validation (as opposed to transport) failure,
+    # which killed the whole graph run on one-off LLM phrasing variance.
+    validated = call_qwen_json_validated(
+        _CTA_SYSTEM_PROMPT,
+        user_prompt,
+        lambda raw: _validate_results(raw, CtaCheckResult, expected, axis="CTA"),
+        model=model,
+    )
     return {vid: res.model_dump() for vid, res in validated.items()}
 
 
@@ -349,9 +361,14 @@ def check_tone(
         bool(seller_direction and seller_direction.get("never_do")),
     )
 
-    raw = call_qwen_json(_TONE_SYSTEM_PROMPT, user_prompt, model=model)
     expected = {v["variant_id"] for v in variants}
-    validated = _validate_results(raw, ToneCheckResult, expected, axis="Tone")
+    # call_qwen_json_validated -- same rationale as check_cta above.
+    validated = call_qwen_json_validated(
+        _TONE_SYSTEM_PROMPT,
+        user_prompt,
+        lambda raw: _validate_results(raw, ToneCheckResult, expected, axis="Tone"),
+        model=model,
+    )
     return {vid: res.model_dump() for vid, res in validated.items()}
 
 

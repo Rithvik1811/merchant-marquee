@@ -73,7 +73,7 @@ from pydantic import (
     field_validator,
 )
 
-from agents.critic_llm import call_qwen_json
+from agents.critic_llm import call_qwen_json_validated
 from graph.state import ProductCutState, ScriptVariant
 
 logger = logging.getLogger("productcut.critics.meta")
@@ -1078,8 +1078,17 @@ def meta_critic(
         fallback_id,
     )
 
-    raw = call_qwen_json(_META_SYSTEM_PROMPT, user_prompt, model=model)
-    out = _validate_llm_output(raw, set(survivor_ids))
+    # call_qwen_json_validated -- see agents/critic_llm.py's docstring: a real
+    # live run found this class of call had zero retry on a validation (as
+    # opposed to transport) failure, which killed the whole graph run on
+    # one-off LLM phrasing variance in a sibling checker (Body-Checker).
+    survivor_id_set = set(survivor_ids)
+    out = call_qwen_json_validated(
+        _META_SYSTEM_PROMPT,
+        user_prompt,
+        lambda raw: _validate_llm_output(raw, survivor_id_set),
+        model=model,
+    )
 
     target = _target_length(variants, survivor_ids)
 

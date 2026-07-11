@@ -4,7 +4,7 @@ Extend additively only: add new keys, never rename/remove an existing one
 without a sync between KR and RR and a version bump in this docstring.
 Spec of record: docs/TECHNICAL_DOCUMENTATION.md section 6.
 
-version: 6
+version: 8
   - v2: added CompletionDetail + two CriticScore keys (completion, completion_detail)
         and six NotRequired Critic-Chain scratch keys (hook/pacing/body/cta/tone_scores,
         meta_critic_result) to plumb the 5 parallel checkers into the Meta-Critic join.
@@ -40,6 +40,84 @@ version: 6
         ({type: "timeout"|"api_error"|"budget_exceeded", detail: str}) and
         Shot.failure_reason: NotRequired[FailureReason]. Mirrored in
         graph/shot_schema.py's runtime-validated ShotStatus/ShotModel.
+  - v7: Phase 5 wiring (agents/voiceover_caption_agent.py) made
+        voiceover_caption_agent a genuine parallel branch off merge_validator's
+        "finalize"/"fallback" routes, alongside treatment_agent (graph/build.py).
+        Both branches used to independently read-modify-write the single
+        `reasoning_trace: str` key (every agent module's shared "read current +
+        append this node's note" convention) -- fine when sequential, but two
+        nodes in the SAME superstep both writing a plain (LastValue) channel is
+        rejected outright by LangGraph (InvalidUpdateError: "Can receive only
+        one value per step"). Rather than retrofit that read-modify-write
+        convention across all dozen existing agent modules (and their already-
+        passing unit tests that assert on it) into a proper concurrent-safe
+        reducer, voiceover_caption_agent_node was given its OWN dedicated key,
+        `voiceover_reasoning_trace` -- a single-writer channel, so no reducer is
+        needed and every other node's existing contract/tests are untouched.
+        Additive only; `reasoning_trace` is unchanged in shape and still the
+        trace for the treatment_agent-and-onward chain.
+  - v8: Video-gen fidelity fix (root cause: a Meta Quest VR headset's photos
+        produced a generated clip showing "a phone on a phone stand" --
+        completely the wrong object). Two additive changes, both used only by
+        agents/product_truth_extractor.py, agents/video_gen_node.py,
+        agents/continuity_agent.py and agents/continuity_gate.py -- no
+        existing field renamed/removed:
+          (a) ProductTruth.category += "form_factor" -- exactly one fact per
+              job, a single holistic whole-object shape/silhouette/size
+              anchor sentence synthesized across ALL product photos, distinct
+              from every other category (which are each one isolated
+              micro-fact). Root cause: an i2v prompt built from only a single
+              isolated micro-fact ("matte-black textured strap") under-
+              specifies the subject as a WHOLE object, and i2v models suffer
+              documented "identity drift" where an ambiguous subject resolves
+              toward a common training-data composition ("phone on a stand")
+              instead of the actual, rarer product shape. Consumed by
+              video_gen_node.py's Subject line construction, which now leads
+              with this anchor before the per-shot micro-fact.
+          (b) GeneratedShot.identity_check: NotRequired[IdentityCheck] -- a
+              CATEGORICAL "is this even the same physical object class"
+              verdict from a SEPARATE Qwen-VL call on an early frame of the
+              generated clip (agents/continuity_agent.py's new frame-0(ish)
+              identity check). Additive alongside the existing continuous
+              `drift_score` -- a different question on a different scale, not
+              a stricter threshold on the same one. Consumed by
+              agents/continuity_gate.py for a hard-identity-failure routing
+              path (one automatic re-sample, then straight to the Ken-Burns
+              fallback on a second consecutive failure) distinct from the
+              existing drift-retry/human-review path.
+  - v9: Video-gen creative-direction fix (video-gen-fidelity branch, RR) added
+        one additive enum value to Shot ahead of a Shot-List Agent/Video-Gen
+        Node prompt-phrasing rework: shot_type += "worn_in_use" (product worn/
+        carried/operated by a visible person at medium-to-wide framing, person
+        moves, product rides along) -- distinct from the existing
+        "lifestyle_context" (now strictly a NO-human styled scene, resolving a
+        prior dual-meaning overload) and "product_in_hand" (a static/close
+        hand-contact composition). Mirrored in graph/shot_schema.py's
+        runtime-validated ShotType (C3 v4). No field additions/removals.
+  - v10: Story-arc/character-consistency fix (video-gen-fidelity branch).
+        Adds ONE additive field: Treatment.character_anchor: NotRequired[str].
+        Root cause: text-only i2v prompting cannot lock FACIAL identity across
+        independent Wan generations (no video-to-video chaining, no seed
+        guarantee -- confirmed against Alibaba's own docs), so a script
+        implying a recurring person with no anchored physical description let
+        each human-interaction shot's Call B independently invent hair/
+        wardrobe/setting, producing a different-looking "different person" in
+        every shot rather than one consistent story. `character_anchor` is
+        ONE sentence, produced by the Treatment Agent (not Concept Agent --
+        Concept Agent still produces 4 competing variants pre-selection, so
+        synthesizing a character per variant would be wasted work; Treatment
+        Agent already runs once on the winning script and already owns other
+        whole-ad global fields of identical shape) ONLY when the winning
+        script's STORY/REAL-WORLD-USE beat actually implies a person -- never
+        forced. Gives hair color/length/texture, one distinctively-colored
+        wardrobe item, an age band, and a named setting with 1-2 fixed
+        landmarks + time-of-day, drawn from the same palette as `color_story`
+        so human shots and product-alone shots visually cohere. Consumed by
+        agents/video_gen_node.py's new verbatim, never-cut `Cast:` prompt
+        section on every human-interaction shot (see that module's docstring).
+        NotRequired + empty-string-safe: a script with no implied person
+        (or a Treatment Agent fallback) simply omits/blanks it, and
+        video_gen_node.py's Cast section renders nothing in that case.
 """
 from typing import Literal, TypedDict
 from typing_extensions import NotRequired
@@ -62,7 +140,7 @@ class ProductTruth(TypedDict):
     fact: str
     category: Literal[
         "color", "material", "texture", "construction_detail",
-        "imperfection", "scale_cue", "brief_or_intake_fact",
+        "imperfection", "scale_cue", "brief_or_intake_fact", "form_factor",
     ]
     source: str
 
@@ -122,6 +200,12 @@ class Treatment(TypedDict):
     color_story: str
     pacing_philosophy: str
     beat_treatments: list[BeatTreatment]
+    # v10: ONE sentence anchoring a recurring human character's hair, one
+    # distinctively-colored wardrobe item, age band, and named setting (1-2
+    # fixed landmarks + time-of-day) -- present only when the winning script
+    # implies a person; see the v10 changelog note above for why this lives
+    # here and not on ScriptVariant/Shot.
+    character_anchor: NotRequired[str]
 
 
 class ShotJustification(TypedDict):
@@ -143,7 +227,7 @@ class Shot(TypedDict):
     description: str
     shot_type: Literal[
         "hook_hero", "macro_detail", "lifestyle_context",
-        "hero_reframe", "cta_endcard", "product_in_hand",
+        "hero_reframe", "cta_endcard", "product_in_hand", "worn_in_use",
     ]
     camera_move: Literal[
         "push_in", "orbit", "static", "pan", "tilt_up", "pull_back", "rack_focus",
@@ -173,9 +257,17 @@ class BudgetLedger(TypedDict):
     per_shot: dict[str, float]
 
 
+class IdentityCheck(TypedDict):
+    matching_features: list[str]
+    mismatching_features: list[str]
+    same_object: bool
+    confidence: Literal["high", "medium", "low"]
+
+
 class GeneratedShot(TypedDict):
     video_uri: str
     drift_score: NotRequired[float]
+    identity_check: NotRequired[IdentityCheck]
     attempt: int
 
 
@@ -272,6 +364,10 @@ class ProductCutState(TypedDict, total=False):
     voiceover: Voiceover
     master_cut_uri: str
     exports: Exports
+    # v7: voiceover_caption_agent_node's OWN trace key -- see v7 changelog note
+    # above for why it's separate from `reasoning_trace` (single-writer channel,
+    # avoids a same-superstep concurrent-write conflict with treatment_agent).
+    voiceover_reasoning_trace: NotRequired[str]
 
     # populated only by Phase 9 (chat-based revision)
     chat_thread: list[ChatMessage]

@@ -16,10 +16,30 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import httpx
 from openai import APIConnectionError, APITimeoutError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger("productcut.agents.retry")
+
+# Transport-level failures worth retrying. `APIConnectionError`/`APITimeoutError`
+# are the OpenAI SDK's own wrapped exceptions, raised when the INITIAL request
+# fails -- but a live full-pipeline run (video-gen-fidelity branch) found the
+# SDK does NOT wrap a connection drop that happens mid-STREAM (inside the
+# `async for chunk in stream` loop below): that raises the raw httpx exception
+# straight through, unwrapped. Without these in the retry set, a single dropped
+# packet on an otherwise-healthy connection killed the whole node with ZERO
+# retries -- exactly the "dropped connection" case this module's own docstring
+# already says it's scoped to cover, just missing from the exception-type list.
+_TRANSPORT_EXCEPTIONS = (
+    APIConnectionError,
+    APITimeoutError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+)
 
 
 def _log_retry(retry_state) -> None:
@@ -30,7 +50,7 @@ def _log_retry(retry_state) -> None:
 
 
 dashscope_retry = retry(
-    retry=retry_if_exception_type((APIConnectionError, APITimeoutError)),
+    retry=retry_if_exception_type(_TRANSPORT_EXCEPTIONS),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     stop=stop_after_attempt(3),
     reraise=True,

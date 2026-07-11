@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 
 from langchain_core.callbacks.manager import adispatch_custom_event
@@ -203,6 +204,119 @@ def repair_pacing(candidate: MergeCandidate) -> MergeCandidate:
 
 
 # ===========================================================================
+# SUB-CHECK 1b — Deterministic pronoun-consistency seam check (CODE).
+# video-gen-fidelity story-arc fix.
+#
+# A cross-pollinated merge (agents.meta_critic.MergeCandidate) stitches a
+# hook/body/cta that can come from up to THREE DIFFERENT script variants.
+# agents/concept_agent.py's own PRONOUN THREAD rule keeps ONE pronoun
+# consistent WITHIN a single variant, but it has no visibility across
+# variants -- a hook from a "she" variant merged with a cta from a "he"
+# variant is exactly the seam-level defect this validator already exists to
+# catch (distinct from its own blind coherence read's "voice/POV
+# consistency," which judges direct-address-vs-third-person register, a
+# coarser question than "which gendered pronoun does this implied person
+# use"). Runs deterministically, after the pacing re-check and BEFORE the LLM
+# coherence read -- same "mechanical where mechanical is possible, and cheap
+# checks run before an LLM call" posture as sub-check 1 (pacing) itself.
+# ===========================================================================
+
+# Deliberately crude regex matching, matching this codebase's established
+# posture for text-based backstops (agents/concept_agent.py's own pronoun
+# check, Body-Checker's stacked-compound regex): a false negative here just
+# means a subtler cross-variant mismatch slips through to the LLM coherence
+# read's own (coarser) voice-consistency judgment; a false positive would
+# wrongly block a legitimately-passing merge, which is the worse failure --
+# hence "they/them/their/theirs" is treated as gender-neutral and NEVER
+# flagged against either the "she" or "he" group (singular "they" mixed with
+# a later specific gendered reference to the same person is common, natural
+# usage, not a defect).
+_SHE_WORDS = frozenset({"she", "her", "hers"})
+_HE_WORDS = frozenset({"he", "him", "his"})
+_PRONOUN_WORD_RE = re.compile(r"\b(she|her|hers|he|him|his)\b", re.IGNORECASE)
+
+
+def _line_pronoun_groups(line: str) -> set[str]:
+    """{'she'} and/or {'he'} present in `line` -- never both from the same
+    word, and "they" family is intentionally excluded (see module comment
+    above)."""
+    groups: set[str] = set()
+    for word in _PRONOUN_WORD_RE.findall(line):
+        lowered = word.lower()
+        if lowered in _SHE_WORDS:
+            groups.add("she")
+        elif lowered in _HE_WORDS:
+            groups.add("he")
+    return groups
+
+
+def check_pronoun_consistency(candidate: MergeCandidate) -> list[SeamFlag]:
+    """Deterministic seam-level pronoun-mismatch check (see section banner
+    above). Checks the SAME two seams `derive_seam_flags` already routes to
+    (hook_body, body_cta) -- the only two points a cross-pollinated merge can
+    actually introduce a pronoun-thread break, since `body` itself is always
+    a single, contiguous run of beats from ONE source variant.
+
+    Returns SeamFlag(s) in the identical shape `derive_seam_flags` produces,
+    so a detected mismatch feeds the SAME Copy Editor repair path a
+    voice/register failure from the LLM coherence read already uses (§5.4.8)
+    -- this is not a new repair mechanism, just a second, cheaper way to
+    reach the existing one. Empty list when there is no body beat to route
+    to, or when the hook/cta side of a seam uses no gendered pronoun, or when
+    both sides agree.
+    """
+    beats = candidate.merged_beats
+    hook_indices = [i for i, b in enumerate(beats) if b.role == "hook"]
+    body_indices = [i for i, b in enumerate(beats) if b.role == "body"]
+    cta_indices = [i for i, b in enumerate(beats) if b.role == "cta"]
+    if not body_indices:
+        return []
+
+    def _groups_in(indices: list[int]) -> set[str]:
+        found: set[str] = set()
+        for i in indices:
+            found |= _line_pronoun_groups(beats[i].line)
+        return found
+
+    hook_groups = _groups_in(hook_indices)
+    first_body_groups = _line_pronoun_groups(beats[body_indices[0]].line)
+    last_body_groups = _line_pronoun_groups(beats[body_indices[-1]].line)
+    cta_groups = _groups_in(cta_indices)
+
+    flags: list[SeamFlag] = []
+
+    if hook_groups and first_body_groups and hook_groups.isdisjoint(first_body_groups):
+        flags.append(
+            SeamFlag(
+                seam="hook_body",
+                flagged_beat_index=body_indices[0],
+                editable_beat_index=body_indices[0],
+                evidence=(
+                    f"pronoun mismatch at the hook->body seam: hook uses "
+                    f"{sorted(hook_groups)}, body opens with {sorted(first_body_groups)} "
+                    "-- reads as two different people, not one continuing story."
+                ),
+            )
+        )
+
+    if last_body_groups and cta_groups and last_body_groups.isdisjoint(cta_groups):
+        flags.append(
+            SeamFlag(
+                seam="body_cta",
+                flagged_beat_index=body_indices[-1],
+                editable_beat_index=body_indices[-1],
+                evidence=(
+                    f"pronoun mismatch at the body->cta seam: body closes with "
+                    f"{sorted(last_body_groups)}, cta uses {sorted(cta_groups)} "
+                    "-- reads as two different people, not one continuing story."
+                ),
+            )
+        )
+
+    return flags
+
+
+# ===========================================================================
 # SUB-CHECK 2 — Independent blind LLM coherence read (LLM).
 # ===========================================================================
 
@@ -358,8 +472,15 @@ def validate_merge_candidate(
 
     1. Pacing re-check; on violation, one deterministic repair + re-check.
     2. Still failing -> failed result, failure_kind='pacing', coherence read SKIPPED.
-    3. Pacing passes (possibly after repair) -> blind coherence read (one re-prompt
-       on QwenJSONError/ValidationError, then give up).
+    2b. Pacing passes -> deterministic pronoun-consistency seam check
+        (video-gen-fidelity story-arc fix, `check_pronoun_consistency`). A
+        detected mismatch -> failed result, failure_kind='voice_register',
+        seam_flags from the check, coherence read SKIPPED (same "deterministic
+        catch skips the LLM call" posture as step 2) -- routes to the SAME
+        Copy Editor repair path a voice/register failure from the coherence
+        read below would.
+    3. Pacing passes AND no pronoun mismatch -> blind coherence read (one
+       re-prompt on QwenJSONError/ValidationError, then give up).
     4. No coherence verdict obtainable even after the re-prompt -> failed result,
        failure_kind=None (this exact case is not one of the three named failure
        kinds -- see the docstring note below and the final report), justification
@@ -395,6 +516,31 @@ def validate_merge_candidate(
             failure_kind="pacing",
             seam_flags=[],
             candidate_after_repair=working.model_dump(),
+        )
+
+    pronoun_seam_flags = check_pronoun_consistency(working)
+    if pronoun_seam_flags:
+        logger.info(
+            "Merge Coherence Validator: deterministic pronoun-consistency check "
+            "found %d seam mismatch(es) -- coherence read skipped, routing "
+            "straight to the Copy Editor's voice/register repair path.",
+            len(pronoun_seam_flags),
+        )
+        return CoherenceValidationResult(
+            passed=False,
+            pacing_recheck=pacing,
+            coherence_score=None,
+            voice_consistency=False,
+            promise_payoff_match=None,
+            register_shift_flags=[],
+            justification=(
+                "deterministic pronoun-consistency check found a mismatch at a "
+                "merge seam before the coherence read ever ran: "
+                + "; ".join(f.evidence for f in pronoun_seam_flags)
+            ),
+            failure_kind="voice_register",
+            seam_flags=pronoun_seam_flags,
+            candidate_after_repair=working.model_dump() if repaired else None,
         )
 
     read: Optional[CoherenceRead] = None
@@ -693,6 +839,7 @@ __all__ = [
     # deterministic layers (independently testable)
     "run_pacing_recheck",
     "repair_pacing",
+    "check_pronoun_consistency",
     "derive_seam_flags",
     # LLM layer
     "run_coherence_read",

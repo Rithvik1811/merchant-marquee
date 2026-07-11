@@ -53,16 +53,37 @@ Score EACH hook {MIN_SCORE}-{MAX_SCORE} on how well it would stop a scroll on a
 short-form video feed (TikTok/Reels/Shorts). Consider: does it create curiosity,
 tension, or an immediate visual/emotional pull within the first line?
 
-Calibration -- anchor your scores against these:
+Calibration -- anchor your scores against these. THREE DIFFERENT paths can all
+reach {MAX_SCORE}/{MAX_SCORE} -- a human-moment or curiosity-gap hook is NEVER
+weaker by default than a claim-led one just because it lacks a digit:
 - {MIN_SCORE} (weakest): generic, could open an ad for almost any similar
   product. Example: "Check out this amazing mug." No claim, no tension, no
-  specific detail.
-- {MAX_SCORE} (strongest): a concrete, specific claim -- names a pain tied to
-  a real detail, cites an exact number, or makes a contrarian claim resolved
-  by contrast. Example: "Your coffee is cold in 12 minutes. Mine isn't." A
-  number, then a contrast that resolves it, in one breath.
-- Middling scores (2-4): specific but no contrast/number (a tease with no
-  payoff), or a contrast/number not tied to anything concrete.
+  specific detail, no person, nothing to resolve.
+- {MAX_SCORE} (strongest) -- CLAIM PATH: a concrete, specific claim -- names a
+  pain tied to a real detail, cites an exact number, or makes a contrarian
+  claim resolved by contrast. Example: "Your coffee is cold in 12 minutes.
+  Mine isn't." A number, then a contrast that resolves it, in one breath.
+- {MAX_SCORE} (strongest) -- HUMAN-MOMENT PATH: drops the viewer into a
+  specific person's specific instant, product visible in-scene but not yet
+  pitched. Example: "She's out the door before sunrise, bag already on one
+  shoulder." No number, no contrast marker -- and no weaker for it.
+- {MAX_SCORE} (strongest) -- CURIOSITY-GAP PATH: a genuine curiosity gap
+  grounded in a real, specific detail that the rest of the script actually
+  pays off (not a bare unpaid tease). Example: "There's one part of this bag
+  nobody notices for the first six months." A concrete promise, resolved
+  later, not just a vague "watch till the end."
+- Middling scores (2-4): specific but no payoff (a tease with no resolution
+  anywhere in the script), or a contrast/number not tied to anything concrete.
+- SCORE DOWN (2 max), regardless of specificity, in EITHER of these cases:
+  (a) the hook is built on the PRODUCT'S OWN flaw or a competitor-flaw
+      comparison ("Other bags hide this scuff, not ours.") -- specific detail
+      does not redeem an opener that leads with a defect instead of a
+      strength; imperfection-category material belongs later in the script,
+      never the hook.
+  (b) the hook line is sing-song/rhyming (its ending chimes with a nearby
+      line's ending, or it scans like it could be sung/rapped) -- a jingle
+      cadence reads as an ad, not a person talking, no matter how specific
+      the claim inside it is.
 
 Score each variant independently, but you may compare them to calibrate --
 if all variants are similar strength, they can receive similar scores. Don't

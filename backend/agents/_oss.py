@@ -153,6 +153,23 @@ def upload_audio_to_oss(
     return _put_and_sign(key, local_path, "audio/mpeg", bucket=bucket)
 
 
+def upload_master_cut_to_oss(
+    local_path: str,
+    job_id: str,
+    filename: str = "master_cut.mp4",
+    *,
+    bucket: Optional[object] = None,
+) -> str:
+    """Upload the finished Assembly master-cut MP4 to the job's OSS namespace.
+
+    Same shape as `upload_audio_to_oss`/`upload_json_to_oss` -- keyed via
+    `oss_job_asset_key` (one master cut per job, not per shot) and
+    `Content-Type: video/mp4`. First caller: agents/assembly_agent.py.
+    """
+    key = oss_job_asset_key(job_id, filename)
+    return _put_and_sign(key, local_path, "video/mp4", bucket=bucket)
+
+
 def upload_json_to_oss(
     local_path: str,
     job_id: str,
@@ -229,6 +246,7 @@ __all__ = [
     "oss_job_asset_key",
     "upload_video_to_oss",
     "upload_audio_to_oss",
+    "upload_master_cut_to_oss",
     "upload_json_to_oss",
     "persist_remote_video_to_oss",
 ]

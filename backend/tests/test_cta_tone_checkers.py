@@ -221,6 +221,33 @@ def test_check_cta_duplicate_variant_raises(monkeypatch):
         check_cta(VARIANTS)
 
 
+def test_check_cta_retries_once_on_validation_failure_and_recovers(monkeypatch):
+    """Bounded retry-on-validation-failure (call_qwen_json_validated, video-gen-
+    fidelity branch fix): the first response is missing a variant entirely
+    (structural mismatch _validate_results raises on); the re-prompted second
+    response is complete and succeeds."""
+    good = [_cta_entry("v1"), _cta_entry("v2")]
+    fake = FakeSyncOpenAIClient([_payload([_cta_entry("v1")]), _payload(good)])
+    _patch_client(monkeypatch, fake)
+
+    result = check_cta(VARIANTS)
+
+    assert fake.call_count == 2
+    assert set(result.keys()) == {"v1", "v2"}
+
+
+def test_check_cta_raises_clearly_after_max_attempts_exhausted(monkeypatch):
+    """Every attempt is missing a variant -> bounded retry (max_attempts=2),
+    never hangs, raises the real ValueError clearly."""
+    fake = FakeSyncOpenAIClient([_payload([_cta_entry("v1")])])
+    _patch_client(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="missing"):
+        check_cta(VARIANTS)
+
+    assert fake.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # check_tone — full path, incl. never_do hard gate and None seller_direction.
 # ---------------------------------------------------------------------------
@@ -286,3 +313,21 @@ def test_check_tone_invalid_entry_raises(monkeypatch):
 
     with pytest.raises(ValueError, match="v1"):
         check_tone(BRIEF, SELLER_DIRECTION, VARIANTS)
+
+
+def test_check_tone_retries_once_on_validation_failure_and_recovers(monkeypatch):
+    """Bounded retry-on-validation-failure (call_qwen_json_validated): a
+    never_do_violation emitted as a string fails StrictBool on attempt 1; the
+    re-prompted attempt 2 emits a real JSON boolean and succeeds."""
+    bad = [
+        {"variant_id": "v1", "tone_score": 3, "never_do_violation": "true", "justification": "x"},
+        _tone_entry("v2"),
+    ]
+    good = [_tone_entry("v1"), _tone_entry("v2")]
+    fake = FakeSyncOpenAIClient([_payload(bad), _payload(good)])
+    _patch_client(monkeypatch, fake)
+
+    result = check_tone(BRIEF, SELLER_DIRECTION, VARIANTS)
+
+    assert fake.call_count == 2
+    assert result["v1"]["never_do_violation"] is False

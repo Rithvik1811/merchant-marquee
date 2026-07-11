@@ -27,12 +27,28 @@ import pytest
 from pydantic import ValidationError
 
 from agents.shot_list_agent import (
+    DEFAULT_TARGET_LENGTH_SEC,
+    HERO_SHOT_MAX_DURATION_SEC,
+    HERO_SHOT_MIN_DURATION_SEC,
+    HUMAN_INTERACTION_SHOT_TYPES,
+    HUMAN_SHOT_MAX_DURATION_SEC,
+    HUMAN_SHOT_MIN_DURATION_SEC,
+    HUMAN_SHOT_NEGATIVE_EXTRA,
     MAX_SHOTS,
     MIN_SHOTS,
+    NON_HERO_HUMAN_SHOT_NEGATIVE_EXTRA,
+    _AFFORDANCE_RUBRIC,
     _as_beat_index,
+    _assemble_shots,
+    _build_call_b_system_prompt,
     _clamp_duration,
+    _default_shot_type,
     _default_validate_justifications,
+    _hook_beat_implies_person,
+    _scaled_hero_window,
+    _target_duration_sec,
     generate_shot_list,
+    is_hero_shot,
     shot_list_agent_node,
 )
 from graph.shot_schema import validate_shot, validate_shot_list
@@ -357,6 +373,28 @@ async def test_call_b_extra_unknown_shot_ids_are_ignored():
 
 
 @pytest.mark.asyncio
+async def test_negative_prompt_over_500_chars_logs_warning_but_is_not_truncated(caplog):
+    """v8 fix: the hosted API truncates negative_prompt at 500 chars server-side.
+    This module never truncates it itself -- it only flags the shot so a lost
+    per-shot negative_prompt_extra term is visible in logs, not silently gone."""
+    long_extra = "extremely specific per-shot risk term, " * 15  # comfortably pushes s2 over 500 chars total
+    client = FakeOpenAIClient(
+        [_call_a(THREE_GOOD_JUSTIFS), _call_b(["s1", "s2", "s3"], per_shot={"s2": {"negative_prompt_extra": long_extra}})]
+    )
+    with caplog.at_level("WARNING"):
+        shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+
+    s2 = next(s for s in shots if s["shot_id"] == "s2")
+    assert len(s2["negative_prompt"]) > 500
+    assert long_extra.strip() in s2["negative_prompt"], "never truncated locally -- the API truncates server-side, not us"
+    assert any(
+        "s2" in r.message and "500-char" in r.message for r in caplog.records
+    )
+    # A sibling shot with no long extra never trips the guard.
+    assert not any("s1" in r.message and "500-char" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_call_b_missing_shots_key_all_defaults():
     """Call B returns valid JSON but no "shots" key -> every shot is assembled
     purely from defaults + its Call-A justification, still passing validation."""
@@ -610,3 +648,394 @@ def test_schema_extra_forbid_rejects_product_category_directly():
     validate_shot(base)  # sanity: the base is valid
     with pytest.raises(ValidationError):
         validate_shot({**base, "product_category": "phone stand"})
+
+
+# ===========================================================================
+# 11. Human-Contact Affordance Rule + deterministic human-shot clamps
+#     (video-gen-fidelity branch: worn_in_use addition + safety-tier clamps,
+#     see agents/shot_list_agent.py's HUMAN_INTERACTION_SHOT_TYPES et al.).
+# ===========================================================================
+def test_affordance_rubric_includes_human_contact_rule():
+    """The rubric extension (research point 5) must be present in the SAME
+    rendered string Call B's prompt already embeds, in the same rubric voice
+    as the existing camera_move rows."""
+    assert "human-contact affordance rubric" in _AFFORDANCE_RUBRIC
+    for term in ("handle", "strap", "grip", "scale_cue", "form_factor"):
+        assert term in _AFFORDANCE_RUBRIC
+
+
+def test_call_b_prompt_includes_bookend_and_human_shot_guidance():
+    prompt = _build_call_b_system_prompt()
+    assert "STRUCTURE (bookend rule)" in prompt
+    assert "HUMAN-INTERACTION SHOTS" in prompt
+    assert "DECISIVE action verb" in prompt
+    assert _AFFORDANCE_RUBRIC in prompt
+
+
+# ---------------------------------------------------------------------------
+# video-gen-fidelity PHASE 1: description is Action/Motion ONLY -- camera/
+# lighting/composition/identity-protection are handled downstream by the
+# Video-Gen Node's own prompt builder and must not be duplicated in
+# description. Tested via the PROMPT INSTRUCTION text (LLM-output-dependent
+# behavior can't be asserted deterministically here), same posture as the
+# rest of this system-prompt-content test class.
+# ---------------------------------------------------------------------------
+def test_call_b_description_instruction_bans_camera_lighting_identity_duplication():
+    prompt = _build_call_b_system_prompt()
+    assert "Action/Motion text ONLY" in prompt
+    assert "do NOT mention camera moves, lighting, framing, composition" in prompt
+
+
+def test_call_b_human_shot_instruction_bans_duplicate_identity_clauses():
+    prompt = _build_call_b_system_prompt()
+    assert "Do NOT add a scale-lock clause or an occlusion-continuity clause here" in prompt
+
+
+def test_call_b_human_shot_instruction_bans_hedged_verbs():
+    prompt = _build_call_b_system_prompt()
+    assert "NOT a hedged/softened one" in prompt
+    assert "slowly lifts" in prompt  # named as the example to avoid, not to use
+    assert "default to decisive" in prompt
+
+
+def test_call_b_prompt_includes_hero_shot_rule():
+    prompt = _build_call_b_system_prompt()
+    assert "ONE HERO SHOT, ALL OTHERS FACELESS" in prompt
+    assert "AT MOST ONE may be face-visible" in prompt
+    assert str(HERO_SHOT_MAX_DURATION_SEC) in prompt
+
+
+# ---------------------------------------------------------------------------
+# is_hero_shot -- the structural hero-identification mechanism (no new Shot
+# field; a human-interaction shot IS the hero iff its duration_sec exceeds
+# HUMAN_SHOT_MAX_DURATION_SEC).
+# ---------------------------------------------------------------------------
+
+
+def test_is_hero_shot_true_for_long_human_interaction_shot():
+    shot = {"shot_type": "worn_in_use", "duration_sec": 12.0}
+    assert is_hero_shot(shot) is True
+
+
+def test_is_hero_shot_false_for_short_human_interaction_shot():
+    shot = {"shot_type": "product_in_hand", "duration_sec": 3.5}
+    assert is_hero_shot(shot) is False
+
+
+def test_is_hero_shot_false_for_long_non_human_shot():
+    # A long duration alone is not enough -- must also be human-interaction
+    # typed (no non-hero code path can actually produce this combination, but
+    # the predicate itself must not be fooled by duration alone).
+    shot = {"shot_type": "hero_reframe", "duration_sec": 12.0}
+    assert is_hero_shot(shot) is False
+
+
+def test_is_hero_shot_false_at_exact_boundary():
+    # Exactly at the ceiling is NOT above it -- strict ">" per is_hero_shot's
+    # own docstring, matching every other clamp in this module's convention
+    # of well-defined boundary behavior.
+    shot = {"shot_type": "product_in_hand", "duration_sec": HUMAN_SHOT_MAX_DURATION_SEC}
+    assert is_hero_shot(shot) is False
+
+
+def _justification(shot_id="s1", truth_fact_id="t1", treatment_ref=0):
+    return {
+        "shot_id": shot_id,
+        "beat_role": "demo",
+        "script_quote": "This one grips with a dual knurled hinge.",
+        "truth_fact_id": truth_fact_id,
+        "treatment_ref": treatment_ref,
+    }
+
+
+def _call_b_entry(shot_id="s1", **overrides):
+    entry = {
+        "shot_id": shot_id,
+        "shot_type": "product_in_hand",
+        "camera_move": "orbit",  # deliberately disallowed for a human-tier shot
+        "framing": "fills_frame",
+        "text_overlay_zone": "none",
+        "duration_sec": 5,  # deliberately above the human-tier ceiling
+        "voiceover_line": "line",
+        "description": "a hand grips the dual knurled hinge",
+        "negative_prompt_extra": "",
+    }
+    entry.update(overrides)
+    return entry
+
+
+@pytest.mark.parametrize("shot_type", sorted(HUMAN_INTERACTION_SHOT_TYPES))
+def test_assemble_shots_clamps_camera_move_and_duration_for_human_shot_types(shot_type):
+    """A product_in_hand/worn_in_use shot with an out-of-tier camera_move
+    (orbit) and an over-ceiling duration is deterministically coerced --
+    matching the same _coerce_enum/_clamp_duration defensive posture this
+    function already applies, not left to a prompt instruction alone.
+
+    Two human-interaction justifications are used here (s0 then s1): s0 always
+    becomes THE hero (first human-interaction shot in list order -- see the
+    HERO SHOT mechanism note above `is_hero_shot` in shot_list_agent.py), so
+    s1 under test is the SECOND human-interaction shot and is therefore
+    force-clamped into the ordinary tight [HUMAN_SHOT_MIN_DURATION_SEC,
+    HUMAN_SHOT_MAX_DURATION_SEC] window, not the extended hero window."""
+    justifs = [_justification(shot_id="s0"), _justification(shot_id="s1")]
+    call_b_by_id = {
+        "s0": _call_b_entry(shot_id="s0", shot_type="product_in_hand", camera_move="static", duration_sec=10.0),
+        "s1": _call_b_entry(shot_id="s1", shot_type=shot_type),
+    }
+    shots = _assemble_shots(justifs, call_b_by_id, "soft key light", {"t1": TRUTHS[0]})
+    shot = next(s for s in shots if s["shot_id"] == "s1")
+    assert shot["camera_move"] == "static", "orbit is not in the human-shot allowed set -> coerced to static"
+    assert HUMAN_SHOT_MIN_DURATION_SEC <= shot["duration_sec"] <= HUMAN_SHOT_MAX_DURATION_SEC
+    for term in HUMAN_SHOT_NEGATIVE_EXTRA.split(", "):
+        assert term in shot["negative_prompt"]
+    # non-hero human shots also get the faceless-reinforcement negative terms.
+    for term in NON_HERO_HUMAN_SHOT_NEGATIVE_EXTRA.split(", "):
+        assert term in shot["negative_prompt"]
+
+
+def test_assemble_shots_allows_push_in_for_human_shot_types():
+    """push_in is the one non-static move allowed on the human tier. Uses two
+    human-interaction shots (s0, s1) so s1 under test is the non-hero one and
+    is clamped into the ordinary tight window -- see the docstring above."""
+    justifs = [_justification(shot_id="s0"), _justification(shot_id="s1")]
+    call_b_by_id = {
+        "s0": _call_b_entry(shot_id="s0", shot_type="product_in_hand", camera_move="static", duration_sec=10.0),
+        "s1": _call_b_entry(shot_id="s1", shot_type="worn_in_use", camera_move="push_in", duration_sec=3.5),
+    }
+    shots = _assemble_shots(justifs, call_b_by_id, "soft key light", {"t1": TRUTHS[0]})
+    shot = next(s for s in shots if s["shot_id"] == "s1")
+    assert shot["camera_move"] == "push_in"
+    assert shot["duration_sec"] == 3.5
+
+
+def test_assemble_shots_first_human_shot_becomes_hero_with_extended_duration():
+    """The FIRST human-interaction shot in justification order becomes THE
+    hero (see the HERO SHOT mechanism note above `is_hero_shot`) and is
+    clamped into the extended hero window even when Call B proposed a short,
+    ordinary-tier duration -- the hero always gets real room for its arc.
+
+    `_assemble_shots` is called with no explicit `target_duration_sec`, so it
+    uses DEFAULT_TARGET_LENGTH_SEC (15s) -- the Backstory-First fix scales the
+    hero window down from the flat [HERO_SHOT_MIN_DURATION_SEC,
+    HERO_SHOT_MAX_DURATION_SEC]=[10, 15]s range for a 15s-target ad (see
+    `_scaled_hero_window`), so this asserts against the SCALED window, not
+    the flat constants directly."""
+    hero_min, hero_max = _scaled_hero_window(DEFAULT_TARGET_LENGTH_SEC)
+    justifs = [_justification(shot_id="s1")]
+    call_b_by_id = {"s1": _call_b_entry(shot_id="s1", shot_type="worn_in_use", camera_move="push_in", duration_sec=3.5)}
+    shots = _assemble_shots(justifs, call_b_by_id, "soft key light", {"t1": TRUTHS[0]})
+    shot = shots[0]
+    assert shot["camera_move"] == "push_in"
+    assert hero_min <= shot["duration_sec"] <= hero_max
+    assert shot["duration_sec"] > HUMAN_SHOT_MAX_DURATION_SEC
+    assert is_hero_shot(shot)
+    # the hero shot does NOT get the non-hero faceless-reinforcement terms.
+    for term in NON_HERO_HUMAN_SHOT_NEGATIVE_EXTRA.split(", "):
+        assert term not in shot["negative_prompt"]
+
+
+def test_assemble_shots_does_not_clamp_camera_move_or_duration_for_non_human_shot_types():
+    """Regression: the human-tier clamp/negative-prompt extension must not leak
+    onto ordinary shot types -- orbit stays orbit, the general [3,5] window
+    still applies, and the human-only negative terms are absent.
+
+    Only checks terms genuinely UNIQUE to HUMAN_SHOT_NEGATIVE_EXTRA: a couple
+    of its terms ("deformed hands", "fused fingers") overlap words already in
+    NEGATIVE_PROMPT_BOILERPLATE (applied to every shot, human or not), so
+    those two would trivially "pass" a naive membership check regardless of
+    this clamp -- checking only the non-overlapping terms is the real test.
+    """
+    justifs = [_justification()]
+    call_b_by_id = {"s1": _call_b_entry(shot_type="macro_detail", camera_move="orbit", duration_sec=5)}
+    shots = _assemble_shots(justifs, call_b_by_id, "soft key light", {"t1": TRUTHS[0]})
+    shot = shots[0]
+    assert shot["camera_move"] == "orbit", "orbit is a valid enum value -- only human shot types get the extra clamp"
+    assert shot["duration_sec"] == 5.0, "the general [3,5] window allows 5s; only the human tier is tighter"
+    unique_terms = (
+        "extra fingers", "product changing size", "product changing color",
+        "duplicate product", "warped product silhouette", "scene cut",
+    )
+    for term in unique_terms:
+        assert term not in shot["negative_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_human_shot_camera_move_and_duration_hard_clamped():
+    """Full generate_shot_list flow: even when Call B returns an out-of-tier
+    camera_move and duration for a product_in_hand shot, the assembled,
+    schema-validated shot is deterministically clamped, not merely
+    prompt-guided. s1 is the ONLY human-interaction shot here, so it becomes
+    THE hero (see the HERO SHOT mechanism note in shot_list_agent.py) and is
+    clamped into the extended hero window, not the ordinary tight one."""
+    # WINNING_SCRIPT's beats end at t=15, so the Backstory-First fix's
+    # `_target_duration_sec` derives a 15s target -- the hero window is
+    # scaled down from the flat [10, 15]s range accordingly (see
+    # `_scaled_hero_window`); assert against the scaled window, not the flat
+    # module constants directly.
+    hero_min, hero_max = _scaled_hero_window(15.0)
+    per_shot = {"s1": {"shot_type": "product_in_hand", "camera_move": "orbit", "duration_sec": 5}}
+    client = FakeOpenAIClient([_call_a(THREE_GOOD_JUSTIFS), _call_b(["s1", "s2", "s3"], per_shot=per_shot)])
+    shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+    validate_shot_list(shots)
+    s1 = next(s for s in shots if s["shot_id"] == "s1")
+    assert s1["camera_move"] == "static"
+    assert hero_min <= s1["duration_sec"] <= hero_max
+    assert is_hero_shot(s1)
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_second_human_shot_stays_in_ordinary_non_hero_window():
+    """When TWO shots are human-interaction-typed, only the FIRST becomes the
+    hero -- the second is force-clamped into the ordinary tight window
+    regardless of what Call B proposed, proving "at most one hero" is a
+    structural guarantee (duration_sec alone discriminates it), not a
+    hoped-for prompt outcome."""
+    # See the hero-window scaling note in the test above -- WINNING_SCRIPT is
+    # a 15s-target script, so the hero window is scaled down from [10, 15]s.
+    hero_min, hero_max = _scaled_hero_window(15.0)
+    per_shot = {
+        "s1": {"shot_type": "product_in_hand", "camera_move": "static", "duration_sec": 3.5},
+        "s2": {"shot_type": "worn_in_use", "camera_move": "orbit", "duration_sec": 5},
+    }
+    client = FakeOpenAIClient([_call_a(THREE_GOOD_JUSTIFS), _call_b(["s1", "s2", "s3"], per_shot=per_shot)])
+    shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+    validate_shot_list(shots)
+    s1 = next(s for s in shots if s["shot_id"] == "s1")
+    s2 = next(s for s in shots if s["shot_id"] == "s2")
+    assert is_hero_shot(s1)
+    assert hero_min <= s1["duration_sec"] <= hero_max
+    assert not is_hero_shot(s2)
+    assert s2["camera_move"] == "static"
+    assert HUMAN_SHOT_MIN_DURATION_SEC <= s2["duration_sec"] <= HUMAN_SHOT_MAX_DURATION_SEC
+
+
+# ---------------------------------------------------------------------------
+# Backstory-First fix (video-gen-fidelity, 2026-07-11): hero-window scales to
+# target ad length; opening shot_type matches what the hook beat is doing.
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_hero_window_for_15s_ad_is_well_under_flat_10_15s_range():
+    """A 15s-target ad's hero shot must NOT eat the flat [10, 15]s range --
+    that alone could consume the entire ad before a backstory-opening shot
+    (~3s) and the CTA (~2.5-4s) claim their own room."""
+    hero_min, hero_max = _scaled_hero_window(15.0)
+
+    assert hero_max < HERO_SHOT_MAX_DURATION_SEC
+    assert hero_min < HERO_SHOT_MIN_DURATION_SEC
+    assert hero_min <= hero_max
+    # still enough above the ordinary human-shot ceiling to remain
+    # identifiable as THE hero (is_hero_shot's own condition).
+    assert hero_min > HUMAN_SHOT_MAX_DURATION_SEC
+
+
+def test_scaled_hero_window_for_30s_ad_reproduces_the_original_flat_range():
+    """The confirmed decision: the full [10, 15]s range is reserved for
+    30s-target ads -- scaling must be a no-op at 30s and above."""
+    hero_min, hero_max = _scaled_hero_window(30.0)
+
+    assert hero_min == HERO_SHOT_MIN_DURATION_SEC
+    assert hero_max == HERO_SHOT_MAX_DURATION_SEC
+
+
+def test_target_duration_sec_derives_from_winning_script_final_beat_end():
+    script = {
+        "beats": [
+            {"t_start": 0, "t_end": 3, "line": "a"},
+            {"t_start": 3, "t_end": 30, "line": "b"},
+        ]
+    }
+
+    assert _target_duration_sec(script) == 30.0
+
+
+def test_target_duration_sec_falls_back_to_default_when_no_beats():
+    assert _target_duration_sec({"beats": []}) == DEFAULT_TARGET_LENGTH_SEC
+
+
+def test_hook_beat_implies_person_true_for_pronoun_opening():
+    script = {"beats": [{"line": "She's out the door before sunrise, bag on one shoulder."}]}
+
+    assert _hook_beat_implies_person(script)
+
+
+def test_hook_beat_implies_person_false_for_claim_opening():
+    script = {"beats": [{"line": "Your coffee is cold in 12 minutes. Mine isn't."}]}
+
+    assert not _hook_beat_implies_person(script)
+
+
+def test_default_shot_type_hook_is_lifestyle_context_when_hook_implies_person():
+    assert _default_shot_type("hook", hook_implies_person=True) == "lifestyle_context"
+
+
+def test_default_shot_type_hook_is_hook_hero_when_hook_does_not_imply_person():
+    assert _default_shot_type("hook", hook_implies_person=False) == "hook_hero"
+    assert _default_shot_type("hook") == "hook_hero"  # default unchanged for callers that don't pass it
+
+
+def test_default_shot_type_never_returns_a_human_interaction_type_for_hook():
+    # Deliberately NOT product_in_hand/worn_in_use for the opening shot even
+    # when a person is implied -- HUMAN_INTERACTION_SHOT_TYPES would let the
+    # hero-assignment logic in _assemble_shots mistake the opener for the
+    # mid-ad hero and hijack its whole duration budget.
+    assert _default_shot_type("hook", hook_implies_person=True) not in HUMAN_INTERACTION_SHOT_TYPES
+
+
+def test_call_b_prompt_structure_rule_matches_hook_implies_person():
+    person_prompt = _build_call_b_system_prompt(7.5, hook_implies_person=True)
+    claim_prompt = _build_call_b_system_prompt(7.5, hook_implies_person=False)
+
+    assert "lifestyle_context" in person_prompt
+    assert "FACELESS" in person_prompt
+    assert "hook_hero" in claim_prompt
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_opening_shot_defaults_to_lifestyle_context_for_person_implying_hook():
+    """Full generate_shot_list flow with a winning script whose hook beat
+    establishes a person: when Call B doesn't return a valid shot_type for
+    the hook shot, the enum-snap default must be `lifestyle_context`, not the
+    claim-led default `hook_hero`."""
+    person_script = {
+        "text": (
+            "She's out the door before sunrise, bag on one shoulder. "
+            "This one grips with a dual knurled hinge. Tap the link to grab yours today."
+        ),
+        "beats": [
+            {"t_start": 0, "t_end": 3, "line": "She's out the door before sunrise, bag on one shoulder."},
+            {"t_start": 3, "t_end": 8, "line": "This one grips with a dual knurled hinge."},
+            {"t_start": 8, "t_end": 15, "line": "Tap the link to grab yours today."},
+        ],
+        "source_variant_ids": ["v1"],
+    }
+    justifs = [
+        {"shot_id": "s1", "beat_role": "hook", "script_quote": "She's out the door before sunrise, bag on one shoulder.",
+         "truth_fact_id": "t1", "treatment_ref": 0},
+        {"shot_id": "s2", "beat_role": "proof", "script_quote": "This one grips with a dual knurled hinge.",
+         "truth_fact_id": "t2", "treatment_ref": 1},
+        {"shot_id": "s3", "beat_role": "cta", "script_quote": "Tap the link to grab yours today.",
+         "truth_fact_id": "t1", "treatment_ref": 2},
+    ]
+    # Call B omits shot_type for s1 entirely -- forces the enum-snap default.
+    call_b_no_shot_type = {
+        "lighting": "soft key light",
+        "shots": [
+            {"shot_id": "s1", "camera_move": "static", "framing": "context_wide", "text_overlay_zone": "none",
+             "duration_sec": 4, "voiceover_line": "She's out the door before sunrise, bag on one shoulder.",
+             "description": "a woman shrugs a bag onto one shoulder and steps out a door.", "negative_prompt_extra": ""},
+            {"shot_id": "s2", "shot_type": "macro_detail", "camera_move": "push_in", "framing": "fills_frame",
+             "text_overlay_zone": "none", "duration_sec": 4, "voiceover_line": "This one grips with a dual knurled hinge.",
+             "description": "a hinge locks into place.", "negative_prompt_extra": ""},
+            {"shot_id": "s3", "shot_type": "cta_endcard", "camera_move": "static", "framing": "fills_frame",
+             "text_overlay_zone": "lower_third", "duration_sec": 3, "voiceover_line": "Tap the link to grab yours today.",
+             "description": "the product sits centered.", "negative_prompt_extra": ""},
+        ],
+    }
+    client = FakeOpenAIClient([_call_a(justifs), json.dumps(call_b_no_shot_type)])
+
+    shots = await generate_shot_list(person_script, TREATMENT, TRUTHS, client=client)
+    validate_shot_list(shots)
+
+    s1 = next(s for s in shots if s["shot_id"] == "s1")
+    assert s1["shot_type"] == "lifestyle_context"

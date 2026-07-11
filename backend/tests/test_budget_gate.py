@@ -151,8 +151,8 @@ def test_infeasible_above_min_shots_cuts_lowest_weight_first_and_retries():
         _shot("s_hook", "hook", "hook_hero", 4.0),                                     # w=1.20*1.15=1.38
         _shot("s_macro", "demo", "macro_detail", 4.0, truth_fact_id="t_material"),     # w=1.00*1.30*1.10=1.43
         _shot("s_cta", "cta", "cta_endcard", 4.0),                                     # w=1.20*1.10=1.32
-        _shot("s_demo2", "demo", "lifestyle_context", 4.0),                            # w=1.00*0.90=0.90
-        _shot("s_problem", "problem", "lifestyle_context", 4.0),                       # w=0.90*0.90=0.81 (lowest)
+        _shot("s_demo2", "demo", "lifestyle_context", 4.0),                            # w=1.00*1.10=1.10
+        _shot("s_problem", "problem", "lifestyle_context", 4.0),                       # w=0.90*1.10=0.99 (lowest)
     ]
     # sum(lo) at 5 shots = 1.20 (infeasible), at 4 shots = 0.96 (still infeasible
     # against cap below), at 3 shots = 0.72 (feasible) -- forces exactly TWO cuts,

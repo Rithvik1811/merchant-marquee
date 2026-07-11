@@ -156,7 +156,197 @@ NEGATIVE_PROMPT_BOILERPLATE = (
     "flicker, warbling surface, extra logos, extra text, watermark, subtitles, "
     "floating product, duplicated product, product leaving frame, background "
     "warping, flickering, jitter, deformed hands, fused fingers, low quality"
+    # v8 fix (Meta Quest -> "phone on a stand" wrong-object bug). Negative
+    # prompts work by "deletion through neutralization" of concrete visual
+    # concepts -- a vague abstract phrase like "different object" alone is
+    # weak, but naming the SPECIFIC observed failure mode gives it a concrete
+    # visual referent to cancel. Deliberately NOT expanded into a long list of
+    # every conceivable wrong object (that would burn char budget legitimate
+    # per-shot negative terms need) -- just the one empirically observed
+    # attractor plus one generic-but-concrete substitution phrase.
+    ", object substitution, product transforming into a different object, "
+    "smartphone, phone on a stand"
 )
+
+# shot_type values naming the human-interaction composition (C3 v4 addition of
+# "worn_in_use" alongside the existing "product_in_hand"). Hand-kept in sync
+# with agents/video_gen_node.py's own `_HUMAN_INTERACTION_SHOT_TYPES` (same
+# "hand-kept in sync" posture graph/shot_schema.py's docstring already uses for
+# its own enum mirroring) -- if this set changes, update that one too.
+HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
+
+# Tighter duration window than the general [MIN_SHOT_DURATION_SEC,
+# MAX_SHOT_DURATION_SEC] range -- occlusion and identity drift accumulate
+# faster on a shot with a moving human hand/body than on a still-life shot, so
+# the safe-length ceiling is lower (research point 4: "duration_sec hard-
+# clamped to [3, 4]").
+HUMAN_SHOT_MIN_DURATION_SEC = 3.0
+HUMAN_SHOT_MAX_DURATION_SEC = 4.0
+
+# Only one motion source at a time on a human-interaction shot: the human's own
+# motion is already one source, so stacking a second one (orbit/rack_focus/
+# pull_back/tilt_up) compounds drift exactly the way the affordance rubric
+# below already warns against for stacked camera moves generally.
+HUMAN_SHOT_ALLOWED_CAMERA_MOVES = frozenset({"static", "push_in"})
+
+# Extra negative-prompt terms specific to the human-interaction risk tier,
+# appended (never replacing) NEGATIVE_PROMPT_BOILERPLATE -- deterministic, not
+# left to Call B's optional negative_prompt_extra, since this risk applies to
+# EVERY shot of this shot_type, not just the ones the model happens to flag.
+HUMAN_SHOT_NEGATIVE_EXTRA = (
+    "deformed hands, extra fingers, fused fingers, product changing size, "
+    "product changing color, duplicate product, warped product silhouette, "
+    "scene cut"
+    # video-gen-fidelity PHASE 1 fix: a real failed job's rendered clip showed
+    # almost no motion (a near-static hand resting on the bag against a prompt
+    # describing a multi-stage lifting/adjusting action) -- these anti-static
+    # terms directly target that failure mode, same "name the specific
+    # observed failure mode" posture as the v8 object-substitution terms in
+    # NEGATIVE_PROMPT_BOILERPLATE above.
+    ", static scene, motionless person, frozen pose, still image"
+)
+
+# ---------------------------------------------------------------------------
+# HERO SHOT mechanism (video-gen-fidelity story-arc fix).
+#
+# Text-only i2v prompting cannot lock FACIAL identity across independent Wan
+# generations -- each generation is a fully independent call (no video-to-
+# video chaining, and per Alibaba's own docs "the same seed does not
+# guarantee identical results"). What it CAN reliably hold across independent
+# calls is wardrobe color / hair / a named setting, pinned once via
+# Treatment.character_anchor and reused verbatim (agents/video_gen_node.py's
+# new Cast section). The winning strategy: concentrate the ad's ONE real
+# face-visible emotional beat into a SINGLE shot -- the "hero" -- where a
+# single continuous generation is already proven to hold identity well
+# (this project's own Phase 0 de-risk testing and a later 10s real test both
+# stayed identity-consistent across one continuous clip). Every OTHER
+# human-interaction shot is faceless (hands/over-shoulder/insert), which
+# sidesteps the cross-shot face problem entirely instead of trying to solve it.
+#
+# HERO IDENTIFICATION MECHANISM. Deliberately NOT a new Shot field -- C1
+# (graph/state.py) stays additive-minimal for this fix (only
+# Treatment.character_anchor was added, see its v10 changelog note); adding a
+# Shot field would also require a graph/shot_schema.py ShotModel change
+# (`extra="forbid"`) for no real gain. Instead: a shot IS the hero iff it is
+# human-interaction-typed (shot_type in HUMAN_INTERACTION_SHOT_TYPES) AND its
+# duration_sec exceeds HUMAN_SHOT_MAX_DURATION_SEC (the ceiling every OTHER
+# human-interaction shot is hard-clamped under, below in `_assemble_shots`).
+# No other code path in this module can ever produce a human-interaction shot
+# above that ceiling except the one hero-assembly branch, so the condition is
+# structurally unambiguous -- and it composes for free with every downstream
+# reader that already inspects duration_sec (agents/budget_gate.py's
+# allocation windows, agents/video_gen_node.py's Cast-section gate) without
+# needing a new field threaded through three modules.
+HERO_SHOT_MIN_DURATION_SEC = float(os.getenv("HERO_SHOT_MIN_DURATION_SEC", "10.0"))
+HERO_SHOT_MAX_DURATION_SEC = float(os.getenv("HERO_SHOT_MAX_DURATION_SEC", "15.0"))
+
+# Backstory-First fix (video-gen-fidelity, 2026-07-11): the flat [10, 15]s
+# hero window above was sized for a 30s ad and, applied unscaled to a 15s ad,
+# could alone eat the ad's ENTIRE budget even before a ~3s backstory-opening
+# shot and a ~2.5-4s CTA claim their own room. Scale BOTH ends of the window
+# by the target ad length so a 15s ad's hero gets real-but-proportionate room
+# (roughly [5, 7.5]s) while a 30s-target ad keeps the original [10, 15]s
+# range exactly (these ratios were chosen so 30 * ratio reproduces the
+# original constants precisely -- a no-op at 30s and above).
+HERO_SHOT_MIN_DURATION_RATIO = 1.0 / 3.0  # 30 * (1/3) == HERO_SHOT_MIN_DURATION_SEC
+HERO_SHOT_MAX_DURATION_RATIO = 0.5        # 30 * 0.5 == HERO_SHOT_MAX_DURATION_SEC
+
+# Fallback target length when the winning script carries no derivable length
+# (defensive only -- see `_target_duration_sec` below). Mirrors
+# concept_agent.DEFAULT_TARGET_LENGTH_SEC; not imported from there to avoid a
+# cross-module dependency for one constant (same posture as this module's
+# other small duplicated proxies, e.g. its own `_IMPLIED_PERSON_RE` below).
+DEFAULT_TARGET_LENGTH_SEC = 15.0
+
+
+def _target_duration_sec(winning_script: WinningScript) -> float:
+    """The ad's target length in seconds, derived from the winning script.
+
+    C1's `WinningScript` (graph/state.py) carries no `target_length_sec`
+    field of its own (same "known gap" posture as concept_agent.py's and
+    budget_gate.py's own target_length_sec/budget_cap gaps -- see their
+    module docstrings) -- but `winning_script["beats"][-1]["t_end"]` is
+    already a reliable proxy: Meta-Critic's `retime_merged_beats` (§Step 6)
+    guarantees the merged beats end EXACTLY at target_length_sec, and
+    Concept Agent's own `_validate_variant` already rejects any variant whose
+    beats don't sum to within 1s of target_length_sec (so even the
+    single-survivor short-circuit path, which skips re-timing, is within 1s).
+    Falls back to `DEFAULT_TARGET_LENGTH_SEC` only if beats are somehow empty.
+    """
+    beats = winning_script.get("beats") or []
+    if beats:
+        try:
+            return float(beats[-1].get("t_end", DEFAULT_TARGET_LENGTH_SEC))
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_TARGET_LENGTH_SEC
+
+
+def _scaled_hero_window(target_duration_sec: float) -> tuple[float, float]:
+    """The [min, max] hero-shot duration window, scaled to `target_duration_sec`
+    (see the ratio constants' comment above). Never lets the window invert
+    (min > max), and never scales the floor below what `is_hero_shot` itself
+    needs to keep recognizing this shot as the hero (duration_sec strictly
+    greater than HUMAN_SHOT_MAX_DURATION_SEC) even for a very short target ad.
+    """
+    scaled_max = min(HERO_SHOT_MAX_DURATION_SEC, target_duration_sec * HERO_SHOT_MAX_DURATION_RATIO)
+    scaled_min = min(HERO_SHOT_MIN_DURATION_SEC, target_duration_sec * HERO_SHOT_MIN_DURATION_RATIO)
+    scaled_min = min(scaled_min, scaled_max)
+    floor = min(HUMAN_SHOT_MAX_DURATION_SEC + 0.5, scaled_max)
+    scaled_min = max(scaled_min, floor)
+    return scaled_min, scaled_max
+
+
+# Backstory-First fix: which shot_type the OPENING (hook beat_role) shot
+# should default to. Deliberately duplicated (not imported) from
+# agents/treatment_agent.py's own `_IMPLIED_PERSON_RE` -- same "each module
+# owns its own small text-matching helpers" posture that module's docstring
+# already documents for its own duplication from agents/concept_agent.py.
+_IMPLIED_PERSON_RE = re.compile(
+    r"\b(she|he|her|him|his|hers|they|them|their|theirs|a person|someone|a man|a woman|a hand)\b",
+    re.IGNORECASE,
+)
+
+
+def _hook_beat_implies_person(winning_script: WinningScript) -> bool:
+    """True iff the winning script's OWN beat 0 (not the whole script) implies
+    a person -- the signal that the hook is a human-moment/curiosity-gap
+    opening (Concept Agent's HOOK STRENGTH rule) rather than a claim-led one,
+    so the opening shot should be a faceless `lifestyle_context` scene
+    instead of the default product-alone `hook_hero`. Scoped to beat 0 only,
+    matching agents/treatment_agent.py's own `_hook_beat_implies_person`.
+    """
+    beats = winning_script.get("beats") or []
+    if not beats:
+        return False
+    return bool(_IMPLIED_PERSON_RE.search(beats[0].get("line", "")))
+
+
+def is_hero_shot(shot: dict) -> bool:
+    """True iff `shot` is THE hero shot (see the mechanism note above).
+
+    Imported by agents/budget_gate.py (per-shot allocation floor/ceiling) and
+    agents/video_gen_node.py (Cast-section face-visible gate) -- both already
+    import other constants from this module (MIN_SHOTS, MIN_SHOT_DURATION_SEC),
+    so this follows the same established cross-module dependency direction.
+    """
+    return (
+        shot.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES
+        and shot.get("duration_sec", 0.0) > HUMAN_SHOT_MAX_DURATION_SEC
+    )
+
+
+# Structural facelessness reinforcement for every human-interaction shot
+# EXCEPT the hero (see mechanism note above) -- a negative-prompt nudge
+# alongside Call B's own faceless-framing instruction, same "never trust an
+# LLM instruction alone for a hard constraint" posture as
+# HUMAN_SHOT_NEGATIVE_EXTRA above. This is a reinforcing signal, not the
+# primary lever -- the primary lever is the Call B system prompt's own
+# ONE HERO SHOT, ALL OTHERS FACELESS instruction (positive instructions are
+# what empirically move this model family, per
+# docs/DERISK_VIDEO_GEN_RESULT.md SS6 -- the negative prompt alone was never
+# sufficient for the analogous product-vanishing fix either).
+NON_HERO_HUMAN_SHOT_NEGATIVE_EXTRA = "clearly visible face, camera-facing face, facial close-up"
 
 # Affordance-binding rubric (§5.6): which camera_move is MOTIVATED by which kind
 # of cited fact, so Call B's choice is not merely grounded but actually
@@ -170,7 +360,9 @@ camera_move affordance rubric — a move is MOTIVATED only when the cited fact n
 - pull_back   -> a scale/context reveal the product's size makes meaningful. Reject when it reveals nothing new.
 - static      -> a claim proven BY stillness. Reject as default laziness.
 - pan         -> lateral geometry worth traversing.
-NEVER compound/stacked moves — stacked camera moves visibly break current text-to-video models. static/push_in are safest (may run full length); orbit is highest-risk (keep short)."""
+NEVER compound/stacked moves — stacked camera moves visibly break current text-to-video models. static/push_in are safest (may run full length); orbit is highest-risk (keep short).
+
+human-contact affordance rubric — a HUMAN-INTERACTION shot_type (product_in_hand / worn_in_use) is MOTIVATED only when a cited fact names a part whose function is human contact — a handle, strap, grip, rim, spout, clasp, zipper pull, button, drawstring, band, trigger, or an equivalent named part — or a scale_cue/form_factor fact establishing the object is hand- or body-scale. When such a fact exists, the shot's contact point MUST be that fact's text, verbatim — same grounding discipline as every other shot. Reject "it's this kind of product, show someone using it" with no such fact cited. When at least one such fact exists among the product's truths, the shot list SHOULD include at least one human-interaction beat (default ON, not forced when nothing supports it)."""
 
 
 # ---------------------------------------------------------------------------
@@ -421,8 +613,25 @@ def _coerce_enum(value, allowed: tuple[str, ...], default: str) -> str:
     return value if value in allowed else default
 
 
-def _default_shot_type(beat_role: str) -> str:
-    return {"hook": "hook_hero", "cta": "cta_endcard"}.get(beat_role, "macro_detail")
+def _default_shot_type(beat_role: str, hook_implies_person: bool = False) -> str:
+    """Deterministic shot_type default -- used as the enum-snap fallback when
+    Call B doesn't return a valid shot_type (`_coerce_enum`), or when
+    assembling a shot the fallback-justification path produced.
+
+    Backstory-First fix: the "hook" default is now conditional on whether the
+    winning script's own beat 0 implies a person (`hook_implies_person`,
+    computed once from the winning script in `generate_shot_list` and threaded
+    through to `_assemble_shots`) -- a person-establishing hook beat defaults
+    to the faceless `lifestyle_context` open instead of the product-alone
+    `hook_hero`, matching Call B's own STRUCTURE instruction. Deliberately
+    never `product_in_hand`/`worn_in_use` here: those are
+    HUMAN_INTERACTION_SHOT_TYPES, and the hero-assignment logic in
+    `_assemble_shots` would mistake an opening shot of that type for the
+    mid-ad hero and hijack its duration budget.
+    """
+    if beat_role == "hook":
+        return "lifestyle_context" if hook_implies_person else "hook_hero"
+    return {"cta": "cta_endcard"}.get(beat_role, "macro_detail")
 
 
 def _clamp_duration(value) -> float:
@@ -442,7 +651,26 @@ def _reference_image_id(truth_fact_id: str, truths_by_id: dict[str, ProductTruth
     return source if source else "photo_1"
 
 
-def _build_call_b_system_prompt() -> str:
+def _build_call_b_system_prompt(
+    hero_max_duration_sec: float = HERO_SHOT_MAX_DURATION_SEC,
+    hook_implies_person: bool = False,
+) -> str:
+    hook_structure_note = (
+        """This script's hook beat establishes a person in a specific moment (the
+winning script's own opening line names/implies them). Open on shot_type
+`lifestyle_context`: a FACELESS, scene-establishing shot -- from-behind,
+over-the-shoulder, or waist-down framing -- with the product clearly visible
+and identifiable within the first frames, but NOT yet the subject of a
+close-up. Do NOT use `product_in_hand` or `worn_in_use` for this opening
+shot: those are HUMAN-INTERACTION shot_types reserved for the mid-ad hero
+below, and using one here would make the hero-assignment logic mistake this
+opening shot for the hero and hijack its whole duration budget."""
+        if hook_implies_person else
+        """This script's hook beat is a claim or curiosity beat about the product
+itself (no person established in the opening line). Open on shot_type
+`hook_hero`, product ALONE -- never a human-interaction shot_type for this
+kind of hook."""
+    )
     return f"""You are a cinematographer turning already-justified shots into concrete
 video-generation briefs. Each shot's grounding (its exact script quote + the real
 product fact + the treatment beat it realizes) is FIXED and given to you -- do not
@@ -455,22 +683,98 @@ For every shot produce these fields:
 - text_overlay_zone: one of {', '.join(_TEXT_ZONES)} -- reserved empty space for a
   caption/CTA composited later. On-screen text is NEVER generated; reserve a zone
   when the shot carries a caption/CTA, otherwise "none".
-- duration_sec: a number in [{MIN_SHOT_DURATION_SEC}, {MAX_SHOT_DURATION_SEC}]. Keep
-  static/push_in at full length; keep orbit/rack_focus short.
+- duration_sec: a number in [{MIN_SHOT_DURATION_SEC}, {MAX_SHOT_DURATION_SEC}] for
+  every ordinary shot. Keep static/push_in at full length; keep orbit/rack_focus
+  short. EXCEPTION: if this shot is THE HERO (see STRUCTURE below), duration_sec
+  may extend up to {hero_max_duration_sec}s for this ad's target length -- give the
+  arc real room, but do not assume the full 15s ceiling applies to every ad length.
 - voiceover_line: the script line spoken over this shot.
-- description: the video-gen prompt text, {80}-{120} words, ordered
-  Subject -> Action/Motion -> Camera -> Lighting -> Composition -> Mood -> Quality.
-  Name the product's REAL color/material/logo (from the cited truth) in the FIRST
-  20-30 words -- front-loaded terms carry the most weight -- then spend the rest on
-  motion/camera, not on re-describing the static scene the reference photo fixes.
-  End with a positive identity-preservation clause ("preserve product shape, keep
-  label text, keep proportions"). On any shot with human interaction or a
-  transition-adjacent move, ALSO add an anti-cut clause ("product stays centered,
-  never leaves frame, no scene cut") -- this positive instruction, not the negative
-  prompt, is what stops the product vanishing.
+- description: the Action/Motion text ONLY -- what the subject physically DOES
+  in this shot: what starts, what happens, what it ends on. Word count depends
+  on the shot (see STRUCTURE/HUMAN-INTERACTION SHOTS below for the human cases);
+  an ordinary product-alone shot runs 40-70 words. Camera, lighting,
+  framing/composition, and identity-protection (product shape/color/material
+  staying constant, hands having five fingers, no scene cut) are ALL added
+  separately downstream by the Video-Gen Node's own prompt builder -- do NOT mention camera moves, lighting, framing, composition, or
+  any identity-preservation/anti-cut clause here. Writing that language into description
+  duplicates content the downstream builder already adds (costing real
+  character budget a video-gen prompt has very little of) for zero extra
+  benefit. Name the product's REAL color/material (from the cited truth) in
+  the FIRST 10-15 words if it naturally belongs in the action, but do not pad
+  with static appearance description the reference photo already fixes -- spend
+  the words on the actual motion. Use DECISIVE action verbs ("lifts," "settles,"
+  "adjusts") -- avoid hedging/softening adverbs ("slowly," "gently,"
+  "carefully") unless the beat's own narrative genuinely calls for a
+  deliberately slow, tender moment (rare); a hedged verb compounds i2v models'
+  documented bias toward under-motion early in a clip into a shot that barely
+  reads as moving at all.
 - negative_prompt_extra: OPTIONAL short extra risk terms for THIS shot only (a
   shared identity-first negative prompt is already applied; only add per-shot
   risk). Leave "" if none.
+
+STRUCTURE (bookend rule): the OPENING shot must match what the hook beat is
+actually doing (Backstory-First fix). {hook_structure_note}
+Always close (cta beat_role) on the product ALONE -- never a human-interaction
+shot_type (product_in_hand / worn_in_use) for the CTA. This is also the
+technically safest choice for the close: an i2v clip's last frames stay
+closest to the reference photo, and a clean product-alone shot is the natural
+fallback anchor if a riskier human shot elsewhere fails. Concentrate any
+human-interaction shots in the demo/proof beats instead. Cap human-interaction
+shots at 1-3 per ad -- never zero when the human-contact affordance rubric
+below supports one, never every shot. Avoid `context_wide` framing more than
+once per ad on a worn_in_use shot -- wide framing makes the product smallest
+and hardest to identity-check.
+
+ONE HERO SHOT, ALL OTHERS FACELESS (structural rule, video-gen-fidelity
+story-arc fix). Text-only i2v prompting cannot lock FACIAL identity across
+independent Wan generations -- each shot is an independent call, no video
+chaining, no seed guarantee. So: of all the human-interaction shots you write
+(1-3 per the cap above), AT MOST ONE may be face-visible -- this is THE HERO.
+Concentrate the ad's real emotional moment there, since a SINGLE continuous
+generation holds character identity well. EVERY OTHER human-interaction shot
+MUST be faceless framing: hands, over-the-shoulder, from-behind, waist-down,
+or an insert on the contact point -- never a visible face, eyes, or
+expression. This sidesteps the cross-shot face-consistency problem entirely
+(no face in one shot to contradict a different-looking face in another).
+- The hero shot gets the extended duration (up to {hero_max_duration_sec}s,
+  see duration_sec above) so a real arc can complete -- e.g. lift, travel,
+  turn, settle -- not a truncated snippet. Its description should scale up to
+  roughly 120-180 words to give that whole arc real content (still Action/
+  Motion only, same rule as above -- do not spend the extra words on
+  appearance; a separate Cast section is added downstream for that).
+- Every OTHER (non-hero) human-interaction shot stays faceless, keeps
+  duration_sec inside the ordinary tight human window (hard-clamped downstream
+  regardless of what you write here), and keeps description to 40-55 words --
+  there is less to show without a face in frame, so there is less to write.
+
+HUMAN-INTERACTION SHOTS (shot_type product_in_hand / worn_in_use) -- extra
+phrasing discipline, on top of the description rule above:
+- Describe the human MINIMALLY and generically ("a person" / "a hand" + one
+  clear action) -- never spend words on human appearance, it steals
+  subject-weight from the product in the front-loaded first 20-30 words. This
+  applies to the hero shot too -- its extra word budget goes to the ACTION
+  arc, never to appearance (a separate Cast section, grounded in the
+  treatment's character_anchor, is added downstream and would otherwise be
+  duplicated here).
+- Name the EXACT contact point using the human-contact fact cited above,
+  verbatim: e.g. "a hand enters frame and grips the {{that fact's exact
+  text}}" -- not a vague "holds it."
+- Do NOT add a scale-lock clause or an occlusion-continuity clause here -- the
+  Video-Gen Node's own prompt builder already appends one compressed
+  identity-protection sentence covering size/proportion/silhouette/occlusion/
+  color/material/no-scene-cut downstream; writing it again in description
+  duplicates the same protection twice and burns character budget the action
+  text needs.
+- Use a clear, DECISIVE action verb for the human action ("lifts," "settles,"
+  "adjusts") -- NOT a hedged/softened one ("slowly lifts," "gently slides"),
+  unless the beat's own narrative genuinely calls for a deliberately slow,
+  tender moment (rare). A real failed shot showed almost no motion because a
+  hedged verb ("slowly slings... gently adjusts") combined with i2v models'
+  documented bias toward under-motion early in a clip left a 3-4s clip with
+  no budget left to render a real action -- default to decisive.
+- camera_move for these shot_types must be "static" or "push_in" ONLY (also
+  hard-enforced downstream) -- one motion source at a time; a moving human
+  plus a moving camera compounds drift.
 
 {_AFFORDANCE_RUBRIC}
 
@@ -535,6 +839,8 @@ def _assemble_shots(
     call_b_by_id: dict[str, dict],
     shared_lighting: str,
     truths_by_id: dict[str, ProductTruth],
+    target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC,
+    hook_implies_person: bool = False,
 ) -> list[dict]:
     """Combine each shot's validated justification (Call A) with its camera fields
     (Call B) into a full Shot dict.
@@ -543,19 +849,80 @@ def _assemble_shots(
     (t_end - t_start == duration_sec), starting at 0 -- a simple, honest mapping
     that keeps position and clip length consistent; finer voiceover sync is the
     Video-Gen / Assembly nodes' job, not this one's.
+
+    HERO ASSIGNMENT (video-gen-fidelity story-arc fix, see the HERO SHOT
+    mechanism comment above `is_hero_shot`): the FIRST human-interaction shot
+    encountered in `justifications` order becomes THE hero -- deterministically,
+    regardless of what Call B's own shot_type/duration choices "intended" --
+    and is clamped into the extended hero window instead of the tight human
+    window. That window is now SCALED to `target_duration_sec`
+    (Backstory-First fix, `_scaled_hero_window`) rather than the flat
+    [HERO_SHOT_MIN_DURATION_SEC, HERO_SHOT_MAX_DURATION_SEC]=[10, 15]s window,
+    which could alone consume an entire 15s-target ad's budget. EVERY
+    subsequent human-interaction shot is force-clamped into the ordinary
+    tight window regardless of what Call B proposed, which is what makes
+    "at most one hero" a structural guarantee rather than a hoped-for prompt
+    outcome: only one shot per assembled list can ever have duration_sec above
+    HUMAN_SHOT_MAX_DURATION_SEC, by construction.
     """
+    hero_min, hero_max = _scaled_hero_window(target_duration_sec)
     shots: list[dict] = []
     cursor = 0.0
+    hero_assigned = False
     for j in justifications:
         b = call_b_by_id.get(j["shot_id"], {})
         beat_role = _coerce_enum(j.get("beat_role"), _BEAT_ROLES, "demo")
+
+        # shot_type and camera_move are resolved BEFORE duration/negative_prompt
+        # below -- the human-interaction risk tier (research point 4: never trust
+        # an LLM instruction alone for a hard constraint, same posture as the
+        # enum-snapping this function already does) clamps duration and
+        # camera_move, and extends the negative prompt, based on shot_type.
+        default_shot_type = _default_shot_type(
+            beat_role, hook_implies_person if beat_role == "hook" else False
+        )
+        shot_type = _coerce_enum(b.get("shot_type"), _SHOT_TYPES, default_shot_type)
+        camera_move = _coerce_enum(b.get("camera_move"), _CAMERA_MOVES, "static")
+        is_human_shot = shot_type in HUMAN_INTERACTION_SHOT_TYPES
+        is_hero = False
+
         duration = _clamp_duration(b.get("duration_sec"))
+        if is_human_shot:
+            if not hero_assigned:
+                is_hero = True
+                hero_assigned = True
+                duration = max(hero_min, min(hero_max, duration))
+            else:
+                duration = max(HUMAN_SHOT_MIN_DURATION_SEC, min(HUMAN_SHOT_MAX_DURATION_SEC, duration))
+        if is_human_shot and camera_move not in HUMAN_SHOT_ALLOWED_CAMERA_MOVES:
+            camera_move = "static"
+
         t_start = cursor
         t_end = round(cursor + duration, 3)
         cursor = t_end
 
-        extra = (b.get("negative_prompt_extra") or "").strip()
+        extra_parts = []
+        call_b_extra = (b.get("negative_prompt_extra") or "").strip()
+        if call_b_extra:
+            extra_parts.append(call_b_extra)
+        if is_human_shot:
+            extra_parts.append(HUMAN_SHOT_NEGATIVE_EXTRA)
+            if not is_hero:
+                extra_parts.append(NON_HERO_HUMAN_SHOT_NEGATIVE_EXTRA)
+        extra = ", ".join(extra_parts)
         negative_prompt = f"{NEGATIVE_PROMPT_BOILERPLATE}, {extra}" if extra else NEGATIVE_PROMPT_BOILERPLATE
+        # The hosted API truncates negative_prompt at 500 chars server-side. We
+        # never truncate it ourselves -- flag it so a shot's specific extra risk
+        # terms silently lost to server-side truncation are at least visible in
+        # logs (same "flag, don't silently hide" posture as video_gen_node.py's
+        # prompt-length guard).
+        if len(negative_prompt) > 500:
+            logger.warning(
+                "Shot-List Agent: shot %s negative_prompt is %d chars, over the "
+                "hosted API's 500-char truncation limit -- some of its "
+                "negative_prompt_extra terms may be silently dropped server-side.",
+                j["shot_id"], len(negative_prompt),
+            )
 
         shots.append(
             {
@@ -565,8 +932,8 @@ def _assemble_shots(
                 "beat_role": beat_role,
                 "description": (b.get("description") or "").strip()
                 or f"{truths_by_id.get(j['truth_fact_id'], {}).get('fact', 'the product')}",
-                "shot_type": _coerce_enum(b.get("shot_type"), _SHOT_TYPES, _default_shot_type(beat_role)),
-                "camera_move": _coerce_enum(b.get("camera_move"), _CAMERA_MOVES, "static"),
+                "shot_type": shot_type,
+                "camera_move": camera_move,
                 "framing": _coerce_enum(b.get("framing"), _FRAMINGS, "fills_frame"),
                 "lighting": shared_lighting,
                 "negative_prompt": negative_prompt,
@@ -623,6 +990,8 @@ async def generate_shot_list(
             timeout=120.0,
         )
     truths_by_id = {t["truth_id"]: t for t in product_truths}
+    target_duration_sec = _target_duration_sec(winning_script)
+    hook_implies_person = _hook_beat_implies_person(winning_script)
 
     try:
         # --- Call A: Justify -------------------------------------------------
@@ -681,7 +1050,10 @@ async def generate_shot_list(
                            len(justifications), MIN_SHOTS)
 
         # --- Call B: Realize -------------------------------------------------
-        shots = await _run_call_b(client, model, justifications, truths_by_id, treatment)
+        shots = await _run_call_b(
+            client, model, justifications, truths_by_id, treatment,
+            target_duration_sec, hook_implies_person,
+        )
         return shots
     finally:
         if own_client:
@@ -694,11 +1066,17 @@ async def _run_call_b(
     justifications: list[dict],
     truths_by_id: dict[str, ProductTruth],
     treatment: Treatment,
+    target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC,
+    hook_implies_person: bool = False,
 ) -> list[Shot]:
     """Call B + assembly + structural validation, with one bounded Call B retry
     if the assembled list fails structural validation (§5.6 repair posture)."""
+    _, hero_max = _scaled_hero_window(target_duration_sec)
     messages = [
-        {"role": "system", "content": _build_call_b_system_prompt()},
+        {
+            "role": "system",
+            "content": _build_call_b_system_prompt(hero_max, hook_implies_person),
+        },
         {"role": "user", "content": _build_call_b_user_content(justifications, truths_by_id, treatment)},
     ]
 
@@ -709,7 +1087,10 @@ async def _run_call_b(
         shared_lighting = (parsed_b.get("lighting") or "").strip() or (
             treatment.get("color_story") or "soft key light, neutral background, clean commercial look"
         )
-        assembled = _assemble_shots(justifications, call_b_by_id, shared_lighting, truths_by_id)
+        assembled = _assemble_shots(
+            justifications, call_b_by_id, shared_lighting, truths_by_id,
+            target_duration_sec, hook_implies_person,
+        )
         try:
             validate_shot_list(assembled)
             return assembled  # type: ignore[return-value]

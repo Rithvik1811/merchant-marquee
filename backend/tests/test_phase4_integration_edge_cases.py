@@ -34,7 +34,11 @@ from agents.video_gen_node import VideoGenAPIError
 from graph.build import build_graph
 
 from tests._fakes import FakeOpenAIClient
-from tests._phase3_graph import patch_phase3_boundaries
+from tests._phase3_graph import (
+    patch_assembly_boundaries,
+    patch_phase3_boundaries,
+    patch_voiceover_boundaries,
+)
 from tests.test_continuity_gate import _build_gate_graph, _gen, _shot, _state
 from tests.test_continuity_loop_e2e import _initial_state, _patch_upstream
 
@@ -59,6 +63,28 @@ def _counting_wan(monkeypatch) -> dict:
     return counts
 
 
+def _patch_clean_identity(monkeypatch) -> None:
+    """Fake the v8 identity check clean (`same_object=True`) for every shot.
+
+    None of the tests in this file are exercising the identity check itself
+    (that's test_continuity_agent.py / test_continuity_gate.py's job) -- they
+    drive the full graph to test the DRIFT retry/interrupt/durability machinery.
+    Without this, the real `_score_one_shot_identity` would run against a fake
+    `http://...` clip URL, fail at the network boundary (worst-case
+    `same_object=False`), and continuity_gate.py's hard-identity-failure routing
+    would fire and steal these tests' outcomes out from under the drift-focused
+    assertions they're actually making.
+    """
+    from agents.continuity_agent import IdentityCheckResult
+
+    async def _clean_identity(shot, entry, product_photos, client, extract):
+        return IdentityCheckResult(
+            matching_features=["clean match"], mismatching_features=[], same_object=True, confidence="high",
+        )
+
+    monkeypatch.setattr("agents.continuity_agent._score_one_shot_identity", _clean_identity)
+
+
 def _cfg(thread_id: str) -> dict:
     # Generous recursion_limit: several loop passes + the ~9 upstream supersteps
     # can exceed LangGraph's default of 25.
@@ -79,7 +105,10 @@ async def _drain(graph, arg, cfg):
 @pytest.mark.asyncio
 async def test_human_approved_shot_not_rereviewed_on_later_loop_pass(monkeypatch):
     _patch_upstream(monkeypatch)
+    _patch_clean_identity(monkeypatch)
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
     _counting_wan(monkeypatch)
 
     # s1 and s2 both drift forever; s3 is always clean. s1 will be APPROVED; s2 is
@@ -134,7 +163,10 @@ async def test_human_approved_shot_not_rereviewed_on_later_loop_pass(monkeypatch
 @pytest.mark.asyncio
 async def test_retry_with_edit_that_still_drifts_reinterrupts_same_shot(monkeypatch):
     _patch_upstream(monkeypatch)
+    _patch_clean_identity(monkeypatch)
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
 
     # Count generation calls FOR s2 specifically (via its unique prompt marker) --
     # NOT via the final persisted video_uri, which the fake OSS persist step
@@ -213,7 +245,10 @@ async def test_retry_with_edit_that_still_drifts_reinterrupts_same_shot(monkeypa
 @pytest.mark.asyncio
 async def test_hard_fail_during_continuity_retry_falls_back_and_terminates(monkeypatch):
     _patch_upstream(monkeypatch)
+    _patch_clean_identity(monkeypatch)
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)  # provides OSS + Ken-Burns fakes
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
 
     # s2 SUCCEEDS on its first generation (so it can drift + auto-retry), then the
     # Wan call FAILS on the retry regeneration -- a genuine VideoGenAPIError.
@@ -317,7 +352,10 @@ async def test_unknown_resolution_leaves_shot_in_review_and_terminates(monkeypat
 @pytest.mark.asyncio
 async def test_frame_extraction_failure_through_compiled_graph(monkeypatch):
     _patch_upstream(monkeypatch)
+    _patch_clean_identity(monkeypatch)
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
     _counting_wan(monkeypatch)
 
     def _extract(video_uri: str, duration_sec: float) -> str:
