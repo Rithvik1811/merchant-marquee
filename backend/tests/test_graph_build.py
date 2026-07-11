@@ -57,7 +57,11 @@ FOUR_GOOD_VARIANTS = [
         "framework": "PAS",
         "hook_type": "bold claim",
         "emotional_trigger": "FOMO",
-        "grounding_truth_ids": ["t3", "t5"],
+        # Feature-Spread fix (Single-Detail Fixation, video-gen-fidelity): cited
+        # truths must now span >= 2 distinct categories, so v2/v3/v4 each pair
+        # an imperfection/construction truth with the texture truth (t4) instead
+        # of two same-category truths.
+        "grounding_truth_ids": ["t3", "t4"],
         "beats": [{"t_start": 0, "t_end": 3, "line": "Stickers leave rings, not this base."},
                   {"t_start": 3, "t_end": 12, "line": "Ours won't."},
                   {"t_start": 12, "t_end": 15, "line": "Tap to shop."}],
@@ -68,7 +72,7 @@ FOUR_GOOD_VARIANTS = [
         "framework": "AIDA",
         "hook_type": "social proof",
         "emotional_trigger": "recognition",
-        "grounding_truth_ids": ["t6", "t2"],
+        "grounding_truth_ids": ["t6", "t4"],
         "beats": [{"t_start": 0, "t_end": 3, "line": "Every detail debossed, not printed."},
                   {"t_start": 3, "t_end": 12, "line": "Built to last."},
                   {"t_start": 12, "t_end": 15, "line": "Tap to shop."}],
@@ -79,7 +83,7 @@ FOUR_GOOD_VARIANTS = [
         "framework": "BAB",
         "hook_type": "before/after",
         "emotional_trigger": "relief",
-        "grounding_truth_ids": ["t1", "t3"],
+        "grounding_truth_ids": ["t1", "t2"],
         "beats": [{"t_start": 0, "t_end": 3, "line": "From scratch, not spotless -- until now."},
                   {"t_start": 3, "t_end": 12, "line": "Built for real life."},
                   {"t_start": 12, "t_end": 15, "line": "Tap to shop."}],

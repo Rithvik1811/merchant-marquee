@@ -24,6 +24,7 @@ from typing import Optional
 import pronouncing
 from openai import AsyncOpenAI
 
+from agents._affordance import human_use_suits_product
 from agents._retry import create_completion
 from graph.state import ProductCutState, ProductTruth, ScriptVariant
 
@@ -39,6 +40,39 @@ MAX_HOOK_WORDS = 10
 # guess without actually looking at the photos -- a real anti-genericness
 # lever, not just "cite 2 facts, any 2 facts." See module docstring.
 SPECIFIC_CATEGORIES = frozenset({"imperfection", "construction_detail"})
+
+# Single-Detail Fixation fix (video-gen-fidelity, 2026-07-11, owner-flagged
+# issue #1 in docs/BUILD_TASKS.md's Backstory-First section): the live
+# leather-bag run's winning script cited/discussed ONLY the debossed shield
+# logo across every beat, even though 7 truths spanning form_factor/texture/
+# color/scale_cue/construction/imperfection had been extracted. Root cause:
+# the grounding rule above only requires >= 2 truth_ids total plus one
+# SPECIFIC one -- it never required a SPREAD, so one vivid detail could
+# legally carry a whole script. Two new deterministic levers:
+#   1. cited grounding_truth_ids must span at least this many DISTINCT
+#      categories (enforced only when the extracted truths themselves span
+#      that many -- a degenerate all-one-category truth list degrades
+#      gracefully rather than making every variant unvalidatable);
+#   2. `_single_truth_fixation_problems` below flags a script whose beats
+#      overwhelmingly revolve around ONE truth with no other product truth
+#      mentioned anywhere.
+MIN_DISTINCT_TRUTH_CATEGORIES = 2
+
+# A variant is "fixated" when >= this many of its beats mention the same
+# single truth AND no beat mentions any other truth at all. 3 (not 2) so a
+# legitimate hook+payoff pair about one detail never false-positives -- only
+# a script that spends essentially its whole runtime on one micro-detail
+# trips this, which is exactly the observed live failure.
+FIXATION_MIN_BEAT_MENTIONS = 3
+
+# Human-Centric Bias fix (owner-flagged issue #2, same section): when the
+# product's own facts establish a human-use affordance (see
+# agents/_affordance.py), at least this many of the 4 variants must actually
+# commit to an implied person (deterministic proxy: a pronoun-thread beat,
+# reusing _first_pronoun_beat_index below). Product-conditional by explicit
+# owner requirement -- a product with no human-use affordance keeps the
+# original equal-weighting behavior untouched.
+MIN_HUMAN_PRESENCE_VARIANTS = 2
 
 # C1's frozen enum (graph.state.ScriptVariant.framework) -- exactly 4 values,
 # exactly 4 variants required, so "distinct framework per variant" reduces to
@@ -88,7 +122,25 @@ def _format_truths(truths: list[ProductTruth]) -> str:
     return "\n".join(f"- [{t['truth_id']}] ({t['category']}) {t['fact']}" for t in truths)
 
 
-def _build_system_prompt(target_length_sec: int) -> str:
+def _build_system_prompt(target_length_sec: int, human_use_suits: bool = False) -> str:
+    human_centric_block = (
+        f"""HUMAN-CENTRIC BIAS (this product's own facts name real human-contact parts --
+a strap, a handle, a body-scale form -- so it is one people wear, carry, or
+hold in daily life):
+- At least {MIN_HUMAN_PRESENCE_VARIANTS} of the 4 variants must commit to an
+  implied person -- a real backstory moment of someone's life WITH the
+  product (per the PRONOUN THREAD rule below), not just product surfaces
+  narrated at the camera. Human presence in a short-form ad's first second is
+  the single strongest scroll-stop lever there is; a wearable/carryable
+  product that never shows a person wearing or carrying it is leaving that
+  on the table.
+- Prefer the HUMAN MOMENT / IN-MEDIAS-RES hook path (HOOK STRENGTH (a)) for
+  those variants: open on the person mid-moment, product visible in-scene.
+- The remaining variants may stay product-led -- this is a bias, not a
+  uniform template; the best-written script still wins.
+"""
+        if human_use_suits else ""
+    )
     return f"""You are a creative director writing short-form ad video scripts ({target_length_sec}
 seconds) for e-commerce product ads.
 
@@ -120,6 +172,19 @@ Grounding (mandatory):
   never predict (a scuff mark, an odd cutout, a specific hinge mechanism).
   Do not build a variant only from generic material/color/dimension facts;
   those are true of many similar products and produce generic-sounding copy.
+
+FEATURE SPREAD (mandatory -- sell the WHOLE product, not one detail):
+- Each variant's cited truth_ids must span AT LEAST {MIN_DISTINCT_TRUTH_CATEGORIES}
+  DIFFERENT categories -- one idiosyncratic detail (imperfection /
+  construction_detail, per the rule above) PLUS at least one truth from a
+  different category (form_factor, texture, material, color, scale_cue).
+  The form_factor truth exists precisely for this: it describes the object
+  as a whole and grounds "what this thing IS" before any close-up detail.
+- Across a variant's beats, the script must talk about the PRODUCT, not
+  orbit one micro-detail. Never spend every beat on the same single feature
+  (e.g. an entire script about one logo) -- a viewer who watches the whole
+  ad should come away knowing 2-3 different things about this product, not
+  one thing said three ways.
 
 VOICE -- SPOKEN, NOT CATALOG (mandatory, every line of every variant):
 The product truths are deliberately written as clinical visual observations so
@@ -220,6 +285,7 @@ category truths, if cited at all, appear only AFTER a positive beat has
 already landed, framed as earned character, never as a defect -> close on
 exactly one CTA verb (the rule above -- unchanged).
 
+{human_centric_block}
 STORY / REAL-WORLD USE (a narrative/visual choice, distinct from the grounding
 rule above -- this framing choice needs no truth_id of its own, the same way a
 camera angle or pacing decision doesn't need one either):
@@ -605,6 +671,62 @@ def _rhyme_problems(beats: list[dict]) -> list[str]:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# SINGLE-TRUTH FIXATION check (Single-Detail Fixation fix -- see the
+# MIN_DISTINCT_TRUTH_CATEGORIES comment block near the top of this module).
+# Deterministic post-generation backstop in the same re-prompt-loop pattern as
+# _rhyme_problems/_flaw_led_hook_problem: a beat "mentions" a truth when it
+# shares at least one distinctive content word with that truth's fact text --
+# a deliberately crude bag-of-words proxy (NOT semantic matching), which errs
+# toward false negatives (a stray shared word with a second truth suppresses
+# the flag), the safe direction: a false positive would wrongly bounce a
+# legitimately-varied script into the re-prompt loop.
+# ---------------------------------------------------------------------------
+def _truth_mention_beats(beats: list[dict], truth_facts: dict[str, str]) -> dict[str, set[int]]:
+    """Map truth_id -> indices of beats sharing a distinctive content word
+    with that truth's fact text (len >= 4, non-stopword)."""
+    beat_words: list[set[str]] = [
+        {
+            w for w in _PLAIN_WORD_RE.findall(beat.get("line", "").lower())
+            if len(w) >= 4 and w not in _HUMAN_MOMENT_STOPWORDS
+        }
+        for beat in beats
+    ]
+    mentions: dict[str, set[int]] = {}
+    for tid, fact in truth_facts.items():
+        fact_words = {
+            w for w in _PLAIN_WORD_RE.findall(fact.lower())
+            if len(w) >= 4 and w not in _HUMAN_MOMENT_STOPWORDS
+        }
+        hit_beats = {i for i, bw in enumerate(beat_words) if bw & fact_words}
+        if hit_beats:
+            mentions[tid] = hit_beats
+    return mentions
+
+
+def _single_truth_fixation_problems(beats: list[dict], truth_facts: dict[str, str]) -> list[str]:
+    """Flag a script whose beats overwhelmingly revolve around ONE truth with
+    no other product truth mentioned anywhere -- the exact live failure this
+    fix targets (a whole leather-bag script about nothing but its logo).
+    Fires only when exactly one truth is mentioned at all AND it's mentioned
+    by >= FIXATION_MIN_BEAT_MENTIONS beats."""
+    if not truth_facts or len(truth_facts) < 2:
+        return []  # with 0-1 truths there is nothing else the script COULD mention
+    mentions = _truth_mention_beats(beats, truth_facts)
+    if len(mentions) != 1:
+        return []
+    (tid, hit_beats), = mentions.items()
+    if len(hit_beats) < FIXATION_MIN_BEAT_MENTIONS:
+        return []
+    return [
+        f"beats {sorted(hit_beats)} all revolve around truth {tid} and no other "
+        "product truth is mentioned anywhere in the script -- the whole script is "
+        "about one micro-detail; rework it so at least one other real product "
+        "truth (its overall form, material, texture, another detail) genuinely "
+        "features in the copy"
+    ]
+
+
 def _validate_variant(
     variant: dict,
     truth_categories: dict[str, str],
@@ -637,11 +759,29 @@ def _validate_variant(
     unknown = [t for t in gti if t not in truth_categories]
     if unknown:
         problems.append(f"grounding_truth_ids references unknown truth_id(s): {unknown}")
-    elif not any(truth_categories[t] in SPECIFIC_CATEGORIES for t in gti):
-        problems.append(
-            f"grounding_truth_ids {gti} are all generic categories "
-            f"(none is {SPECIFIC_CATEGORIES}) -- cite at least one idiosyncratic detail"
-        )
+    else:
+        if not any(truth_categories[t] in SPECIFIC_CATEGORIES for t in gti):
+            problems.append(
+                f"grounding_truth_ids {gti} are all generic categories "
+                f"(none is {SPECIFIC_CATEGORIES}) -- cite at least one idiosyncratic detail"
+            )
+        # FEATURE SPREAD (Single-Detail Fixation fix): cited truths must span
+        # multiple categories -- but only when the extracted truths themselves
+        # do; a degenerate all-one-category truth list degrades gracefully
+        # rather than making every variant structurally unvalidatable.
+        cited_categories = {truth_categories[t] for t in gti}
+        available_categories = set(truth_categories.values())
+        if (
+            gti
+            and len(cited_categories) < MIN_DISTINCT_TRUTH_CATEGORIES
+            and len(available_categories) >= MIN_DISTINCT_TRUTH_CATEGORIES
+        ):
+            problems.append(
+                f"grounding_truth_ids {gti} all share one category "
+                f"('{next(iter(cited_categories))}') -- cite truths from at least "
+                f"{MIN_DISTINCT_TRUTH_CATEGORIES} different categories so the script "
+                "sells the whole product, not one detail"
+            )
 
     beats = variant.get("beats") or []
     if not beats:
@@ -690,6 +830,8 @@ def _validate_variant(
 
         problems.extend(_reintroduction_problems(beats))
         problems.extend(_rhyme_problems(beats))
+        if truth_facts:
+            problems.extend(_single_truth_fixation_problems(beats, truth_facts))
 
     return problems
 
@@ -745,25 +887,53 @@ def _split_valid_invalid(
     return valid, invalid
 
 
-def _reprompt_message(invalid: list[tuple[dict, list[str]]], valid_count: int) -> str:
-    if not invalid:
-        return (
-            f"You returned only {valid_count} script variant(s), but exactly "
-            f"{REQUIRED_VARIANT_COUNT} are required. Return the full corrected "
-            f"JSON object with all {REQUIRED_VARIANT_COUNT} variants, still "
-            "distinct in framework/hook_type/emotional_trigger."
+def _human_presence_count(variants: list) -> int:
+    """How many variants commit to an implied person -- the deterministic
+    proxy (a pronoun-thread beat, reusing `_first_pronoun_beat_index`) behind
+    the HUMAN-CENTRIC BIAS rule's floor. Works on both raw variant dicts and
+    validated ScriptVariants (both carry `beats`)."""
+    return sum(
+        1 for v in variants
+        if _first_pronoun_beat_index(v.get("beats") or []) is not None
+    )
+
+
+def _reprompt_message(
+    invalid: list[tuple[dict, list[str]]],
+    valid_count: int,
+    human_shortfall: bool = False,
+) -> str:
+    parts: list[str] = []
+    if invalid:
+        lines = []
+        for v, problems in invalid:
+            vid = v.get("variant_id", "?")
+            for p in problems:
+                lines.append(f"- {vid}: {p}")
+        parts.append(
+            "The following problems were found in your response:\n" + "\n".join(lines)
         )
-    lines = []
-    for v, problems in invalid:
-        vid = v.get("variant_id", "?")
-        for p in problems:
-            lines.append(f"- {vid}: {p}")
-    return (
-        "The following problems were found in your response:\n"
-        + "\n".join(lines)
-        + "\n\nFix ONLY these specific issues and return the full corrected JSON "
+    elif valid_count < REQUIRED_VARIANT_COUNT:
+        parts.append(
+            f"You returned only {valid_count} script variant(s), but exactly "
+            f"{REQUIRED_VARIANT_COUNT} are required, still distinct in "
+            "framework/hook_type/emotional_trigger."
+        )
+    if human_shortfall:
+        parts.append(
+            f"Fewer than {MIN_HUMAN_PRESENCE_VARIANTS} of your variants commit to "
+            "an implied person, but this product's own facts name real "
+            "human-contact parts (see the HUMAN-CENTRIC BIAS rule): rewrite enough "
+            f"variants so at least {MIN_HUMAN_PRESENCE_VARIANTS} of the 4 open on "
+            "or carry a real moment of someone wearing/carrying/using the product "
+            "(one pronoun thread per variant, per the PRONOUN THREAD rule), while "
+            "keeping every other rule intact."
+        )
+    parts.append(
+        "Fix ONLY these specific issues and return the full corrected JSON "
         "object in the same shape, still with exactly 4 variants."
     )
+    return "\n\n".join(parts)
 
 
 async def generate_script_variants(
@@ -797,10 +967,11 @@ async def generate_script_variants(
         )
     truth_categories = {t["truth_id"]: t["category"] for t in product_truths}
     truth_facts = {t["truth_id"]: t["fact"] for t in product_truths}
+    human_bias = human_use_suits_product(product_truths)
 
     try:
         messages = [
-            {"role": "system", "content": _build_system_prompt(target_length_sec)},
+            {"role": "system", "content": _build_system_prompt(target_length_sec, human_bias)},
             {"role": "user", "content": _build_user_content(brief, product_truths, seller_direction)},
         ]
 
@@ -811,21 +982,43 @@ async def generate_script_variants(
 
         # Per spec: fewer than 4 variants is its own re-prompt trigger, even
         # when nothing else was individually wrong (the model just under-delivered).
-        needs_reprompt = len(valid) < REQUIRED_VARIANT_COUNT
+        # Human-Centric Bias fix: for a product whose facts establish a human-use
+        # affordance, too few person-committed variants is ALSO a re-prompt
+        # trigger (deterministic floor behind the HUMAN-CENTRIC BIAS prompt rule).
+        human_shortfall = (
+            human_bias and _human_presence_count(valid) < MIN_HUMAN_PRESENCE_VARIANTS
+        )
+        needs_reprompt = len(valid) < REQUIRED_VARIANT_COUNT or human_shortfall
         if needs_reprompt:
             logger.info(
-                "Concept Agent: %d/%d variants valid, re-prompting once (%d problems)",
-                len(valid), REQUIRED_VARIANT_COUNT, len(invalid),
+                "Concept Agent: %d/%d variants valid (human-presence shortfall: %s), "
+                "re-prompting once (%d problems)",
+                len(valid), REQUIRED_VARIANT_COUNT, human_shortfall, len(invalid),
             )
             messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": _reprompt_message(invalid, len(valid))})
+            messages.append({
+                "role": "user",
+                "content": _reprompt_message(invalid, len(valid), human_shortfall=human_shortfall),
+            })
             retry_text = await create_completion(client, model=model, messages=messages)
             retry_parsed = _parse_json_response(retry_text)
             retry_valid, _ = _split_valid_invalid(
                 retry_parsed.get("script_variants", []), truth_categories, target_length_sec, truth_facts
             )
-            if len(retry_valid) > len(valid):
+            retry_better = len(retry_valid) > len(valid) or (
+                human_shortfall
+                and len(retry_valid) >= len(valid)
+                and _human_presence_count(retry_valid) > _human_presence_count(valid)
+            )
+            if retry_better:
                 valid = retry_valid
+            if human_shortfall and _human_presence_count(valid) < MIN_HUMAN_PRESENCE_VARIANTS:
+                logger.warning(
+                    "Concept Agent: still only %d/%d person-committed variant(s) after "
+                    "re-prompt for a human-suited product -- proceeding degraded, the "
+                    "Hook-Checker's human-moment tiebreak is the remaining lever.",
+                    _human_presence_count(valid), MIN_HUMAN_PRESENCE_VARIANTS,
+                )
 
         if len(valid) < MIN_VARIANTS_AFTER_DEGRADE:
             logger.warning(

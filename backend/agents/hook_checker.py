@@ -30,6 +30,7 @@ from typing import Optional, TypedDict
 
 from openai import AsyncOpenAI
 
+from agents._affordance import human_use_suits_product
 from agents._retry import create_completion
 from graph.state import ProductCutState, ScriptVariant
 
@@ -44,8 +45,31 @@ class HookScore(TypedDict):
     justification: str
 
 
-def _build_system_prompt() -> str:
-    return f"""You are scoring the opening hook (first 2-3 seconds) of ad video scripts.
+def _build_system_prompt(human_use_bias: bool = False) -> str:
+    # Human-Centric Bias fix (video-gen-fidelity, 2026-07-11): a deliberate,
+    # PRODUCT-CONDITIONAL scoring edge for human-moment hooks, per the owner's
+    # reversal of the earlier "all three hook paths weigh equally" decision
+    # (docs/BUILD_TASKS.md, Backstory-First section, issue #2). Only rendered
+    # when the product's own facts establish a human-use affordance
+    # (agents/_affordance.py) -- a product nobody wears/carries/holds keeps
+    # the original equal-weighting calibration untouched. Deliberately a
+    # TIEBREAK, not a blanket bonus, so it can never outrank the flaw-led/
+    # sing-song SCORE DOWN rules or rescue a weak, vague human hook.
+    human_bias_block = (
+        f"""
+
+PRODUCT-SUITABILITY TIEBREAK (this specific product is one a person wears,
+carries, or holds in daily life -- its facts name real human-contact parts):
+when a HUMAN-MOMENT hook and a claim-led or curiosity-gap hook are otherwise
+comparable in specificity and craft, score the human-moment one ONE POINT
+higher (capped at {MAX_SCORE}). Human presence in the first second is the
+single strongest retention lever on short-form feeds. This tiebreak NEVER
+overrides the SCORE DOWN rules below -- a flaw-led or sing-song hook still
+caps at 2 even with a person in it -- and a vague, unspecific human hook
+("someone loves this bag") still scores low on its own (lack of) merits."""
+        if human_use_bias else ""
+    )
+    return f"""You are scoring the opening hook (first 2-3 seconds) of ad video scripts.{human_bias_block}
 
 You will receive several script variants, each with its full text and stated hook_type.
 
@@ -152,7 +176,10 @@ def _reprompt_message(problems: list[str]) -> str:
 
 
 async def score_hooks(
-    script_variants: list[ScriptVariant], client: Optional[AsyncOpenAI] = None
+    script_variants: list[ScriptVariant],
+    client: Optional[AsyncOpenAI] = None,
+    *,
+    human_use_bias: bool = False,
 ) -> dict[str, HookScore]:
     """Run the Hook-Checker: one Qwen call scoring all variants, one bounded re-prompt.
 
@@ -160,6 +187,11 @@ async def score_hooks(
     any variant still unscored after the retry, rather than blocking the
     Critic Chain -- same bounded-retry-then-safe-fallback shape as every other
     loop in this pipeline.
+
+    `human_use_bias` renders the product-conditional human-moment scoring
+    tiebreak into the rubric (see _build_system_prompt) -- the node wrapper
+    derives it from the job's own product truths; default False keeps the
+    original calibration for products with no human-use affordance.
     """
     if not script_variants:
         return {}
@@ -176,7 +208,7 @@ async def score_hooks(
 
     try:
         messages = [
-            {"role": "system", "content": _build_system_prompt()},
+            {"role": "system", "content": _build_system_prompt(human_use_bias)},
             {"role": "user", "content": _build_user_content(script_variants)},
         ]
 
@@ -218,6 +250,12 @@ async def score_hooks(
 
 
 async def hook_checker_node(state: ProductCutState) -> dict:
-    """LangGraph node wrapper: scores each variant's hook. Runs in parallel with the other 4 checkers (see graph/build.py's fan-out from concept_agent)."""
-    scores = await score_hooks(state["script_variants"])
+    """LangGraph node wrapper: scores each variant's hook. Runs in parallel with
+    the other 4 checkers (see graph/build.py's fan-out from concept_agent).
+    Derives the product-conditional human-moment tiebreak from the job's own
+    product truths (Human-Centric Bias fix)."""
+    scores = await score_hooks(
+        state["script_variants"],
+        human_use_bias=human_use_suits_product(state.get("product_truths", [])),
+    )
     return {"hook_scores": scores}

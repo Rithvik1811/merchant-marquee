@@ -13,12 +13,15 @@ import pytest
 
 from agents.concept_agent import (
     FRAMEWORKS,
+    MIN_HUMAN_PRESENCE_VARIANTS,
     MIN_VARIANTS_AFTER_DEGRADE,
     REQUIRED_VARIANT_COUNT,
     _build_system_prompt,
     _flaw_led_hook_problem,
     _has_human_moment_marker,
+    _human_presence_count,
     _rhyme_problems,
+    _single_truth_fixation_problems,
     _validate_variant,
     generate_script_variants,
 )
@@ -30,6 +33,9 @@ TRUTHS = [
     {"truth_id": "t2", "fact": "dual cylindrical hinge with knurled end caps", "category": "construction_detail", "source": "photo_1"},
     {"truth_id": "t3", "fact": "faint scuff on the base plate's right cutout", "category": "imperfection", "source": "photo_1"},
     {"truth_id": "t4", "fact": "deep navy blue colorway", "category": "color", "source": "photo_1"},
+    # Second construction_detail truth so the FEATURE SPREAD (category-spread)
+    # check has a same-category pair to be tested against.
+    {"truth_id": "t5", "fact": "reinforced corner rivet with a hex head", "category": "construction_detail", "source": "photo_1"},
 ]
 
 
@@ -449,3 +455,219 @@ def test_flaw_led_hook_backstop_does_not_flag_an_ordinary_claim_hook():
     )
 
     assert problem is None
+
+
+# ---------------------------------------------------------------------------
+# Single-Detail Fixation fix (video-gen-fidelity, 2026-07-11, owner-flagged
+# issue #1): FEATURE SPREAD category check + single-truth fixation backstop.
+# ---------------------------------------------------------------------------
+
+
+def test_same_category_grounding_ids_are_flagged_for_missing_spread():
+    # t2 and t5 are BOTH construction_detail -- satisfies the count bar AND the
+    # "at least one specific" bar, but spans only ONE category.
+    v = _variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity", gti=("t2", "t5"))
+
+    problems = _validate_variant(v, _TRUTH_CATEGORIES, 15, _TRUTH_FACTS)
+
+    assert any("all share one category" in p for p in problems), (
+        f"expected a category-spread violation, got: {problems}"
+    )
+
+
+def test_cross_category_grounding_ids_pass_the_spread_check():
+    v = _variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity", gti=("t1", "t2"))
+
+    problems = _validate_variant(v, _TRUTH_CATEGORIES, 15, _TRUTH_FACTS)
+
+    assert not any("all share one category" in p for p in problems)
+
+
+def test_spread_check_degrades_when_all_available_truths_share_one_category():
+    # A degenerate truth list where EVERY extracted truth is the same category
+    # must not make every variant unvalidatable -- the spread check only fires
+    # when the truths themselves could support a spread.
+    single_cat = {"t2": "construction_detail", "t5": "construction_detail"}
+    facts = {"t2": _TRUTH_FACTS["t2"], "t5": _TRUTH_FACTS["t5"]}
+    v = _variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity", gti=("t2", "t5"))
+
+    problems = _validate_variant(v, single_cat, 15, facts)
+
+    assert not any("all share one category" in p for p in problems), (
+        f"spread check must degrade gracefully with a single-category truth list, got: {problems}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_category_spread_violation_triggers_reprompt_through_full_flow():
+    fixated = _variant("v4", "BAB", "how-to", "relief", gti=("t2", "t5"))
+    first = _payload(FOUR_GOOD_VARIANTS[:3] + [fixated])
+    fixed = _variant("v4", "BAB", "how-to", "relief", gti=("t1", "t2"))
+    retry = _payload(FOUR_GOOD_VARIANTS[:3] + [fixed])
+    client = FakeOpenAIClient([first, retry])
+
+    result = await generate_script_variants("a brief", TRUTHS, client=client)
+
+    assert client.call_count == 2, "same-category grounding must trigger a re-prompt"
+    assert len(result) == REQUIRED_VARIANT_COUNT
+
+
+def test_single_truth_fixation_is_flagged_on_a_one_detail_script():
+    # The exact live failure shape: a whole script orbiting one debossed-shield
+    # truth, three beats mentioning it, no other truth mentioned anywhere.
+    beats = [
+        {"line": "Look at this shield, a hidden detail."},
+        {"line": "Pressed deep into the hide, that shield stays."},
+        {"line": "The debossed mark proves how hard they pressed it."},
+        {"line": "Buy it today."},
+    ]
+    truth_facts = {
+        "t1": "debossed shield logo pressed into the pebbled hide",
+        "t2": "twin padded straps with brass hardware",
+    }
+
+    problems = _single_truth_fixation_problems(beats, truth_facts)
+
+    assert len(problems) == 1
+    assert "revolve around truth t1" in problems[0]
+
+
+def test_single_truth_fixation_not_flagged_when_a_second_truth_features():
+    beats = [
+        {"line": "Look at this shield, a hidden detail."},
+        {"line": "Pressed deep into the hide, that shield stays."},
+        {"line": "And the padded straps carry the weight."},
+        {"line": "Buy it today."},
+    ]
+    truth_facts = {
+        "t1": "debossed shield logo pressed into the pebbled hide",
+        "t2": "twin padded straps with brass hardware",
+    }
+
+    assert _single_truth_fixation_problems(beats, truth_facts) == []
+
+
+def test_single_truth_fixation_not_flagged_below_the_beat_threshold():
+    # A legitimate hook+payoff pair about one detail (2 beats) must never trip.
+    beats = [
+        {"line": "Look at this shield, a hidden detail."},
+        {"line": "Pressed deep into the hide, that shield stays."},
+        {"line": "Grab it now."},
+    ]
+    truth_facts = {
+        "t1": "debossed shield logo pressed into the pebbled hide",
+        "t2": "twin padded straps with brass hardware",
+    }
+
+    assert _single_truth_fixation_problems(beats, truth_facts) == []
+
+
+def test_single_truth_fixation_skipped_with_fewer_than_two_truths():
+    beats = [
+        {"line": "Look at this shield, a hidden detail."},
+        {"line": "Pressed deep into the hide, that shield stays."},
+        {"line": "The debossed mark proves how hard they pressed it."},
+    ]
+    assert _single_truth_fixation_problems(
+        beats, {"t1": "debossed shield logo pressed into the pebbled hide"}
+    ) == []
+
+
+def test_feature_spread_block_present_in_system_prompt():
+    prompt = _build_system_prompt(15)
+
+    assert "FEATURE SPREAD" in prompt
+    assert "sell the WHOLE product" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Human-Centric Bias fix (owner-flagged issue #2): product-conditional
+# human-centric prompt block + deterministic person-committed-variant floor.
+# ---------------------------------------------------------------------------
+
+# A product whose facts establish a real human-use affordance ("strap").
+BAG_TRUTHS = [
+    {"truth_id": "t1", "fact": "pebbled russet-brown leather front panel", "category": "material", "source": "photo_1"},
+    {"truth_id": "t2", "fact": "adjustable shoulder strap with a stitched pad", "category": "construction_detail", "source": "photo_2"},
+    {"truth_id": "t3", "fact": "pale compression halo around the debossed mark", "category": "imperfection", "source": "photo_1"},
+]
+
+
+def _bag_variant(variant_id: str, framework: str, hook_type: str, trigger: str, human: bool = False) -> dict:
+    v = _variant(variant_id, framework, hook_type, trigger, gti=("t1", "t3"))
+    if human:
+        v["beats"][1]["line"] = "She grips it tight on her walk to work."
+    return v
+
+
+def test_human_centric_block_rendered_only_when_product_suits_it():
+    with_bias = _build_system_prompt(15, human_use_suits=True)
+    without_bias = _build_system_prompt(15, human_use_suits=False)
+
+    assert "HUMAN-CENTRIC BIAS" in with_bias
+    assert str(MIN_HUMAN_PRESENCE_VARIANTS) in with_bias
+    assert "HUMAN-CENTRIC BIAS" not in without_bias
+
+
+def test_human_presence_count_uses_pronoun_thread():
+    humans = [_bag_variant("v1", "PAS", "bold claim", "FOMO", human=True)]
+    no_humans = [_bag_variant("v2", "AIDA", "social proof", "recognition")]
+
+    assert _human_presence_count(humans) == 1
+    assert _human_presence_count(no_humans) == 0
+
+
+@pytest.mark.asyncio
+async def test_human_shortfall_triggers_reprompt_for_human_suited_product():
+    no_human_variants = [
+        _bag_variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity"),
+        _bag_variant("v2", "PAS", "bold claim", "FOMO"),
+        _bag_variant("v3", "AIDA", "social proof", "recognition"),
+        _bag_variant("v4", "BAB", "how-to", "relief"),
+    ]
+    human_variants = [
+        _bag_variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity", human=True),
+        _bag_variant("v2", "PAS", "bold claim", "FOMO", human=True),
+        _bag_variant("v3", "AIDA", "social proof", "recognition"),
+        _bag_variant("v4", "BAB", "how-to", "relief"),
+    ]
+    client = FakeOpenAIClient([_payload(no_human_variants), _payload(human_variants)])
+
+    result = await generate_script_variants("a brief", BAG_TRUTHS, client=client)
+
+    assert client.call_count == 2, (
+        "4 valid variants but zero person-committed ones must still re-prompt "
+        "when the product suits human use"
+    )
+    assert len(result) == REQUIRED_VARIANT_COUNT
+    assert _human_presence_count(result) >= MIN_HUMAN_PRESENCE_VARIANTS
+
+
+@pytest.mark.asyncio
+async def test_no_human_reprompt_for_product_without_affordance():
+    # Same zero-person variants, but TRUTHS (no strap/handle/scale facts) --
+    # the product-conditional gate must keep the original single-call behavior.
+    client = FakeOpenAIClient([_payload(FOUR_GOOD_VARIANTS)])
+
+    result = await generate_script_variants("a brief", TRUTHS, client=client)
+
+    assert client.call_count == 1
+    assert len(result) == REQUIRED_VARIANT_COUNT
+
+
+@pytest.mark.asyncio
+async def test_human_shortfall_degrades_when_retry_still_has_no_people(caplog):
+    no_human_variants = [
+        _bag_variant("v1", "hook_problem_product_cta", "pattern interrupt", "curiosity"),
+        _bag_variant("v2", "PAS", "bold claim", "FOMO"),
+        _bag_variant("v3", "AIDA", "social proof", "recognition"),
+        _bag_variant("v4", "BAB", "how-to", "relief"),
+    ]
+    client = FakeOpenAIClient([_payload(no_human_variants), _payload(no_human_variants)])
+
+    with caplog.at_level("WARNING"):
+        result = await generate_script_variants("a brief", BAG_TRUTHS, client=client)
+
+    assert client.call_count == 2
+    assert len(result) == REQUIRED_VARIANT_COUNT, "must proceed degraded, never block"
+    assert any("person-committed" in r.message for r in caplog.records)

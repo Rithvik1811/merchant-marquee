@@ -81,6 +81,7 @@ from typing import Callable, Optional, get_args
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
+from agents._affordance import human_use_suits_product
 from agents._retry import create_completion
 from agents.justification_validator import (
     validate_justifications as _kr_validate_justifications,
@@ -124,6 +125,18 @@ DEFAULT_SHOT_DURATION_SEC = 4.0
 # that matches a category-generic phrase, is rejected even if it is technically
 # verbatim -- those are the "plausible-sounding but says nothing specific" quotes.
 MIN_QUOTE_WORDS = 4
+
+# Single-Detail Fixation fix (video-gen-fidelity, 2026-07-11, owner-flagged
+# issue #1 in docs/BUILD_TASKS.md's Backstory-First section): the live
+# leather-bag run's 3-shot list cited the SAME truth (the debossed shield
+# logo) for every single shot, cascading the script's own fixation into the
+# visuals. Deterministic list-level floor: across the whole shot list, at
+# least this many DISTINCT truth_fact_ids must be cited (enforced via the
+# existing bounded Call-A re-prompt; degrades with a logged warning, never
+# blocks -- and is skipped entirely when the job has fewer distinct truths
+# than the floor, or fewer than 2 shots).
+MIN_DISTINCT_TRUTHS_ACROSS_SHOTS = 2
+
 _GENERIC_QUOTE_STOPLIST = frozenset(
     {
         "show the product clearly",
@@ -362,7 +375,7 @@ camera_move affordance rubric — a move is MOTIVATED only when the cited fact n
 - pan         -> lateral geometry worth traversing.
 NEVER compound/stacked moves — stacked camera moves visibly break current text-to-video models. static/push_in are safest (may run full length); orbit is highest-risk (keep short).
 
-human-contact affordance rubric — a HUMAN-INTERACTION shot_type (product_in_hand / worn_in_use) is MOTIVATED only when a cited fact names a part whose function is human contact — a handle, strap, grip, rim, spout, clasp, zipper pull, button, drawstring, band, trigger, or an equivalent named part — or a scale_cue/form_factor fact establishing the object is hand- or body-scale. When such a fact exists, the shot's contact point MUST be that fact's text, verbatim — same grounding discipline as every other shot. Reject "it's this kind of product, show someone using it" with no such fact cited. When at least one such fact exists among the product's truths, the shot list SHOULD include at least one human-interaction beat (default ON, not forced when nothing supports it)."""
+human-contact affordance rubric — a HUMAN-INTERACTION shot_type (product_in_hand / worn_in_use) is MOTIVATED only when a cited fact names a part whose function is human contact — a handle, strap, grip, rim, spout, clasp, zipper pull, button, drawstring, band, trigger, or an equivalent named part — or a scale_cue/form_factor fact establishing the object is hand- or body-scale. When such a fact exists, the shot's contact point MUST be that fact's text, verbatim — same grounding discipline as every other shot. Reject "it's this kind of product, show someone using it" with no such fact cited. When at least one such fact exists among the product's truths, the shot list MUST include at least one human-interaction beat — people buy the moment of use, not the object; a wearable/carryable product shown only as still-life surfaces is a demo reel, not an ad. Omit human-interaction shots ONLY when no such fact exists."""
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +521,14 @@ Every shot must cite a real quote, a real truth id, and a real treatment beat
 index -- these are how the shot is grounded in the actual product and script, not
 in a template. Never justify a shot by the KIND of product it is.
 
+TRUTH DIVERSITY (mandatory): across the WHOLE shot list, cite at least
+{MIN_DISTINCT_TRUTHS_ACROSS_SHOTS} DIFFERENT truth_fact_id values -- prefer 3
+when the truth table offers them. A shot list where every shot cites the same
+single truth is a demo reel of one feature, not an ad for the product: the
+shots must collectively show the product's different real aspects (its overall
+form, its material/texture, its specific details), not the same detail from
+three angles.
+
 Return ONLY valid JSON in this exact shape, no preamble or commentary:
 
 {{
@@ -575,6 +596,44 @@ def _build_call_a_reprompt(
         + ", ".join(str(bt["beat_index"]) for bt in treatment.get("beat_treatments", []))
         + "\n\nReturn the full corrected JSON with all shots in the same shape."
     )
+
+
+def _truth_diversity_failures(
+    justifications: list[dict], product_truths: list[ProductTruth]
+) -> list[dict]:
+    """List-level TRUTH DIVERSITY floor (Single-Detail Fixation fix -- see
+    MIN_DISTINCT_TRUTHS_ACROSS_SHOTS's comment). Returns validator-shaped
+    failure dicts ({shot_id, passed, violation}) for every shot AFTER the
+    first when the whole list cites a single truth_fact_id, so the existing
+    Call-A re-prompt machinery can name the exact shots to fix (the first
+    shot keeps its citation -- only the duplicates are asked to move).
+    Empty when the list is already diverse, has < 2 shots, or the job's
+    truths can't support diversity in the first place.
+    """
+    if len(justifications) < 2:
+        return []
+    available = {t["truth_id"] for t in product_truths}
+    if len(available) < MIN_DISTINCT_TRUTHS_ACROSS_SHOTS:
+        return []
+    cited = {str(j.get("truth_fact_id", "")) for j in justifications}
+    if len(cited) >= MIN_DISTINCT_TRUTHS_ACROSS_SHOTS:
+        return []
+    dup = next(iter(cited))
+    alternatives = sorted(available - cited)
+    return [
+        {
+            "shot_id": str(j.get("shot_id", "?")),
+            "passed": False,
+            "violation": (
+                f"every shot in the list cites the same truth_fact_id '{dup}' -- "
+                "the shot list must show the product's different aspects, not one "
+                f"detail from several angles; re-justify this shot on a DIFFERENT "
+                f"truth (e.g. {', '.join(alternatives[:3])}) with a matching "
+                "script_quote"
+            ),
+        }
+        for j in justifications[1:]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1004,28 +1063,50 @@ async def generate_shot_list(
 
         results = validate_justifications(justifications, winning_script, product_truths, treatment)
         failures = [r for r in results if not r.get("passed")]
+        # TRUTH DIVERSITY floor (Single-Detail Fixation fix): a list where every
+        # shot cites one truth re-prompts through the same bounded loop, with
+        # the duplicated shots named individually so the fix is surgical.
+        diversity_failures = _truth_diversity_failures(justifications, product_truths)
 
         # --- One bounded Call A re-prompt on any failure ---------------------
-        if failures:
-            logger.info("Shot-List Agent: %d/%d justifications failed, re-prompting Call A once.",
-                        len(failures), len(justifications))
+        if failures or diversity_failures:
+            logger.info(
+                "Shot-List Agent: %d/%d justifications failed (+%d truth-diversity "
+                "flags), re-prompting Call A once.",
+                len(failures), len(justifications), len(diversity_failures),
+            )
             messages.append({"role": "assistant", "content": raw_a})
             messages.append({
                 "role": "user",
-                "content": _build_call_a_reprompt(failures, winning_script, product_truths, treatment),
+                "content": _build_call_a_reprompt(
+                    failures + diversity_failures, winning_script, product_truths, treatment
+                ),
             })
             raw_a2 = await create_completion(client, model=model, messages=messages, temperature=CALL_A_TEMPERATURE)
             retry_justifications = _parse_json_response(raw_a2).get("shots", [])[:MAX_SHOTS]
-            retry_by_id = {str(r.get("shot_id")): r for r in retry_justifications}
+            # Only accept retry entries that are actually justification-shaped:
+            # KR's validator is deliberately field-presence-driven (a dict with
+            # NO script_quote/truth_fact_id keys passes vacuously), so merging a
+            # malformed retry entry in would let it slip through re-validation
+            # and crash Call B assembly downstream instead of falling back.
+            retry_by_id = {
+                str(r.get("shot_id")): r
+                for r in retry_justifications
+                if "script_quote" in r and "truth_fact_id" in r
+            }
 
             # Merge by shot_id rather than replacing the whole list: a re-prompt
             # reply may legitimately contain only the corrected shot(s) ("here is
             # the fixed shot"), not the full set. Every already-valid shot is kept
-            # untouched; only originally-failing shot_ids are swapped for the
-            # retry's entry (when the model actually returned one) -- wholesale
-            # replacement would silently drop shots that already passed.
+            # untouched; only originally-failing (or diversity-flagged) shot_ids
+            # are swapped for the retry's entry (when the model actually returned
+            # one) -- wholesale replacement would silently drop shots that
+            # already passed.
+            diversity_flagged_ids = {f["shot_id"] for f in diversity_failures}
             justifications = [
-                j if r.get("passed") else retry_by_id.get(str(j.get("shot_id")), j)
+                retry_by_id.get(str(j.get("shot_id")), j)
+                if (not r.get("passed") or str(j.get("shot_id")) in diversity_flagged_ids)
+                else j
                 for j, r in zip(justifications, results)
             ]
             results = validate_justifications(justifications, winning_script, product_truths, treatment)
@@ -1042,6 +1123,13 @@ async def generate_shot_list(
                     repaired.append(_fallback_justification(j, treatment, i))
             justifications = repaired
 
+            if _truth_diversity_failures(justifications, product_truths):
+                logger.warning(
+                    "Shot-List Agent: shot list still cites a single truth_fact_id "
+                    "after the re-prompt -- proceeding degraded (bounded loop, "
+                    "never blocks), the fixated list ships rather than nothing."
+                )
+
         if not justifications:
             logger.warning("Shot-List Agent: Call A produced no shots; returning empty shot list.")
             return []
@@ -1053,6 +1141,7 @@ async def generate_shot_list(
         shots = await _run_call_b(
             client, model, justifications, truths_by_id, treatment,
             target_duration_sec, hook_implies_person,
+            human_affordance=human_use_suits_product(product_truths),
         )
         return shots
     finally:
@@ -1068,9 +1157,17 @@ async def _run_call_b(
     treatment: Treatment,
     target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC,
     hook_implies_person: bool = False,
+    human_affordance: bool = False,
 ) -> list[Shot]:
     """Call B + assembly + structural validation, with one bounded Call B retry
-    if the assembled list fails structural validation (§5.6 repair posture)."""
+    if the assembled list fails structural validation (§5.6 repair posture) OR
+    -- Human-Centric Bias fix -- if a product whose truths establish a
+    human-use affordance came back with ZERO human-interaction shots (the
+    affordance rubric's own "MUST include at least one" rule, enforced
+    deterministically rather than trusted to the prompt alone; the live
+    leather-bag run produced zero human shots despite strap facts). Both
+    triggers share the same single bounded retry; a second miss degrades with
+    a logged warning rather than blocking."""
     _, hero_max = _scaled_hero_window(target_duration_sec)
     messages = [
         {
@@ -1093,7 +1190,6 @@ async def _run_call_b(
         )
         try:
             validate_shot_list(assembled)
-            return assembled  # type: ignore[return-value]
         except ValidationError as exc:
             if attempt == 0:
                 logger.warning("Shot-List Agent: Call B output failed structural validation, retrying once: %s", exc)
@@ -1106,12 +1202,44 @@ async def _run_call_b(
                         "listed enum values and never include a product_category field."
                     ),
                 })
-            else:
-                # Should not happen given the enum-snapping in assembly; surfacing
-                # rather than emitting a structurally-invalid shot list into typed
-                # state that every downstream node trusts.
-                logger.error("Shot-List Agent: Call B still structurally invalid after retry: %s", exc)
-                raise
+                continue
+            # Should not happen given the enum-snapping in assembly; surfacing
+            # rather than emitting a structurally-invalid shot list into typed
+            # state that every downstream node trusts.
+            logger.error("Shot-List Agent: Call B still structurally invalid after retry: %s", exc)
+            raise
+
+        has_human_shot = any(
+            s.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES for s in assembled
+        )
+        if human_affordance and not has_human_shot:
+            if attempt == 0:
+                logger.info(
+                    "Shot-List Agent: product truths establish a human-use affordance "
+                    "but Call B returned zero human-interaction shots -- re-prompting "
+                    "Call B once (human-contact affordance rubric)."
+                )
+                messages.append({"role": "assistant", "content": raw_b})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your shot list contains ZERO human-interaction shots, but this "
+                        "product's own truths name real human-contact parts -- per the "
+                        "human-contact affordance rubric, the shot list MUST include at "
+                        "least one. Change exactly one demo/proof shot's shot_type to "
+                        "product_in_hand or worn_in_use, grounding its contact point in "
+                        "the human-contact fact per the rubric (never the opening hook "
+                        "shot, never the CTA shot). Return the full corrected JSON in "
+                        "the same shape with all shots."
+                    ),
+                })
+                continue
+            logger.warning(
+                "Shot-List Agent: still zero human-interaction shots after the "
+                "re-prompt for a human-suited product -- proceeding degraded, "
+                "not blocking."
+            )
+        return assembled  # type: ignore[return-value]
     return assembled  # type: ignore[return-value]  # unreachable; loop returns or raises
 
 
