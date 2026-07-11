@@ -61,6 +61,14 @@ def test_product_in_hand_shot_type_is_valid():
     assert shot.shot_type == "product_in_hand"
 
 
+def test_worn_in_use_shot_type_is_valid():
+    """C3 v4 addition (video-gen-fidelity branch): the wider, person-in-motion
+    human-interaction composition, distinct from the static/close
+    product_in_hand composition."""
+    shot = validate_shot(_shot(shot_type="worn_in_use"))
+    assert shot.shot_type == "worn_in_use"
+
+
 def test_unknown_camera_move_is_rejected():
     with pytest.raises(ValidationError):
         validate_shot(_shot(camera_move="dolly_zoom"))

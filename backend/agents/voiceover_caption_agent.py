@@ -53,25 +53,36 @@ as soon as the winning script is finalized... because voiceover depends only
 on the script, not on the rendered video"). This module's entry point,
 `voiceover_caption_agent_node`, reads ONLY `state["winning_script"]` +
 `state["job_id"]` -- it never reads `treatment`, `shot_list`, `budget_ledger`,
-or `generated_shots`, and writes only `state["voiceover"]` + `reasoning_trace`.
+or `generated_shots`, and writes only `state["voiceover"]` +
+`voiceover_reasoning_trace` (its OWN dedicated trace key, not the shared
+`reasoning_trace` every other node writes -- see graph/state.py's v7 changelog:
+this node now genuinely runs in the same superstep as treatment_agent, and two
+nodes read-modify-writing one plain-string channel raises LangGraph's
+InvalidUpdateError; a single-writer key sidesteps that without touching the
+other dozen agent modules' already-established read-modify-write contract).
 Nothing here depends on, blocks, or is blocked by Video-Gen/Ken-Burns/Continuity.
 
 HOW THIS COMPOSES WITH THE REST OF THE GRAPH (checked graph/build.py and
 agents/merge_validator.py's `route_after_merge_validation` before deciding --
 not a guess): `winning_script` is written by `merge_validator_node` on EITHER
-a "finalize" or a "fallback" verdict (graph/build.py's own docstring), and
-`route_after_merge_validation` currently returns a bare `str` routing key,
-mapped 1:1 to a single next node ("finalize"/"fallback" -> "treatment_agent").
-This is NOT a `Send()` fan-out (that pattern, used internally by
-video_gen_node.py, is for fanning one shot list out to N parallel per-shot
-branches within a single node -- a different problem). The correct mechanism
-for a SECOND node to run in parallel off the SAME conditional edge is
-LangGraph's documented support for a conditional-edge path function returning
-a *list* of routing keys, not just one (confirmed by reading the installed
-`langgraph.graph.state.StateGraph.add_conditional_edges`'s own type signature:
-`path: Callable[..., Hashable | Sequence[Hashable]]`). So wiring this node in,
-when that follow-up integration commit happens, means:
-  1. `route_after_merge_validation`'s "finalize"/"fallback" branches return
+a "finalize" or a "fallback" verdict (graph/build.py's own docstring). This is
+NOT a `Send()` fan-out (that pattern, used internally by video_gen_node.py, is
+for fanning one shot list out to N parallel per-shot branches within a single
+node -- a different problem). The mechanism used for a SECOND node to run in
+parallel off the SAME conditional edge is LangGraph's documented support for a
+conditional-edge path function returning a *list* of routing keys, not just one
+(confirmed by reading the installed `langgraph.graph.state.StateGraph.add_conditional_edges`'s
+own type signature: `path: Callable[..., Hashable | Sequence[Hashable]]`).
+
+WIRED INTO graph/build.py (follow-up integration commit, matching this
+codebase's established rhythm -- see video_gen_node.py's own precedent). What
+actually landed, exactly as planned below except item 1 (kept
+`route_after_merge_validation` itself untouched -- it's independently
+unit-tested in test_merge_validator.py and called internally by
+`merge_validator_node`; graph/build.py instead wraps it in a small
+`_route_after_merge_validation_with_vo` path function used only by the
+conditional edge):
+  1. The conditional-edge path function's "finalize"/"fallback" branches return
      `["treatment_agent", "voiceover_caption_agent"]` instead of a bare string
      (its "copy_editor"/"meta_critic" retry-loop branches are unaffected --
      winning_script isn't final yet on those paths, so VOX must not fire).
@@ -84,22 +95,18 @@ when that follow-up integration commit happens, means:
      is a leaf for now, exactly like Continuity's "end" branch before Phase 4
      added a consumer downstream of it.
 
-NOT WIRED INTO graph/build.py IN THIS PASS -- deliberately, matching this
-codebase's own established rhythm (confirmed via `git log --oneline -- backend/graph/build.py`
-and `git show --stat` on the Phase 3 commits, not assumed): agents/video_gen_node.py
-(Phase 3, KR) was merged standalone in its own commit with an EXPLICIT note --
-"Not wired into graph/build.py yet -- deliberate, matching how each Phase 2
-agent was merged standalone before its own later integration commit" -- even
-though its upstream (`budget_gate`) was already fully wired to END at the time,
-exactly the same situation this module is in now (everything from
-`merge_validator` through `continuity_gate` is already wired). RR then wired
-Video-Gen (+ Ken-Burns, built alongside it) into graph/build.py as a separate
-follow-up commit that also updated tests/test_graph_end_to_end.py. This module
-follows that same precedent: built + tested standalone here; the follow-up
-integration commit (list-fan-out change above, §5.11 (2)) is a separate task,
-matching the instruction to build+test standalone first this pass. Because
-nothing changes in graph/build.py, tests/test_graph_end_to_end.py is
-untouched by this task.
+WAS NOT WIRED INTO graph/build.py FOR ONE PASS -- deliberately, matching this
+codebase's own established rhythm (agents/video_gen_node.py, Phase 3, was
+merged standalone before its own later integration commit; RR then wired it +
+Ken-Burns in as a separate follow-up). This module followed the same
+precedent: built + tested standalone first, then wired in as a separate
+follow-up commit (the "WIRED INTO graph/build.py" section above) that also
+updated tests/test_graph_build.py, tests/test_graph_end_to_end.py,
+tests/test_graph_critic_chain.py, tests/test_graph_merge_validator.py,
+tests/test_continuity_loop_e2e.py, tests/test_phase4_integration_edge_cases.py,
+and tests/test_pipeline_integration_edge_cases.py (every test driving the
+compiled graph through merge_validator now fakes this node's TTS/OSS boundary
+too, via tests/_phase3_graph.py's new `patch_voiceover_boundaries`).
 
 REQUIREMENT 1 -- PER-BEAT vs. WHOLE-SCRIPT TTS, tradeoff and decision. Chosen:
 PER-BEAT (one `SpeechSynthesizer.call` per `ScriptBeat.line`), not one call for
@@ -703,7 +710,12 @@ async def voiceover_caption_agent_node(
 
     return {
         "voiceover": voiceover,
-        "reasoning_trace": state.get("reasoning_trace", "") + trace_note,
+        # Dedicated key, NOT the shared `reasoning_trace` -- this node runs as a
+        # genuine parallel branch alongside treatment_agent (graph/build.py), and
+        # two nodes read-modify-writing the same plain-string channel in the same
+        # superstep raises LangGraph's InvalidUpdateError. See graph/state.py's
+        # v7 changelog note for the full reasoning.
+        "voiceover_reasoning_trace": state.get("voiceover_reasoning_trace", "") + trace_note,
     }
 
 

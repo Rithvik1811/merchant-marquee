@@ -24,15 +24,19 @@ from langchain_core.runnables import RunnableLambda
 from agents.budget_gate import (
     DEFAULT_JOB_BUDGET_CAP,
     FLOOR_COST,
+    HUMAN_INTERACTION_SHOT_TYPES,
+    RATE_720P,
     RATE_1080P,
     W_ROLE,
     W_TYPE,
     _argmin,
+    _choose_drop_index,
+    _shot_floor_cost,
     _shot_weight,
     allocate_budget,
     budget_gate_node,
 )
-from agents.shot_list_agent import MIN_SHOTS
+from agents.shot_list_agent import HERO_SHOT_MIN_DURATION_SEC, MIN_SHOTS, is_hero_shot
 
 _EPS = 1e-6
 
@@ -458,3 +462,248 @@ async def test_node_empty_budget_ledger_dict_falls_back_to_default():
     }
     out = await RunnableLambda(budget_gate_node).ainvoke(state)
     assert out["budget_ledger"]["cap"] == DEFAULT_JOB_BUDGET_CAP
+
+
+# ===========================================================================
+# Human-interaction cut protection (video-gen-fidelity redesign fix).
+#
+# Root cause this section proves fixed: a real live pipeline run found the
+# Shot-List Agent correctly wrote a human-usage (worn_in_use) shot, but the
+# OLD W_TYPE table made lifestyle_context/worn_in_use the structural bottom
+# weight, so it was consistently the argmin and got cut first under the
+# default $2.00 cap -- silently erasing the ad's whole human-story beat even
+# though nothing upstream did anything wrong. Two independent fixes compose
+# here: (1) W_TYPE re-weighting (lifestyle_context 0.90->1.10, worn_in_use
+# added at 1.15) makes this less LIKELY; (2) `_choose_drop_index`'s override
+# below makes it structurally IMPOSSIBLE for the sole surviving human shot to
+# be cut while ANY non-human shot remains, regardless of weight. These tests
+# target (2) directly -- deliberately constructing a case where the human
+# shot is STILL the argmin even under the new weights, to prove the override
+# (not just the re-weighting) is what's doing the protecting.
+# ===========================================================================
+def test_sole_human_interaction_shot_is_never_the_argmin_cut_target():
+    """Direct unit test of `_choose_drop_index`: construct weights where the
+    sole human-interaction shot IS the argmin -- it must be skipped in favor
+    of the next-lowest-weight NON-human shot."""
+    working = [
+        _shot("s_hook", "hook", "hook_hero", 4.0),
+        _shot("s_human", "problem", "worn_in_use", 4.0),      # w=0.90*1.15=1.035 (argmin)
+        _shot("s_context", "demo", "lifestyle_context", 4.0),  # w=1.00*1.10=1.10 (next-lowest)
+        _shot("s_macro", "demo", "macro_detail", 4.0, truth_fact_id="t_material"),
+        _shot("s_cta", "cta", "cta_endcard", 4.0),
+    ]
+    weights = [_shot_weight(s, {t["truth_id"]: t for t in TRUTHS}) for s in working]
+
+    # Sanity: confirm the human shot really is the plain argmin under these
+    # weights (i.e. this test is actually exercising the override, not a case
+    # where re-weighting alone already made the human shot safe).
+    assert working[_argmin(weights)]["shot_type"] == "worn_in_use"
+
+    drop_index = _choose_drop_index(working, weights)
+
+    assert working[drop_index]["shot_id"] == "s_context", (
+        "the sole human-interaction shot must be protected; the next-lowest "
+        "NON-human shot is cut instead"
+    )
+
+
+def test_allocate_budget_end_to_end_protects_the_human_shot_from_the_cut():
+    """Integration-level version of the same scenario through the real
+    `allocate_budget` reduce loop (not just the isolated helper): the human
+    shot survives, a different (non-human) shot is cut instead."""
+    shots = [
+        _shot("s_hook", "hook", "hook_hero", 4.0),
+        _shot("s_human", "problem", "worn_in_use", 4.0),
+        _shot("s_context", "demo", "lifestyle_context", 4.0),
+        _shot("s_macro", "demo", "macro_detail", 4.0, truth_fact_id="t_material"),
+        _shot("s_cta", "cta", "cta_endcard", 4.0),
+    ]
+    # sum(lo) at 5 shots = 1.20 (infeasible); at 4 shots = 0.96 (feasible against
+    # this cap) -- forces exactly ONE cut, same shape as the builder's own
+    # test_infeasible_single_cut_still_retries_the_whole_computation.
+    cap = 1.05
+
+    result = allocate_budget(shots, TRUTHS, cap)
+
+    remaining_ids = {s["shot_id"] for s in result.shots}
+    assert "s_human" in remaining_ids, "the human-interaction shot must survive the cut"
+    assert "s_context" not in remaining_ids, "the next-lowest non-human shot is cut instead"
+    assert len(result.shots) == 4
+
+
+def test_reduce_regression_unaffected_when_no_human_interaction_shot_present():
+    """Regression: with no human-interaction shot in the list at all,
+    `_choose_drop_index` must behave EXACTLY like plain `_argmin` -- no change
+    to the pre-existing reduce behavior for an ordinary shot list."""
+    working = [
+        _shot("s_hook", "hook", "hook_hero", 4.0),
+        _shot("s_macro", "demo", "macro_detail", 4.0, truth_fact_id="t_material"),
+        _shot("s_cta", "cta", "cta_endcard", 4.0),
+        _shot("s_demo2", "demo", "lifestyle_context", 4.0),
+        _shot("s_problem", "problem", "lifestyle_context", 4.0),
+    ]
+    assert not any(s["shot_type"] in HUMAN_INTERACTION_SHOT_TYPES for s in working)
+    weights = [_shot_weight(s, {t["truth_id"]: t for t in TRUTHS}) for s in working]
+
+    assert _choose_drop_index(working, weights) == _argmin(weights)
+
+
+def test_reduce_regression_unaffected_when_multiple_human_shots_present():
+    """When MORE THAN ONE human-interaction shot survives, cutting the
+    lowest-weight one (even if it's human-typed) is fine -- the protection
+    only kicks in for the SOLE survivor, since the story beat isn't erased
+    while a sibling human shot remains."""
+    working = [
+        _shot("s_hook", "hook", "hook_hero", 4.0),
+        _shot("s_human1", "problem", "worn_in_use", 4.0),       # w=0.90*1.15=1.035 (argmin)
+        _shot("s_human2", "demo", "product_in_hand", 4.0),      # w=1.00*1.15=1.15
+        _shot("s_cta", "cta", "cta_endcard", 4.0),
+    ]
+    weights = [_shot_weight(s, {t["truth_id"]: t for t in TRUTHS}) for s in working]
+
+    assert _choose_drop_index(working, weights) == _argmin(weights) == 1
+    assert working[_choose_drop_index(working, weights)]["shot_id"] == "s_human1"
+
+
+def test_pathological_all_remaining_shots_human_interaction_falls_through_to_argmin():
+    """Pathological edge case (documented in `_choose_drop_index`'s own
+    docstring): every remaining shot is human-interaction-typed, so there is
+    no non-human shot to redirect the cut to. Must NOT hang or crash -- falls
+    through to plain argmin so the reduce loop still progresses."""
+    working = [
+        _shot("s1", "hook", "product_in_hand", 4.0),      # w=1.20*1.15=1.38
+        _shot("s2", "problem", "worn_in_use", 4.0),        # w=0.90*1.15=1.035 (lowest)
+        _shot("s3", "demo", "product_in_hand", 4.0),       # w=1.00*1.15=1.15
+        _shot("s4", "cta", "worn_in_use", 4.0),             # w=1.20*1.15=1.38
+    ]
+    assert all(s["shot_type"] in HUMAN_INTERACTION_SHOT_TYPES for s in working)
+    weights = [_shot_weight(s, {t["truth_id"]: t for t in TRUTHS}) for s in working]
+
+    drop_index = _choose_drop_index(working, weights)
+
+    assert drop_index == _argmin(weights)
+    assert working[drop_index]["shot_id"] == "s2"
+
+
+def test_pathological_all_human_shots_end_to_end_through_allocate_budget():
+    """Same pathological case, but driven through the real `allocate_budget`
+    reduce loop end to end -- proves the whole function completes (does not
+    hang/crash) and still converges to a feasible allocation."""
+    shots = [
+        _shot("s1", "hook", "product_in_hand", 4.0),
+        _shot("s2", "problem", "worn_in_use", 4.0),
+        _shot("s3", "demo", "product_in_hand", 4.0),
+        _shot("s4", "cta", "worn_in_use", 4.0),
+    ]
+    # sum(lo) at 4 shots = 0.96 (infeasible against this cap); at 3 shots = 0.72
+    # (feasible) -- forces exactly one cut via the pathological-fallback path.
+    cap = 0.85
+
+    result = allocate_budget(shots, TRUTHS, cap)
+
+    assert not result.over_cap
+    assert len(result.shots) == 3
+    remaining_ids = {s["shot_id"] for s in result.shots}
+    assert "s2" not in remaining_ids, "the lowest-weight shot is still cut via the argmin fallback"
+    assert result.ledger["spent"] == pytest.approx(cap, abs=1e-3)
+
+
+# ===========================================================================
+# HERO SHOT budget headroom (video-gen-fidelity story-arc fix). A hero shot
+# (agents/shot_list_agent.py's is_hero_shot -- human-interaction-typed with
+# duration_sec above HUMAN_SHOT_MAX_DURATION_SEC) must never be silently
+# clamped down to an ordinary shot's floor just because the §5.7 floor case
+# fires -- `_shot_floor_cost` gives it its OWN, larger floor.
+# ===========================================================================
+
+
+def _hero_shot(shot_id="s_hero", duration_sec=12.0, beat_role="demo"):
+    return _shot(shot_id, beat_role, "worn_in_use", duration_sec)
+
+
+def test_shot_floor_cost_uses_hero_floor_for_a_real_hero_shot():
+    # Backstory-First fix (video-gen-fidelity, 2026-07-11): the hero's floor
+    # is now THIS SHOT's own duration_sec @ 720p, not the flat
+    # HERO_SHOT_MIN_DURATION_SEC constant -- the hero window itself now
+    # scales to the ad's target length, so a flat constant floor could sit
+    # ABOVE a scaled-down hero's own 1080p ceiling on a short-target ad (see
+    # _shot_floor_cost's own docstring).
+    hero = _hero_shot(duration_sec=12.0)
+    assert is_hero_shot(hero)
+    assert _shot_floor_cost(hero) == pytest.approx(hero["duration_sec"] * RATE_720P)
+    assert _shot_floor_cost(hero) > FLOOR_COST
+
+
+def test_shot_floor_cost_uses_flat_floor_for_ordinary_human_shot():
+    # duration_sec at/under HUMAN_SHOT_MAX_DURATION_SEC -- not a hero.
+    ordinary_human = _shot("s1", "demo", "product_in_hand", 4.0)
+    assert not is_hero_shot(ordinary_human)
+    assert _shot_floor_cost(ordinary_human) == FLOOR_COST
+
+
+def test_shot_floor_cost_uses_flat_floor_for_non_human_shot():
+    non_human = _shot("s1", "demo", "macro_detail", 4.0)
+    assert _shot_floor_cost(non_human) == FLOOR_COST
+
+
+def test_hero_shot_floor_case_gets_its_own_floor_not_the_flat_one():
+    """The §5.7 floor case (n == MIN_SHOTS and the cap still can't fit) must
+    pin the hero to its OWN floor (this shot's own duration_sec @ 720p), not
+    the flat FLOOR_COST every ordinary shot gets -- otherwise a 12s-planned
+    hero would report (and, downstream in video_gen_node's budget clamp,
+    actually render at) only ~3s worth of allocated_budget."""
+    shots = [
+        _hero_shot(duration_sec=12.0),
+        _shot("s2", "hook", "hook_hero", 4.0),
+        _shot("s3", "cta", "cta_endcard", 4.0),
+    ]
+    # A cap far below what even the floor case needs -- forces the floor case
+    # at exactly MIN_SHOTS (nothing left to cut).
+    cap = 0.10
+
+    result = allocate_budget(shots, TRUTHS, cap)
+
+    assert result.over_cap  # honestly flagged, not hidden -- this cap is absurdly tight
+    hero_alloc = result.ledger["per_shot"]["s_hero"]
+    assert hero_alloc == pytest.approx(12.0 * RATE_720P)
+    assert hero_alloc > FLOOR_COST
+    # the ordinary shots still get the flat floor, unaffected by the hero's
+    # different treatment.
+    assert result.ledger["per_shot"]["s2"] == pytest.approx(FLOOR_COST)
+    assert result.ledger["per_shot"]["s3"] == pytest.approx(FLOOR_COST)
+
+
+def test_hero_shot_affords_at_least_its_minimum_duration_at_default_cap():
+    """Under the module's real DEFAULT_JOB_BUDGET_CAP, a hero shot alongside
+    MIN_SHOTS-1 ordinary shots must be allocated enough to actually render at
+    HERO_SHOT_MIN_DURATION_SEC or more at 720p -- the concrete "does this
+    actually fit in a normal job cap" claim behind the fix."""
+    shots = [
+        _hero_shot(duration_sec=12.0, beat_role="demo"),
+        _shot("s2", "hook", "hook_hero", 4.0),
+        _shot("s3", "cta", "cta_endcard", 4.0),
+    ]
+
+    result = allocate_budget(shots, TRUTHS, DEFAULT_JOB_BUDGET_CAP)
+
+    assert not result.over_cap
+    hero_alloc = result.ledger["per_shot"]["s_hero"]
+    affordable_duration_720p = hero_alloc / RATE_720P
+    assert affordable_duration_720p >= HERO_SHOT_MIN_DURATION_SEC - 1e-6
+
+
+def test_hero_shot_never_cut_when_other_non_human_shots_available():
+    """The pre-existing _choose_drop_index sole-human-shot protection already
+    covers the hero (it is human-interaction-typed) for free -- confirms that
+    synergy explicitly for a real hero-shaped shot under a tight cap."""
+    shots = [
+        _hero_shot(duration_sec=12.0),
+        _shot("s2", "problem", "lifestyle_context", 4.0),  # lowest weight -> would be argmin
+        _shot("s3", "cta", "cta_endcard", 4.0),
+    ]
+    cap = 0.7  # tight enough to force one cut, but feasible at MIN_SHOTS
+
+    result = allocate_budget(shots, TRUTHS, cap)
+
+    remaining_ids = {s["shot_id"] for s in result.shots}
+    assert "s_hero" in remaining_ids, "the hero shot must never be the one cut when a non-human shot can be instead"

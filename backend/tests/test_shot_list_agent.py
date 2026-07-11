@@ -15,8 +15,10 @@ import json
 import pytest
 
 from agents.shot_list_agent import (
+    HUMAN_INTERACTION_SHOT_TYPES,
     NEGATIVE_PROMPT_BOILERPLATE,
     _default_validate_justifications,
+    _truth_diversity_failures,
     generate_shot_list,
 )
 from graph.shot_schema import validate_shot_list
@@ -149,6 +151,15 @@ async def test_happy_path_produces_valid_shot_list():
     assert all("product_category" not in s for s in shots)
 
 
+def test_negative_prompt_boilerplate_includes_v8_object_substitution_terms():
+    """v8 fix (Meta Quest -> "phone on a stand" wrong-object bug): the empirically
+    observed failure mode's specific tokens must be present, appended (not
+    replacing) the original identity-first terms, which must stay first."""
+    assert NEGATIVE_PROMPT_BOILERPLATE.startswith("warped label, distorted logo")
+    for term in ("object substitution", "different object", "smartphone", "phone on a stand"):
+        assert term in NEGATIVE_PROMPT_BOILERPLATE
+
+
 @pytest.mark.asyncio
 async def test_call_a_reprompt_fires_and_repairs_bad_justification():
     bad = [
@@ -195,6 +206,135 @@ async def test_out_of_enum_camera_move_is_snapped_not_rejected():
 
     validate_shot_list(shots)  # would raise if the bad enum leaked through
     assert shots[0]["camera_move"] == "static", "invalid camera_move snaps to the safe default"
+
+
+# ---------------------------------------------------------------------------
+# Single-Detail Fixation fix (video-gen-fidelity, 2026-07-11): TRUTH DIVERSITY
+# floor across the shot list.
+# ---------------------------------------------------------------------------
+
+FIXATED_JUSTIFS = [
+    _justif("s1", "hook", "Your phone slides off every stand you own.", "t1", 0),
+    _justif("s2", "proof", "This one grips with a dual knurled hinge.", "t1", 1),
+    _justif("s3", "cta", "Tap the link to grab yours today.", "t1", 2),
+]
+
+
+def test_truth_diversity_failures_flag_single_truth_list():
+    failures = _truth_diversity_failures(FIXATED_JUSTIFS, TRUTHS)
+
+    # First shot keeps its citation; only the duplicates are asked to move.
+    assert [f["shot_id"] for f in failures] == ["s2", "s3"]
+    assert all("same truth_fact_id 't1'" in f["violation"] for f in failures)
+
+
+def test_truth_diversity_failures_empty_for_diverse_list():
+    assert _truth_diversity_failures(THREE_GOOD_JUSTIFS, TRUTHS) == []
+
+
+def test_truth_diversity_failures_skipped_when_job_has_one_truth():
+    one_truth = [TRUTHS[0]]
+    fixated = [dict(j) for j in FIXATED_JUSTIFS]
+    assert _truth_diversity_failures(fixated, one_truth) == []
+
+
+@pytest.mark.asyncio
+async def test_single_truth_shot_list_triggers_diversity_reprompt():
+    client = FakeOpenAIClient([
+        _call_a(FIXATED_JUSTIFS),
+        _call_a(THREE_GOOD_JUSTIFS),  # retry diversifies
+        _call_b(["s1", "s2", "s3"]),
+    ])
+
+    shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+
+    assert client.call_count == 3, "diversity flag must trigger one Call-A re-prompt"
+    validate_shot_list(shots)
+    cited = {s["justification"]["truth_fact_id"] for s in shots}
+    assert len(cited) >= 2
+
+
+@pytest.mark.asyncio
+async def test_persistently_fixated_shot_list_degrades_with_warning(caplog):
+    client = FakeOpenAIClient([
+        _call_a(FIXATED_JUSTIFS),
+        _call_a(FIXATED_JUSTIFS),  # retry repeats the fixation
+        _call_b(["s1", "s2", "s3"]),
+    ])
+
+    with caplog.at_level("WARNING"):
+        shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+
+    assert len(shots) == 3, "a still-fixated list ships rather than nothing"
+    assert any("single truth_fact_id" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Human-Centric Bias fix (video-gen-fidelity, 2026-07-11): a product whose
+# truths establish a human-use affordance must get at least one
+# human-interaction shot -- enforced by a bounded Call B re-prompt, never
+# trusted to the prompt alone.
+# ---------------------------------------------------------------------------
+
+# Same script/treatment, but truths naming a real human-contact part ("strap").
+BAG_TRUTHS = [
+    {"truth_id": "t1", "fact": "pebbled russet-brown leather front panel", "category": "material", "source": "photo_1"},
+    {"truth_id": "t2", "fact": "adjustable shoulder strap with a stitched pad", "category": "construction_detail", "source": "photo_2"},
+    {"truth_id": "t3", "fact": "pale compression halo around the debossed mark", "category": "imperfection", "source": "photo_1"},
+]
+
+
+def _call_b_with_human_shot(shot_ids, human_shot_id):
+    payload = json.loads(_call_b(shot_ids))
+    for s in payload["shots"]:
+        if s["shot_id"] == human_shot_id:
+            s["shot_type"] = "product_in_hand"
+            s["camera_move"] = "static"
+    return json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_zero_human_shots_for_human_suited_product_reprompts_call_b():
+    client = FakeOpenAIClient([
+        _call_a(THREE_GOOD_JUSTIFS),
+        _call_b(["s1", "s2", "s3"]),                       # all still-life
+        _call_b_with_human_shot(["s1", "s2", "s3"], "s2"),  # retry adds one
+    ])
+
+    shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, BAG_TRUTHS, client=client)
+
+    assert client.call_count == 3, "zero human shots + strap facts = one Call B re-prompt"
+    validate_shot_list(shots)
+    assert any(s["shot_type"] in HUMAN_INTERACTION_SHOT_TYPES for s in shots)
+
+
+@pytest.mark.asyncio
+async def test_zero_human_shots_degrades_after_failed_call_b_retry(caplog):
+    client = FakeOpenAIClient([
+        _call_a(THREE_GOOD_JUSTIFS),
+        _call_b(["s1", "s2", "s3"]),
+        _call_b(["s1", "s2", "s3"]),  # retry still all still-life
+    ])
+
+    with caplog.at_level("WARNING"):
+        shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, BAG_TRUTHS, client=client)
+
+    assert client.call_count == 3
+    validate_shot_list(shots)
+    assert not any(s["shot_type"] in HUMAN_INTERACTION_SHOT_TYPES for s in shots)
+    assert any("zero human-interaction shots" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_call_b_reprompt_for_product_without_affordance():
+    # TRUTHS (hinge/aluminum, no contact parts): all-still-life Call B output
+    # is accepted first try -- the human-shot retry is product-conditional.
+    client = FakeOpenAIClient([_call_a(THREE_GOOD_JUSTIFS), _call_b(["s1", "s2", "s3"])])
+
+    shots = await generate_shot_list(WINNING_SCRIPT, TREATMENT, TRUTHS, client=client)
+
+    assert client.call_count == 2
+    validate_shot_list(shots)
 
 
 @pytest.mark.asyncio

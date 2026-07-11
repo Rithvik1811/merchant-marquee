@@ -1,5 +1,6 @@
 """
-Unit tests for the Continuity Agent (§5.10 Qwen-VL drift scoring).
+Unit tests for the Continuity Agent (§5.10 Qwen-VL drift scoring + the v8
+frame-0(ish) identity check).
 
 Both boundaries are faked (same injection pattern every other agent uses):
   * the Qwen-VL client -> tests._fakes.FakeOpenAIClient seeded with a JSON
@@ -9,9 +10,14 @@ Both boundaries are faked (same injection pattern every other agent uses):
     temp .jpg and returns its path (no real ffmpeg -- matches how
     tests/_phase3_graph.py fakes Ken-Burns's render step).
 
+Note: `score_continuity` now runs the drift check AND the identity check for
+every scored shot -- that's TWO Qwen-VL calls per shot, not one. Any test that
+asserts an exact `client.call_count` accounts for both.
+
 Covers: scores only "passed" shots; skips "fallback"/"fallback_requested";
 skips already-scored clips; one shot's Qwen-VL failure doesn't block others and
-does NOT write a passing score for it; drift_scored events fire correctly.
+does NOT write a passing score for it; drift_scored events fire correctly;
+the identity check (same_object true/false, malformed-JSON defaults to false).
 """
 from __future__ import annotations
 
@@ -71,6 +77,45 @@ def _drift_json(score: float, justification: str = "matches well") -> str:
     return f'{{"drift_score": {score}, "justification": "{justification}"}}'
 
 
+def _make_alternating_client_factory(responses: list[str]):
+    """Factory for monkeypatching `agents.continuity_agent.AsyncOpenAI` when the
+    NODE wrapper is under test (client=None, so `_call_qwen_vl_drift` and
+    `_call_qwen_vl_identity` each build their OWN fresh client). A flat
+    `FakeOpenAIClient(responses)` shared instance doesn't work here because each
+    fresh instance's OWN call_count starts at 0 -- the identity call would
+    always see `responses[0]`, same as the drift call. This instead hands out
+    `responses` ONE AT A TIME across successive `AsyncOpenAI(...)` instantiations
+    (drift's own_client is built before identity's, per call, so the ordering is
+    deterministic): call N gets a fresh client seeded with only `responses[N]`.
+    """
+    state = {"n": 0}
+
+    def _factory(*_a, **_k):
+        idx = min(state["n"], len(responses) - 1)
+        state["n"] += 1
+        return FakeOpenAIClient([responses[idx]])
+
+    return _factory
+
+
+def _identity_json(
+    same_object: bool = True,
+    confidence: str = "high",
+    matching: list[str] | None = None,
+    mismatching: list[str] | None = None,
+) -> str:
+    import json as _json
+
+    return _json.dumps(
+        {
+            "matching_features": matching if matching is not None else ["deep rounded silhouette", "matte finish"],
+            "mismatching_features": mismatching if mismatching is not None else [],
+            "same_object": same_object,
+            "confidence": confidence,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # score_continuity -- status filtering
 # ---------------------------------------------------------------------------
@@ -88,7 +133,7 @@ async def test_scores_only_passed_shots_skips_fallback_and_requested():
         "s_requested": _gen(),
         "s_pending": _gen(),
     }
-    client = FakeOpenAIClient([_drift_json(0.1)])
+    client = FakeOpenAIClient([_drift_json(0.1), _identity_json(same_object=True)])
 
     updated, records = await score_continuity(
         shots, generated, PRODUCT_PHOTOS, client=client, extract_frame_fn=_fake_extract_frame
@@ -98,8 +143,9 @@ async def test_scores_only_passed_shots_skips_fallback_and_requested():
     assert set(updated.keys()) == {"s_passed"}
     assert {r["shot_id"] for r in records} == {"s_passed"}
     assert updated["s_passed"]["drift_score"] == pytest.approx(0.1)
-    # Exactly one Qwen-VL call was made (only for the passed shot).
-    assert client.call_count == 1
+    assert updated["s_passed"]["identity_check"]["same_object"] is True
+    # Two Qwen-VL calls were made for the one passed shot (drift + identity).
+    assert client.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -154,6 +200,94 @@ async def test_pass_and_fail_derived_from_threshold():
     assert by_id["s_bad"]["attempt"] == 1  # mirrors retry_count
     assert updated["s_good"]["drift_score"] == pytest.approx(within)
     assert updated["s_bad"]["drift_score"] == pytest.approx(over)
+
+
+# ---------------------------------------------------------------------------
+# v8 fix: frame-0(ish) identity check -- a SEPARATE, categorical check
+# alongside (not instead of) the continuous drift score.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_identity_check_same_object_true_is_recorded():
+    shot = _shot("s1", status="passed")
+    generated = {"s1": _gen()}
+    client = FakeOpenAIClient(
+        [_drift_json(0.05), _identity_json(same_object=True, confidence="high", matching=["deep rounded block"])]
+    )
+
+    updated, records = await score_continuity(
+        [shot], generated, PRODUCT_PHOTOS, client=client, extract_frame_fn=_fake_extract_frame
+    )
+
+    identity = updated["s1"]["identity_check"]
+    assert identity["same_object"] is True
+    assert identity["confidence"] == "high"
+    assert identity["matching_features"] == ["deep rounded block"]
+    assert identity["mismatching_features"] == []
+    # scored_records also carries identity_check for event emission.
+    assert records[0]["identity_check"]["same_object"] is True
+
+
+@pytest.mark.asyncio
+async def test_identity_check_same_object_false_is_recorded():
+    shot = _shot("s1", status="passed")
+    generated = {"s1": _gen()}
+    client = FakeOpenAIClient(
+        [
+            _drift_json(0.05),  # low drift -- style/color can superficially match a wrong object
+            _identity_json(same_object=False, confidence="high", mismatching=["flat vs. deep silhouette"]),
+        ]
+    )
+
+    updated, records = await score_continuity(
+        [shot], generated, PRODUCT_PHOTOS, client=client, extract_frame_fn=_fake_extract_frame
+    )
+
+    identity = updated["s1"]["identity_check"]
+    assert identity["same_object"] is False
+    assert identity["mismatching_features"] == ["flat vs. deep silhouette"]
+    # Identity is independent of drift -- a low drift score does not suppress it.
+    assert updated["s1"]["drift_score"] == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_identity_check_malformed_json_defaults_to_worst_case_false(caplog):
+    shot = _shot("s1", status="passed")
+    generated = {"s1": _gen()}
+    # Drift call succeeds; identity call returns something that fails
+    # IdentityCheckResult's extra="forbid" + required-field validation.
+    client = FakeOpenAIClient([_drift_json(0.05), '{"not_a_real_field": true}'])
+
+    with caplog.at_level("ERROR"):
+        updated, records = await score_continuity(
+            [shot], generated, PRODUCT_PHOTOS, client=client, extract_frame_fn=_fake_extract_frame
+        )
+
+    identity = updated["s1"]["identity_check"]
+    assert identity["same_object"] is False, "a malformed identity response must default to the worst case, never silently pass"
+    assert identity["confidence"] == "low"
+    assert any("identity check FAILED" in r.message for r in caplog.records)
+    # The drift check (a separate boundary) is unaffected by the identity failure.
+    assert updated["s1"]["drift_score"] == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_identity_check_ffmpeg_extraction_failure_defaults_to_worst_case_false():
+    shot = _shot("s1", status="passed")
+    generated = {"s1": _gen()}
+    client = FakeOpenAIClient([_drift_json(0.05), _identity_json(same_object=True)])
+
+    def _boom_identity_extract(video_uri: str, at_sec: float) -> str:
+        raise RuntimeError("simulated ffmpeg failure on the identity frame")
+
+    updated, records = await score_continuity(
+        [shot], generated, PRODUCT_PHOTOS, client=client,
+        extract_frame_fn=_fake_extract_frame,  # drift extraction still works
+        identity_extract_frame_fn=_boom_identity_extract,  # identity extraction fails
+    )
+
+    assert updated["s1"]["identity_check"]["same_object"] is False
+    # Drift, using its own (working) extractor, is unaffected.
+    assert updated["s1"]["drift_score"] == pytest.approx(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +347,14 @@ def _state(shots, generated):
 @pytest.mark.asyncio
 async def test_node_writes_drift_scores_and_preserves_other_entries(monkeypatch):
     monkeypatch.setattr("agents.continuity_agent.extract_midpoint_frame", _fake_extract_frame)
+    # The identity check's default extractor is the module-level `extract_frame`
+    # (real ffmpeg) when neither extract_frame_fn nor identity_extract_frame_fn
+    # is injected -- the node wrapper injects neither, so this must be faked too,
+    # or the test would attempt a real network download.
+    monkeypatch.setattr("agents.continuity_agent.extract_frame", _fake_extract_frame)
     monkeypatch.setattr(
         "agents.continuity_agent.AsyncOpenAI",
-        lambda *a, **k: FakeOpenAIClient([_drift_json(0.15)]),
+        _make_alternating_client_factory([_drift_json(0.15), _identity_json(same_object=True)]),
     )
 
     shots = [_shot("s1", status="passed"), _shot("s2", status="fallback")]
@@ -226,7 +365,9 @@ async def test_node_writes_drift_scores_and_preserves_other_entries(monkeypatch)
     gen = result["generated_shots"]
     # s1 scored; s2 (fallback) left exactly as it was, still present.
     assert gen["s1"]["drift_score"] == pytest.approx(0.15)
+    assert gen["s1"]["identity_check"]["same_object"] is True
     assert "drift_score" not in gen["s2"]
+    assert "identity_check" not in gen["s2"]
     assert gen["s2"]["video_uri"] == "http://oss/s2.mp4"
     assert "[continuity_agent]" in result["reasoning_trace"]
 
@@ -234,10 +375,11 @@ async def test_node_writes_drift_scores_and_preserves_other_entries(monkeypatch)
 @pytest.mark.asyncio
 async def test_node_emits_drift_scored_events(monkeypatch):
     monkeypatch.setattr("agents.continuity_agent.extract_midpoint_frame", _fake_extract_frame)
+    monkeypatch.setattr("agents.continuity_agent.extract_frame", _fake_extract_frame)
     over = DRIFT_THRESHOLD + 0.2
     monkeypatch.setattr(
         "agents.continuity_agent.AsyncOpenAI",
-        lambda *a, **k: FakeOpenAIClient([_drift_json(over)]),
+        _make_alternating_client_factory([_drift_json(over), _identity_json(same_object=True)]),
     )
 
     shots = [_shot("s1", status="passed", retry_count=1)]

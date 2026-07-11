@@ -520,3 +520,39 @@ def test_llm_source_not_a_survivor_raises(monkeypatch):
     with pytest.raises(ValueError) as exc:
         meta_critic(variants, hook, pacing, body, cta, tone)
     assert "not a surviving" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry-on-validation-failure (call_qwen_json_validated, video-gen-
+# fidelity branch fix) -- integration coverage for the Meta-Critic's own call
+# site (agents/meta_critic.py's `meta_critic()`, ~line 1081).
+# ---------------------------------------------------------------------------
+def test_meta_critic_retries_once_on_validation_failure_and_recovers(monkeypatch):
+    """First response is missing a required field (fails MetaCriticLLMOutput
+    validation); the re-prompted second response is complete and succeeds."""
+    bad = _llm_out_dict()
+    del bad["overall_reasoning"]
+    good = json.dumps(_llm_out_dict())
+    monkeypatch.setattr(
+        "agents.critic_llm.OpenAI", make_fake_sync_openai([json.dumps(bad), good])
+    )
+    variants = [_mk_variant(v) for v in ("v1", "v2", "v3", "v4")]
+    hook, pacing, body, cta, tone = _scores(["v1", "v2", "v3", "v4"])
+
+    result = meta_critic(variants, hook, pacing, body, cta, tone)
+
+    assert result.outcome == "cross_pollinated"
+
+
+def test_meta_critic_raises_clearly_after_max_attempts_exhausted(monkeypatch):
+    """Every attempt is missing the same required field -> bounded retry
+    (max_attempts=2), never hangs, raises the real ValueError clearly."""
+    bad = _llm_out_dict()
+    del bad["overall_reasoning"]
+    monkeypatch.setattr("agents.critic_llm.OpenAI", make_fake_sync_openai([json.dumps(bad)]))
+    variants = [_mk_variant(v) for v in ("v1", "v2", "v3")]
+    hook, pacing, body, cta, tone = _scores(["v1", "v2", "v3"])
+
+    with pytest.raises(ValueError) as exc:
+        meta_critic(variants, hook, pacing, body, cta, tone)
+    assert "failed validation" in str(exc.value)

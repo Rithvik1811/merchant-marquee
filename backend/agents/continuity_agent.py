@@ -81,6 +81,39 @@ agent here). `client` (an AsyncOpenAI-compatible Qwen-VL client) and
 `extract_frame_fn` (the ffmpeg-boundary frame extractor) are both injectable, so
 tests fake the vision call and the ffmpeg step without touching real DashScope
 or ffmpeg -- matching how tests/_phase3_graph.py fakes Ken-Burns's render step.
+
+FRAME-0(ISH) IDENTITY CHECK (v8 fix -- Meta Quest -> "phone on a stand"
+wrong-object bug). This is a SECOND, INDEPENDENT check alongside the drift
+score above, not a stricter threshold on the same [0,1] scale. Drift asks a
+CONTINUOUS question ("how similar is this frame to the reference,
+color/shape/style-wise"); identity asks a CATEGORICAL one ("is this even the
+same physical object class at all"). A wrong-object generation can plausibly
+score a misleadingly moderate drift (lighting/composition can still roughly
+match), so a purely continuous check is not guaranteed to catch it -- hence a
+dedicated categorical verdict, `DRIFT_THRESHOLD` never involved.
+
+Deliberately NOT frame 0 -- i2v models keep frame 0 tightly conditioned on the
+reference image (often near-identical), so an identity check AT t=0 can
+trivially pass even when the clip drifts to the wrong object by t=1s. We check
+an EARLY frame instead: `at_sec = max(0.4, 0.1 * duration_sec_used)`. This
+reuses the frame-extraction boundary generalized below (`extract_frame`, of
+which `extract_midpoint_frame` is now a thin wrapper) with a different seek
+target, and a SEPARATE Qwen-VL call (`_call_qwen_vl_identity`) with its own
+system prompt (`_IDENTITY_SYSTEM_PROMPT`) forcing feature-by-feature evidence
+BEFORE a same_object verdict -- deliberate field ordering (mirrors this
+module's BaseModel-validation posture below) that measurably reduces blind-
+approval bias in multimodal judging.
+
+Runs ALONGSIDE drift scoring in `score_continuity`, same scope restriction
+(only un-scored `status == "passed"` shots -- see WHY SCORE ONLY "passed"
+SHOTS / WHY SCORE ONLY UN-SCORED CLIPS above) and the SAME conservative
+failure posture: an identity-check failure (bad JSON, API error, ffmpeg
+failure) is recorded as the worst case, `same_object=False`, never silently
+passed -- exactly mirroring `_FAILED_DRIFT_SCORE`'s posture for drift. Written
+onto `generated_shots[shot_id]["identity_check"]`, ADDITIVE alongside
+`drift_score` (graph/state.py v8), never replacing it. This node still only
+SCORES -- `agents/continuity_gate.py` owns the routing decision on a hard
+identity failure, exactly as it already owns the drift-retry/review decision.
 """
 from __future__ import annotations
 
@@ -91,12 +124,13 @@ import logging
 import os
 import re
 import tempfile
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import ffmpeg
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.runnables import RunnableConfig
 from openai import AsyncOpenAI
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from agents._oss import _download_to_temp
 from agents._retry import create_completion
@@ -120,7 +154,7 @@ DRIFT_THRESHOLD = float(os.getenv("CONTINUITY_DRIFT_THRESHOLD", "0.35"))
 # routed to the Gate's retry/review path, never silently passed (see docstring).
 _FAILED_DRIFT_SCORE = 1.0
 
-# ExtractFrameFn contract: (video_uri, duration_sec) -> local_jpg_path. The
+# ExtractFrameFn contract: (video_uri, seek_seconds) -> local_jpg_path. The
 # caller deletes the returned path. Injectable so tests fake the ffmpeg boundary.
 ExtractFrameFn = Callable[[str, float], str]
 
@@ -148,35 +182,93 @@ drift_score is a single number in [0.0, 1.0]:
   1.0  = a totally different product or completely inconsistent style.
 Use the middle of the range for partial/subtle drift. Be honest and specific."""
 
+# v8 fix -- see module docstring's "FRAME-0(ISH) IDENTITY CHECK" section. Field
+# order in the required JSON (features/evidence BEFORE the same_object verdict)
+# is deliberate: it forces the model to generate comparison evidence before
+# committing to a yes/no, mirrored in IdentityCheckResult's own field order below.
+_IDENTITY_SYSTEM_PROMPT = """You are a strict product-identity verifier for an ad-video pipeline. You are
+given a REFERENCE product photo and one FRAME from the very start of a
+generated video clip that is REQUIRED to depict the same physical product.
+
+Your job is to catch the specific failure where the video shows a DIFFERENT
+KIND of object entirely (e.g. the wrong product was generated), not to judge
+video quality, lighting, or background. IGNORE the background, the scene, the
+camera angle, and lighting differences completely -- judge ONLY the object
+itself.
+
+Work in this exact order:
+1. List 3-6 concrete physical features of the object in the REFERENCE photo
+   (3-D shape and depth, proportions, parts and how they attach, materials,
+   color/finish).
+2. For each feature, state whether the object in the FRAME shows the same
+   feature, a clearly different one, or it cannot be determined from this
+   frame.
+3. Only then decide: same_object is true ONLY if the frame's object could be
+   the same physical item. If the frame shows an object with a fundamentally
+   different shape, depth, or part structure (even if it is a plausible,
+   nice-looking product), same_object is false. Do not give the benefit of
+   the doubt: "similar-looking but a different kind of object" is false.
+
+Return ONLY this JSON, keys in this exact order:
+{
+  "matching_features": ["..."],
+  "mismatching_features": ["..."],
+  "same_object": true,
+  "confidence": "high" | "medium" | "low"
+}"""
+
+
+class IdentityCheckResult(BaseModel):
+    """Validated frame-0(ish) identity-check output (see module docstring).
+
+    Field order mirrors the exact order the prompt demands (evidence BEFORE the
+    verdict) -- Pydantic doesn't enforce input JSON key order, but keeping the
+    model's own field order the same documents the intended reasoning sequence
+    for a future reader. `extra="forbid"` / StrictBool mirror this codebase's
+    other raw-LLM-JSON validation gates (see agents/body_checker.py's
+    BodyCheckResult for the precedent this is modeled on).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    matching_features: list[str] = Field(default_factory=list)
+    mismatching_features: list[str] = Field(default_factory=list)
+    same_object: StrictBool
+    confidence: Literal["high", "medium", "low"]
+
 
 # ---------------------------------------------------------------------------
 # ffmpeg frame extraction (boundary -- faked in tests, run off-loop in prod).
 # ---------------------------------------------------------------------------
-def extract_midpoint_frame(
+def extract_frame(
     video_uri: str,
-    duration_sec: float,
+    at_sec: float,
     download_fn: Optional[Callable[[str], str]] = None,
 ) -> str:
-    """Download the generated clip and extract ONE frame near its midpoint.
+    """Download the generated clip and extract ONE frame at `at_sec` seconds in.
 
     Returns the local .jpg path (the CALLER deletes it). The downloaded clip is
     always cleaned up here. `download_fn` reuses agents/_oss.py's
     `_download_to_temp` by default (httpx, follow_redirects for OSS/CDN 3xx);
     injectable only so a caller could swap the transport.
 
-    ffmpeg invocation matches the spec: `-ss <duration/2>` (seek BEFORE `-i` for
-    a fast keyframe seek) then `-frames:v 1` to grab a single frame.
+    ffmpeg invocation matches the spec: `-ss <at_sec>` (seek BEFORE `-i` for a
+    fast keyframe seek) then `-frames:v 1` to grab a single frame. Generalizes
+    what was `extract_midpoint_frame`'s own inline ffmpeg call (see that
+    function, now a thin wrapper around this one, for the midpoint-specific
+    call site; the v8 identity check below calls this directly with an EARLY
+    seek target instead).
     """
     dl = download_fn or _download_to_temp
     clip_path = dl(video_uri)
     try:
         out_fd, out_path = tempfile.mkstemp(suffix=".jpg", prefix="continuity_frame_")
         os.close(out_fd)  # ffmpeg writes the file itself; we only needed a unique path
-        midpoint = max(duration_sec / 2.0, 0.0)
+        seek = max(at_sec, 0.0)
         try:
             (
                 ffmpeg
-                .input(clip_path, ss=midpoint)
+                .input(clip_path, ss=seek)
                 .output(out_path, vframes=1)
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
@@ -195,6 +287,21 @@ def extract_midpoint_frame(
                 os.remove(clip_path)
             except OSError:
                 pass
+
+
+def extract_midpoint_frame(
+    video_uri: str,
+    duration_sec: float,
+    download_fn: Optional[Callable[[str], str]] = None,
+) -> str:
+    """Thin wrapper over `extract_frame`, preserved so every existing caller
+    (score_continuity's drift path, and every test that imports this name)
+    keeps working unchanged. Seeks to the clip's midpoint -- the drift check's
+    own rationale (a clip's opening frame is often still settling from the
+    reference still, so mid-clip is the more honest drift test) is unaffected
+    by this refactor; only the ffmpeg mechanics moved into `extract_frame`.
+    """
+    return extract_frame(video_uri, at_sec=duration_sec / 2.0, download_fn=download_fn)
 
 
 def _encode_image_to_data_uri(path: str) -> str:
@@ -296,6 +403,85 @@ async def _score_one_shot(
 
 
 # ---------------------------------------------------------------------------
+# One Qwen-VL identity call (v8 fix -- see module docstring's "FRAME-0(ISH)
+# IDENTITY CHECK" section). Separate call, separate frame, separate prompt from
+# the drift call above -- a categorical verdict, not a continuous score.
+# ---------------------------------------------------------------------------
+async def _call_qwen_vl_identity(
+    reference_url: str,
+    frame_path: str,
+    client: Optional[AsyncOpenAI] = None,
+) -> IdentityCheckResult:
+    """One Qwen-VL call judging whether the FRAME is even the same physical
+    object as the REFERENCE photo. Returns a validated IdentityCheckResult;
+    raises (ValidationError / JSONDecodeError / etc.) on any malformed output --
+    the caller (`_score_one_shot_identity`'s caller, `score_continuity`) is
+    responsible for the worst-case fallback, mirroring `_call_qwen_vl_drift`'s
+    contract with its own caller.
+    """
+    model = os.environ["MODEL_VISION"]  # KeyError intentional -- see product_truth_extractor.py
+    own_client = client is None
+    if own_client:
+        client = AsyncOpenAI(
+            api_key=os.environ["DASHSCOPE_API_KEY"],
+            base_url=os.environ["DASHSCOPE_BASE_URL"],
+            timeout=60.0,
+        )
+    try:
+        frame_data_uri = _encode_image_to_data_uri(frame_path)
+        user_content = [
+            {"type": "text", "text": "REFERENCE product photo:"},
+            {"type": "image_url", "image_url": {"url": reference_url}},
+            {
+                "type": "text",
+                "text": "FRAME extracted from the very start of the generated clip (check this):",
+            },
+            {"type": "image_url", "image_url": {"url": frame_data_uri}},
+            {"type": "text", "text": "Return only the JSON object."},
+        ]
+        messages = [
+            {"role": "system", "content": _IDENTITY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        raw = await create_completion(client, model=model, messages=messages)
+        parsed = _parse_json_response(raw)
+        return IdentityCheckResult.model_validate(parsed)
+    finally:
+        if own_client:
+            await client.close()
+
+
+async def _score_one_shot_identity(
+    shot: Shot,
+    entry: GeneratedShot,
+    product_photos: list[str],
+    client: Optional[AsyncOpenAI],
+    extract_frame_fn: ExtractFrameFn,
+) -> IdentityCheckResult:
+    """Extract an EARLY frame (not frame 0 -- see module docstring for why) and
+    run the identity check, always cleaning the frame up.
+
+    `at_sec = max(0.4, 0.1 * duration_sec_used)`: a small absolute floor so a
+    very short clip still seeks a moment past the tightly-conditioned opening
+    frame, otherwise 10% into the clip's REALIZED duration (Video-Gen may have
+    budget-clamped it, same "prefer duration_sec_used" precedent as
+    `_score_one_shot`'s drift midpoint above).
+    """
+    reference_url = _resolve_reference_image_url(shot["reference_image_id"], product_photos)
+    duration = float(entry.get("duration_sec_used") or shot["duration_sec"])
+    at_sec = max(0.4, 0.1 * duration)
+    frame_path = await asyncio.to_thread(extract_frame_fn, entry["video_uri"], at_sec)
+    try:
+        return await _call_qwen_vl_identity(reference_url, frame_path, client=client)
+    finally:
+        if frame_path and os.path.exists(frame_path):
+            try:
+                os.remove(frame_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Batch scorer (status-filtered, per-shot isolated) -- the reusable core.
 # ---------------------------------------------------------------------------
 async def score_continuity(
@@ -304,23 +490,38 @@ async def score_continuity(
     product_photos: list[str],
     client: Optional[AsyncOpenAI] = None,
     extract_frame_fn: Optional[ExtractFrameFn] = None,
+    identity_extract_frame_fn: Optional[ExtractFrameFn] = None,
 ) -> tuple[dict[str, GeneratedShot], list[dict]]:
-    """Score every un-scored `passed` shot's drift; leave everything else alone.
+    """Score every un-scored `passed` shot's drift AND identity; leave everything
+    else alone.
 
     Returns (updated_entries, scored_records):
       * updated_entries: one GeneratedShot per shot we scored, each a copy of the
-        existing entry with `drift_score` written in. Merge it INTO the outer
-        state's `generated_shots` (the node wrapper does this) -- it never
-        contains entries for shots we skipped.
+        existing entry with `drift_score` AND `identity_check` written in. Merge
+        it INTO the outer state's `generated_shots` (the node wrapper does this)
+        -- it never contains entries for shots we skipped.
       * scored_records: one dict per scored shot for event emission --
-        {shot_id, drift_score, passed, attempt}.
+        {shot_id, drift_score, passed, attempt, identity_check}.
 
-    Never raises for a single shot's failure: a Qwen-VL/ffmpeg error is caught,
-    logged, and recorded as the worst-case `_FAILED_DRIFT_SCORE` (see docstring)
-    so the batch is never blocked and the shot is never silently passed. Does NOT
-    change any shot's `status` -- that is the Continuity Gate's job.
+    Never raises for a single shot's failure: a Qwen-VL/ffmpeg error on EITHER
+    check is caught and isolated from the other (drift and identity are two
+    independent checks against two independently-extracted frames -- one
+    failing must not silently skip or corrupt the other). A failed drift check
+    is recorded as the worst-case `_FAILED_DRIFT_SCORE`; a failed identity
+    check is recorded as the worst-case `same_object=False` -- both mirror the
+    same "never silently pass" posture (see module docstring). Does NOT change
+    any shot's `status` -- that is the Continuity Gate's job.
     """
     extract = extract_frame_fn or extract_midpoint_frame
+    # Defaults to whatever `extract_frame_fn` was given (if any) before falling
+    # back to the real `extract_frame`: a caller that only fakes ONE frame-
+    # extraction boundary (the common case -- every existing test here does
+    # this) gets that same fake reused for the identity check too, rather than
+    # the identity path silently falling through to a REAL httpx download +
+    # ffmpeg call. Production (`continuity_agent_node`, neither arg given)
+    # is unaffected -- both still resolve to real extraction, just at
+    # different seek points (midpoint vs. the early identity frame).
+    identity_extract = identity_extract_frame_fn or extract_frame_fn or extract_frame
     updated: dict[str, GeneratedShot] = {}
     scored_records: list[dict] = []
 
@@ -353,13 +554,37 @@ async def score_continuity(
                 shot_id, exc, _FAILED_DRIFT_SCORE,
             )
 
-        updated[shot_id] = {**entry, "drift_score": drift}
+        try:
+            identity_result = await _score_one_shot_identity(
+                shot, entry, product_photos, client, identity_extract
+            )
+            identity_check = identity_result.model_dump()
+            logger.info(
+                "Continuity Agent: shot %s identity_check same_object=%s confidence=%s",
+                shot_id, identity_check["same_object"], identity_check["confidence"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- an identity failure must not block drift or the batch
+            identity_check = {
+                "matching_features": [],
+                "mismatching_features": [],
+                "same_object": False,
+                "confidence": "low",
+            }
+            logger.error(
+                "Continuity Agent: identity check FAILED for shot %s (%s) -- "
+                "recording worst-case same_object=False so it is NOT silently "
+                "passed; it will flow into the Gate's hard-identity-failure path.",
+                shot_id, exc,
+            )
+
+        updated[shot_id] = {**entry, "drift_score": drift, "identity_check": identity_check}
         scored_records.append(
             {
                 "shot_id": shot_id,
                 "drift_score": drift,
                 "passed": drift <= DRIFT_THRESHOLD,
                 "attempt": shot.get("retry_count", 0),
+                "identity_check": identity_check,
             }
         )
 
@@ -418,6 +643,8 @@ async def continuity_agent_node(
 
 __all__ = [
     "DRIFT_THRESHOLD",
+    "IdentityCheckResult",
+    "extract_frame",
     "extract_midpoint_frame",
     "score_continuity",
     "continuity_agent_node",

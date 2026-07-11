@@ -101,6 +101,45 @@ agents/continuity_agent.py (the scorer defines the scale). MAX_AUTO_RETRIES is
 the local, env-overridable cap (§5.10's "retry_count < 2"), same
 flag-don't-hardcode-forever pattern as budget_gate.py's DEFAULT_JOB_BUDGET_CAP.
 
+HARD IDENTITY FAILURE (v8 fix -- Meta Quest -> "phone on a stand" wrong-object
+bug). `agents/continuity_agent.py` now writes a SECOND, independent verdict
+onto a scored clip's entry: `identity_check.same_object` (a categorical "is
+this even the same physical object class" check on an early frame, NOT a
+stricter threshold on `drift_score`'s continuous scale -- see that module's
+own docstring). `same_object == false` -- regardless of `confidence`, per the
+identity prompt's own "do not give the benefit of the doubt" instruction -- is
+treated as a HARD failure, routed by a SEPARATE, ADDITIVE decision layered
+BEFORE the existing drift-threshold branch below:
+  * 1st hard identity failure for a shot -> exactly ONE automatic retry (same
+    mechanism as an over-threshold drift auto-retry -- `status="pending"`,
+    `retry_count` incremented -- but NOT counted against `MAX_AUTO_RETRIES`,
+    and logged/traced distinctly for observability). A fresh sample can escape
+    a bad generation mode a drift-style retry would also fix, so it gets its
+    own one-shot budget rather than being folded into the drift retry cap.
+  * 2nd CONSECUTIVE hard identity failure for the same shot -> routes STRAIGHT
+    to `fallback_requested` (Ken-Burns), skipping both the remaining
+    `MAX_AUTO_RETRIES` budget and human review entirely -- two wrong-object
+    generations in a row means the prompt/reference combination itself is
+    unfixable by resampling, so burning the normal retry/review budget
+    chasing it would just delay an inevitable fallback.
+  * A CONSECUTIVE-failure streak is tracked via `IDENTITY_HARD_FAIL_STREAK_KEY`,
+    an extra, undeclared key written directly onto the Shot dict (not a C1
+    schema field -- `graph.shot_schema.validate_shot_list`'s `extra="forbid"`
+    Pydantic gate only ever runs ONCE, in `agents/shot_list_agent.py`'s own
+    assembly step, before a shot ever reaches this node; every downstream
+    node's `{**shot, ...}` spread already preserves arbitrary extra keys
+    unvalidated, exactly the same "costs nothing" posture video_gen_node.py's
+    "KNOWN DEPARTURES" #3 already established for GeneratedShot's
+    resolution_used/duration_sec_used/budget_clamped). It resets to 0 the
+    moment a pass's identity check comes back `same_object=true` again, so a
+    much LATER, unrelated hard failure is never mistaken for a second
+    consecutive one.
+  * A shot that never hard-fails identity (the overwhelming common case: no
+    `identity_check` on the entry, or `same_object=true`) falls straight
+    through to the existing drift-threshold branch below, completely
+    untouched by any of this -- this is why every pre-existing drift/retry/
+    interrupt test in this suite needed zero changes for this fix.
+
 THE RETRY CYCLE (wired in graph/build.py). After this node,
 `route_after_continuity_gate` sends the run back to `video_gen` iff any shot
 still needs a pass -- "pending" (an auto-retry or a human retry_with_edit) OR
@@ -149,6 +188,15 @@ REVIEW_STATUS = "review"
 # accepted, and if the clip were ever regenerated its entry (and this marker) is
 # overwritten, correctly forcing a fresh decision.
 CONTINUITY_APPROVED_KEY = "continuity_approved"
+
+# v8 fix: extra, undeclared Shot key tracking CONSECUTIVE same_object=false
+# identity verdicts for a given shot across regeneration passes -- see module
+# docstring's "HARD IDENTITY FAILURE" section for why this is safe (Shot is
+# never re-validated after agents/shot_list_agent.py's own assembly step) and
+# why it must exist (a fresh GeneratedShot entry carries no memory of a prior
+# pass's identity_check once the clip is regenerated, so the Shot itself is the
+# only place a cross-pass streak can live without a C1 schema change).
+IDENTITY_HARD_FAIL_STREAK_KEY = "identity_hard_fail_streak"
 
 # Resume-value resolutions -- mirror HumanReviewEntry.resolution's Literal.
 RESOLUTION_APPROVE = "approve"
@@ -221,6 +269,8 @@ async def continuity_gate_node(
     n_retry = 0
     n_review = 0
     n_within = 0
+    n_identity_retry = 0
+    n_identity_fallback = 0
 
     for shot in shots:
         shot_id = shot["shot_id"]
@@ -240,6 +290,44 @@ async def continuity_gate_node(
             n_within += 1
             continue
 
+        # v8 fix -- HARD IDENTITY FAILURE, a separate, categorical check ahead of
+        # the continuous drift-threshold decision below (see module docstring).
+        identity = entry.get("identity_check")
+        if identity and identity.get("same_object") is True and shot.get(IDENTITY_HARD_FAIL_STREAK_KEY):
+            # A genuine same_object=true clears any stale streak from an earlier
+            # round so a much LATER, unrelated hard failure is never mistaken
+            # for a second consecutive one.
+            shot = {**shot, IDENTITY_HARD_FAIL_STREAK_KEY: 0}
+
+        if identity and identity.get("same_object") is False:
+            streak = shot.get(IDENTITY_HARD_FAIL_STREAK_KEY, 0) + 1
+            if streak >= 2:
+                updated_shots.append(
+                    {**shot, "status": FALLBACK_REQUESTED_STATUS, IDENTITY_HARD_FAIL_STREAK_KEY: streak}
+                )
+                n_identity_fallback += 1
+                logger.warning(
+                    "Continuity Gate: shot %s failed the IDENTITY check TWICE in a "
+                    "row (same_object=false, confidence=%s) -- routing straight to "
+                    "Ken-Burns fallback instead of exhausting the normal drift "
+                    "retry/review budget on an unfixable prompt/reference combo.",
+                    shot_id, identity.get("confidence"),
+                )
+            else:
+                updated_shots.append(
+                    {**shot, "status": PENDING_STATUS, "retry_count": shot.get("retry_count", 0) + 1,
+                     IDENTITY_HARD_FAIL_STREAK_KEY: streak}
+                )
+                n_identity_retry += 1
+                logger.warning(
+                    "Continuity Gate: shot %s failed the IDENTITY check (same_object="
+                    "false, confidence=%s) -- distinct from a normal drift retry: one "
+                    "automatic re-sample allowed (not counted against MAX_AUTO_RETRIES) "
+                    "-> pending.",
+                    shot_id, identity.get("confidence"),
+                )
+            continue
+
         drift = float(entry["drift_score"])
         if drift <= DRIFT_THRESHOLD:
             updated_shots.append(shot)  # within threshold -- leave passed
@@ -248,7 +336,8 @@ async def continuity_gate_node(
 
         retry_count = shot.get("retry_count", 0)
         if retry_count < MAX_AUTO_RETRIES:
-            # Automatic capped retry -- the ONLY place retry_count is incremented.
+            # Automatic capped drift retry (the hard-identity-failure branch
+            # above is this node's only OTHER retry_count-incrementing path).
             updated_shots.append({**shot, "status": PENDING_STATUS, "retry_count": retry_count + 1})
             n_retry += 1
             logger.info(
@@ -298,7 +387,10 @@ async def continuity_gate_node(
 
     trace_note = (
         f"\n[continuity_gate] {n_within} shot(s) within drift threshold; "
-        f"{n_retry} auto-retried; {n_review} sent to human review."
+        f"{n_retry} auto-retried; {n_review} sent to human review; "
+        f"{n_identity_retry} auto-retried for a HARD IDENTITY failure; "
+        f"{n_identity_fallback} routed straight to Ken-Burns after a second "
+        "consecutive identity failure."
     )
     return {
         "shot_list": updated_shots,
@@ -349,6 +441,7 @@ def route_after_continuity_gate(state: ProductCutState) -> str:
 __all__ = [
     "MAX_AUTO_RETRIES",
     "CONTINUITY_APPROVED_KEY",
+    "IDENTITY_HARD_FAIL_STREAK_KEY",
     "RESOLUTION_APPROVE",
     "RESOLUTION_RETRY_WITH_EDIT",
     "RESOLUTION_ACCEPT_FALLBACK",

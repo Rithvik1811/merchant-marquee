@@ -63,9 +63,19 @@ from langchain_core.runnables import RunnableConfig
 # routine — §5.7 step 4 explicitly calls for a second use of this exact function.
 from agents.meta_critic import _waterfill
 # Reuse the Shot-List Agent's own constants so they cannot silently drift: the
-# 3-7 shot contract's floor (MIN_SHOTS) and the per-shot minimum duration that
-# defines the cheapest-possible 720p render (§5.6).
-from agents.shot_list_agent import MIN_SHOTS, MIN_SHOT_DURATION_SEC
+# 3-7 shot contract's floor (MIN_SHOTS), the per-shot minimum duration that
+# defines the cheapest-possible 720p render (§5.6), and the structural hero-
+# identification predicate -- see `_shot_floor_cost` below for why the hero
+# needs its OWN floor rather than the flat per-shot FLOOR_COST. NOTE: this
+# module deliberately does NOT import HERO_SHOT_MIN_DURATION_SEC (anymore) --
+# the Backstory-First fix (video-gen-fidelity, 2026-07-11) made the hero
+# floor derive from each shot's own (already target-length-scaled)
+# duration_sec instead of that flat constant; see `_shot_floor_cost`.
+from agents.shot_list_agent import (
+    MIN_SHOTS,
+    MIN_SHOT_DURATION_SEC,
+    is_hero_shot,
+)
 from graph.state import BudgetLedger, ProductCutState, ProductTruth, Shot
 
 logger = logging.getLogger("productcut.agents.budget_gate")
@@ -93,9 +103,13 @@ DEFAULT_JOB_BUDGET_CAP = float(os.getenv("DEFAULT_JOB_BUDGET_CAP", "2.00"))
 # matter — the allocation is normalized to the cap regardless of absolute scale.
 #
 # w_role favors attention (hook) and conversion (cta); w_type favors the
-# specificity-carriers (macro_detail / hook_hero); truth_bonus rewards a shot
-# that cites a truth in one of the four "specific" categories — the facts that
-# make the product SPECIFIC rather than generic, which is the whole point.
+# specificity-carriers (macro_detail / hook_hero) AND, since the video-gen-
+# fidelity creative-direction redesign, human-interaction shots
+# (product_in_hand / worn_in_use) comparably — a real person using the product
+# is now a deliberate, load-bearing part of the ad's story, not an afterthought
+# the original research pass treated as generic filler; truth_bonus rewards a
+# shot that cites a truth in one of the four "specific" categories — the facts
+# that make the product SPECIFIC rather than generic, which is the whole point.
 W_ROLE: dict[str, float] = {
     "hook": 1.20,     # opening attention — the scarcest resource
     "cta": 1.20,      # the conversion ask
@@ -111,11 +125,35 @@ W_TYPE: dict[str, float] = {
     # is usually a meaningful demo/proof composition (a real human-interaction
     # shot), not the extreme close-up macro_detail is. Reasoned default, tune later.
     "product_in_hand": 1.15,
+    # worn_in_use is the video-gen-fidelity redesign's C3 v4 addition (the wider,
+    # person-in-motion human-interaction composition) — weighted identically to
+    # product_in_hand, deliberately, not left to the 1.0 unknown-type fallback:
+    # both are the human-story payoff shot the redesign exists to protect, they
+    # just differ in framing/motion, not in narrative value.
+    "worn_in_use": 1.15,
     "cta_endcard": 1.10,        # the closing card
     "hero_reframe": 1.00,       # baseline
-    "lifestyle_context": 0.90,  # the generic establishing/context shot
+    # Raised from the pre-redesign 0.90 ("the generic establishing/context
+    # shot" — a framing that predates the video-gen-fidelity creative-direction
+    # redesign and is now outdated: lifestyle_context is a real narrative
+    # composition, not filler). 1.10 sits between hero_reframe's 1.00 baseline
+    # and product_in_hand/worn_in_use's 1.15 — competitive with the rest of the
+    # table rather than the table's structural bottom, which previously made a
+    # human/lifestyle shot the first thing cut under a tight cap regardless of
+    # how load-bearing it was to the story.
+    "lifestyle_context": 1.10,
 }
 TRUTH_BONUS = 1.10  # applied when the cited truth is one of the "specific" categories below
+
+# Shot-type composition set naming the human-interaction shots the reduce path
+# below protects from being the first thing cut under a tight cap (§5.7 reduce,
+# extended for the video-gen-fidelity redesign). MUST exactly match
+# agents/video_gen_node.py's own `_HUMAN_INTERACTION_SHOT_TYPES` — kept as a
+# separate local constant rather than imported, since video_gen_node.py already
+# imports RATE_720P/RATE_1080P FROM this module, and importing back the other
+# direction would create a circular dependency. If this set changes, update
+# that one too.
+HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
 
 # The four ProductTruth categories that make a product SPECIFIC, not generic —
 # the facts you cannot guess without actually looking at the photos (§5.7).
@@ -162,9 +200,98 @@ def _shot_weight(shot: Shot, truths_by_id: dict[str, ProductTruth]) -> float:
     return role_w * type_w * truth_w
 
 
+def _shot_floor_cost(shot: Shot) -> float:
+    """Per-shot floor for the waterfill window's lower bound AND for the §5.7
+    floor case's `final_alloc = list(lo)` (video-gen-fidelity story-arc fix).
+
+    FLOOR_COST (MIN_SHOT_DURATION_SEC @ 720p, ~3s) is the right floor for
+    every ORDINARY shot. It is the WRONG floor for the hero shot (see
+    agents/shot_list_agent.py's HERO SHOT mechanism note, `is_hero_shot`):
+    that constant assumes a render length no hero shot is ever clamped to, so
+    using it as the hero's floor would let the §5.7 floor case (cap can't fit
+    even at floor -> every shot pinned to its floor) silently clamp a
+    15s-planned hero shot down to a ~3s render -- defeating the entire reason
+    the extended duration ceiling exists, exactly the "silently clamped back
+    down" failure mode this fix was asked to prevent (see
+    agents/video_gen_node.py's `_resolve_generation_params`, which derives the
+    ACTUAL generated duration from allocated_budget / RATE_720P -- an
+    under-floored hero would generate at a few seconds regardless of what
+    shot_list_agent.py planned).
+
+    The hero's floor is THIS SHOT's own `duration_sec` @ 720p -- NOT the flat
+    HERO_SHOT_MIN_DURATION_SEC constant (Backstory-First fix,
+    video-gen-fidelity, 2026-07-11). The hero window itself now SCALES to the
+    ad's target length (`agents.shot_list_agent._scaled_hero_window`) -- a
+    15s-target ad's hero can be clamped to ~5-7.5s, well under the flat 10s
+    constant. Using that flat constant as the floor would then set floor
+    ($0.80 @ 10s*720p) ABOVE the ceiling (`duration_sec * RATE_1080P`, e.g.
+    $0.60 @ 5s*1080p) -- an inverted, infeasible window on every 15s-target
+    ad. Deriving the floor from the shot's own (already target-scaled)
+    duration_sec instead guarantees floor < ceiling always (RATE_720P <
+    RATE_1080P on the same duration basis) at ANY target ad length, while
+    still being "the cheapest resolution tier for what this hero was actually
+    planned to render" -- the same semantics the flat constant approximated
+    for the 30s case it was originally sized for.
+    """
+    if is_hero_shot(shot):
+        return shot["duration_sec"] * RATE_720P
+    return FLOOR_COST
+
+
 def _argmin(values: list[float]) -> int:
     """Index of the smallest value (first on ties → fully deterministic)."""
     return min(range(len(values)), key=lambda i: values[i])
+
+
+def _choose_drop_index(working: list[Shot], weights: list[float]) -> int:
+    """Pick which shot the deterministic cut-only reduce (§5.7) removes next.
+
+    Normally this is just the lowest-weight shot (`_argmin`). But the
+    video-gen-fidelity creative-direction redesign added a deliberate priority
+    override: if the lowest-weight shot is the SOLE remaining human-interaction
+    shot (`HUMAN_INTERACTION_SHOT_TYPES` — product_in_hand / worn_in_use) in
+    `working`, cutting it would silently erase the ad's entire human-usage
+    story beat. This is not hypothetical — a real live pipeline run caught
+    exactly this: the human-usage shot was the cheapest-weighted survivor and
+    got cut first under the default $2.00 cap, even though the Shot-List
+    Agent had correctly written it and the affordance rubric had correctly
+    motivated it. Re-weighting `lifestyle_context`/`worn_in_use` upward (see
+    W_TYPE above) reduces how OFTEN this happens, but does not guarantee it —
+    a cheap short duration or a `problem`/`demo` beat_role can still leave a
+    human shot the argmin under a tight enough cap, so this is a real,
+    deterministic floor protection, not just a weighting nudge. Mirrors the
+    existing MIN_SHOTS floor protection's spirit (never let a mechanical cut
+    silently erase something structurally load-bearing) without touching that
+    floor logic at all — this only changes WHICH shot gets cut, never whether
+    one does, and never overrides the MIN_SHOTS floor case itself.
+
+    If the argmin shot is NOT the sole human-interaction shot in `working`
+    (there is another one left, or it isn't human-interaction-typed at all),
+    behavior is exactly the pre-existing plain argmin — no regression for the
+    common case.
+
+    Pathological edge case: if EVERY remaining shot in `working` is human-
+    interaction-typed, there is no non-human shot to redirect the cut to.
+    Falls through to plain argmin rather than refuse to reduce or hang — a cut
+    still has to happen for the cap to ever be met above the MIN_SHOTS floor,
+    and this case is rare/pathological (it needs almost the whole shot list to
+    already be human-interaction-typed), not a scenario worth blocking on.
+    """
+    drop_index = _argmin(weights)
+    if working[drop_index].get("shot_type") not in HUMAN_INTERACTION_SHOT_TYPES:
+        return drop_index
+
+    human_indices = [
+        i for i, s in enumerate(working) if s.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES
+    ]
+    if len(human_indices) > 1:
+        return drop_index  # another human-interaction shot survives either way
+
+    non_human_indices = [i for i in range(len(working)) if i not in human_indices]
+    if not non_human_indices:
+        return drop_index  # pathological: nothing non-human left to redirect to
+
+    return min(non_human_indices, key=lambda i: weights[i])
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +307,11 @@ def allocate_budget(
     For each shot: `base_i = duration_sec_i × RATE_720P`, `w_i = _shot_weight(shot)`,
     and a proportional target normalized to the cap `alloc_i = (base_i·w_i)·(cap/Σ)`.
     Targets are then clamped to each shot's feasible window
-    `[FLOOR_COST, duration_sec_i × RATE_1080P]` and the clamping remainder is
-    redistributed by the reused `_waterfill()` routine.
+    `[_shot_floor_cost(shot), duration_sec_i × RATE_1080P]` (FLOOR_COST for an
+    ordinary shot; this shot's own duration_sec @ 720p for the hero shot --
+    video-gen-fidelity story-arc fix, see `_shot_floor_cost`'s own docstring)
+    and the clamping remainder is redistributed by the reused `_waterfill()`
+    routine.
 
     Over-cap reduce path (deterministic, cut-only — §5.7): if `_waterfill` reports
     the cap cannot be met inside every window, the single LOWEST-WEIGHT shot is cut
@@ -189,6 +319,15 @@ def allocate_budget(
     hook/cta carry the highest role weight, the lowest-weight argmin is never the
     hook/cta/top-weighted shot — the §5.7 "never cut the hook/cta/top proof"
     protection falls out of the weighting for free.
+
+    Human-interaction protection (video-gen-fidelity redesign, see
+    `_choose_drop_index`): WHICH shot the argmin picks is further overridden
+    when it would cut the SOLE remaining human-interaction shot
+    (product_in_hand / worn_in_use) — the next-lowest-weight NON-human shot is
+    cut instead. This is a real, deliberate priority override discovered from a
+    real live pipeline run (the human-usage story beat was consistently the
+    cheapest survivor and got cut first under the default cap), not merely a
+    side-effect of the W_TYPE re-weighting above.
 
     Floor case (§5.7 step 4): once the list is down to MIN_SHOTS (3) and the cap
     STILL cannot fit, there is nothing left to cut without breaking the 3-shot
@@ -237,7 +376,11 @@ def allocate_budget(
         else:  # defensive — durations>0 and weights>0 make this unreachable in practice
             targets = [cap / n] * n
 
-        lo = [FLOOR_COST] * n                          # constant floor: 3s @ 720p
+        # Per-shot floor (video-gen-fidelity story-arc fix): FLOOR_COST for
+        # every ordinary shot, this shot's own duration_sec @ 720p for the
+        # hero -- see `_shot_floor_cost`'s own docstring for why a flat floor
+        # would silently starve a hero shot's real generation duration.
+        lo = [_shot_floor_cost(s) for s in working]
         hi = [s["duration_sec"] * RATE_1080P for s in working]  # ceiling: THIS shot @ 1080p
 
         allocations, infeasible = _waterfill(targets, list(zip(lo, hi)), cap)
@@ -266,7 +409,9 @@ def allocate_budget(
         # Deterministic cut-only reduce (§5.7): drop the single lowest-weight shot
         # and retry the whole computation from scratch on the smaller list. No LLM,
         # no Shot-List re-invocation — a plain removal of already-validated content.
-        drop_index = _argmin(weights)
+        # `_choose_drop_index` (not plain `_argmin`) additionally protects the sole
+        # remaining human-interaction shot from being that cut — see its docstring.
+        drop_index = _choose_drop_index(working, weights)
         dropped = working.pop(drop_index)
         logger.info(
             "Budget Gate: over cap with %d shots — cutting lowest-weight shot %s "
@@ -376,6 +521,7 @@ __all__ = [
     "W_TYPE",
     "TRUTH_BONUS",
     "SPECIFIC_TRUTH_CATEGORIES",
+    "HUMAN_INTERACTION_SHOT_TYPES",
     "BudgetResult",
     "allocate_budget",
     "budget_gate_node",

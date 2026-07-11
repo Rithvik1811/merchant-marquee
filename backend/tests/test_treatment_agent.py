@@ -18,7 +18,13 @@ import json
 
 import pytest
 
-from agents.treatment_agent import _FALLBACK_VISUAL_APPROACH, _FALLBACK_WHY_NOT_GENERIC, generate_treatment
+from agents.treatment_agent import (
+    _FALLBACK_VISUAL_APPROACH,
+    _FALLBACK_WHY_NOT_GENERIC,
+    _build_system_prompt,
+    _script_implies_person,
+    generate_treatment,
+)
 from tests._fakes import FakeOpenAIClient
 
 WINNING_SCRIPT = {
@@ -167,3 +173,83 @@ async def test_degrades_to_literal_fallback_when_still_invalid_after_retry(caplo
     assert fallback_beat["truth_fact_id"] == "t1"  # first available truth, deterministic
     assert fallback_beat["beat_function"] == "cta"  # last beat -> deterministic default
     assert any("falling back to the literal lowest-risk treatment" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CHARACTER ANCHOR (v10, graph/state.py Treatment.character_anchor).
+# ---------------------------------------------------------------------------
+
+SCRIPT_WITH_IMPLIED_PERSON = {
+    "text": "She slings it over one shoulder on her way out the door. Double-wall seam keeps it hot. Grab yours today.",
+    "beats": [
+        {"t_start": 0, "t_end": 3, "line": "She slings it over one shoulder on her way out the door."},
+        {"t_start": 3, "t_end": 9, "line": "Double-wall seam keeps it hot."},
+        {"t_start": 9, "t_end": 15, "line": "Grab yours today."},
+    ],
+    "source_variant_ids": ["v1"],
+}
+
+IMPLIED_PERSON_BEAT_TREATMENTS = [
+    _beat_treatment(0, "hook", "She slings it over one shoulder on her way out the door."),
+    _beat_treatment(1, "demo", "Double-wall seam keeps it hot."),
+    _beat_treatment(2, "cta", "Grab yours today."),
+]
+
+
+def test_script_implies_person_detects_pronoun():
+    assert _script_implies_person(SCRIPT_WITH_IMPLIED_PERSON) is True
+
+
+def test_script_implies_person_false_for_product_only_script():
+    assert _script_implies_person(WINNING_SCRIPT) is False
+
+
+def test_system_prompt_requests_character_anchor_when_person_implied():
+    prompt = _build_system_prompt(3, implies_person=True)
+
+    assert "character_anchor" in prompt
+    assert "hair color, length, and texture" in prompt
+    assert "color_story" in prompt
+
+
+def test_system_prompt_omits_character_anchor_field_when_no_person():
+    prompt = _build_system_prompt(3, implies_person=False)
+
+    assert "does not\n   imply a recurring person" in prompt or "does not imply a recurring person" in prompt
+
+
+@pytest.mark.asyncio
+async def test_character_anchor_set_when_script_implies_person():
+    payload = _payload(IMPLIED_PERSON_BEAT_TREATMENTS, character_anchor=(
+        "A woman in her late 20s with shoulder-length dark hair wears a "
+        "rust-orange canvas jacket in a sunlit kitchen with an open window "
+        "and a wooden counter, mid-morning."
+    ))
+    client = FakeOpenAIClient([payload])
+
+    treatment = await generate_treatment(SCRIPT_WITH_IMPLIED_PERSON, TRUTHS, client=client)
+
+    assert treatment.get("character_anchor", "").startswith("A woman in her late 20s")
+
+
+@pytest.mark.asyncio
+async def test_character_anchor_absent_when_script_has_no_person():
+    client = FakeOpenAIClient([_payload(GOOD_BEAT_TREATMENTS)])
+
+    treatment = await generate_treatment(WINNING_SCRIPT, TRUTHS, client=client)
+
+    assert not treatment.get("character_anchor")
+
+
+@pytest.mark.asyncio
+async def test_fabricated_character_anchor_is_discarded_on_product_only_script(caplog):
+    # Model returns a character_anchor anyway even though the script never
+    # implies a person -- the deterministic guard must strip it.
+    payload = _payload(GOOD_BEAT_TREATMENTS, character_anchor="A man in a blue jacket in a garage.")
+    client = FakeOpenAIClient([payload])
+
+    with caplog.at_level("INFO"):
+        treatment = await generate_treatment(WINNING_SCRIPT, TRUTHS, client=client)
+
+    assert not treatment.get("character_anchor")
+    assert any("discarding it" in r.message for r in caplog.records)

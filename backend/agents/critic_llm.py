@@ -61,7 +61,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 import httpx
 from openai import (
@@ -150,6 +150,17 @@ _TRANSIENT_ERRORS = (
     RateLimitError,       # 429
     InternalServerError,  # 5xx
     _EmptyStreamContent,  # stream finished with zero content (soft empty response)
+    # A live full-pipeline run (video-gen-fidelity branch) found the OpenAI SDK does
+    # NOT wrap a connection drop that happens mid-STREAM (inside the `for chunk in
+    # stream` loop below) into APIConnectionError -- the raw httpx exception propagates
+    # unwrapped, so without these explicitly listed a single dropped packet on an
+    # otherwise-healthy connection killed the whole node with ZERO retries. Same fix
+    # applied to agents/_retry.py's create_completion() for the same reason.
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
 )
 
 
@@ -211,6 +222,29 @@ def _create_with_retry(client: OpenAI, **kwargs) -> str:
     return content
 
 
+def _parse_json_content(content: str, model_id: str) -> dict:
+    """Parse a non-empty Qwen response string into a JSON object, or raise
+    QwenJSONError. Factored out of `call_qwen_json` so `call_qwen_json_validated`
+    (below) reuses the identical non-JSON / not-an-object content-failure
+    handling instead of duplicating it -- the empty-stream case is handled one
+    layer up (inside `_create_with_retry` / its caller), so this only ever sees
+    a genuinely non-empty string.
+    """
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.error("Qwen returned non-JSON content: %r", content[:500])
+        raise QwenJSONError(
+            f"Model {model_id} did not return valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise QwenJSONError(
+            f"Model {model_id} returned a JSON {type(parsed).__name__}, expected an object."
+        )
+    return parsed
+
+
 def call_qwen_json(
     system_prompt: str,
     user_prompt: str,
@@ -239,6 +273,15 @@ def call_qwen_json(
                        response that survived 3 attempts is a genuine failure worth
                        surfacing clearly, not silently swallowing).
         Exception:     the underlying OpenAI/transport error, after 3 attempts.
+
+    NOTE: this function has NO retry path for a VALIDATION/content failure (a
+    well-formed JSON object that fails the caller's OWN schema check downstream,
+    after this function has already returned) -- it only retries TRANSPORT
+    failures (via `_create_with_retry`) and the soft-empty-stream case. A caller
+    that Pydantic-validates the returned dict with no retry of its own has zero
+    protection against one-off LLM phrasing variance (e.g. a field named
+    slightly differently than the schema expects) killing the whole run. See
+    `call_qwen_json_validated` below for the shared fix.
     """
     model_id = model or os.getenv("MODEL_TEXT", "qwen3.7-plus")
     client = _client()
@@ -261,19 +304,124 @@ def call_qwen_json(
         raise QwenJSONError(
             f"Model {model_id} returned no content after 3 attempts: {exc}"
         ) from exc
-    try:
-        parsed = json.loads(content)
-    except (json.JSONDecodeError, TypeError) as exc:
-        logger.error("Qwen returned non-JSON content: %r", content[:500])
-        raise QwenJSONError(
-            f"Model {model_id} did not return valid JSON: {exc}"
-        ) from exc
-
-    if not isinstance(parsed, dict):
-        raise QwenJSONError(
-            f"Model {model_id} returned a JSON {type(parsed).__name__}, expected an object."
-        )
-    return parsed
+    return _parse_json_content(content, model_id)
 
 
-__all__ = ["call_qwen_json", "QwenJSONError"]
+T = TypeVar("T")
+
+
+def call_qwen_json_validated(
+    system_prompt: str,
+    user_prompt: str,
+    validate_fn: Callable[[dict], T],
+    *,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_attempts: int = 2,
+) -> T:
+    """Call the Qwen text model, then run `validate_fn` on the parsed JSON, with a
+    bounded re-prompt on a VALIDATION (content) failure.
+
+    Why this exists (a real production incident, not a speculative gap): every
+    LLM-backed Critic Chain checker that routes through `call_qwen_json` directly
+    (Body-Checker §5.4.3, CTA-/Tone-Checker §5.4.4/5.4.5, Meta-Critic §5.4.6 --
+    Hook-Checker is NOT one of these; it already has its own bounded re-prompt
+    loop via `agents._retry.create_completion`) Pydantic-validates the raw JSON
+    with `extra="forbid"` and had NO retry path at all. A real live
+    full-pipeline run hit exactly this: the model returned `redundant_pairs`
+    instead of the expected `redundant_beat_pairs` in Body-Checker's output --
+    one-off phrasing variance no different in kind from every OTHER content
+    failure this codebase already retries once elsewhere (Product Truth
+    Extractor's too-few-valid-facts re-prompt, Concept/Treatment/Shot-List
+    Agent's per-field re-prompt, Hook-Checker's own retry_text/retry_parsed
+    loop) -- and it killed the entire graph run with zero retry, because
+    `call_qwen_json` alone only retries TRANSPORT failures (see its own
+    docstring), never content/validation ones. This closes that gap for the
+    four checkers that had it, as ONE shared policy here (this module's own
+    stated reason for existing: "rather than have each checker re-implement
+    ... this module centralises that one pattern") instead of four hand-rolled
+    copies.
+
+    `validate_fn` is deliberately a caller-supplied closure, not a fixed
+    signature: each checker's real validation shape differs (Body-Checker
+    validates a LIST of per-variant results into a dict; Meta-Critic validates
+    ONE flat object plus cross-checks against a survivor-id set) -- forcing one
+    call signature across all of them would fit worse than letting each caller
+    close over its own `expected`/`survivor_ids`/etc. and hand in
+    `lambda raw: existing_validate_fn(raw, ...)`.
+
+    On `validate_fn` raising `ValueError` (the exception type every checker's
+    own validation function already raises here -- confirmed against
+    `body_checker._validate_results`, `cta_tone_checkers._validate_results`, and
+    `meta_critic._validate_llm_output`, all of which wrap the underlying
+    `pydantic.ValidationError` in a `ValueError` carrying a human-readable
+    message), this re-invokes the model with the ORIGINAL conversation plus the
+    exact error message appended as a follow-up user turn -- the same "echo the
+    assistant's raw reply, then name the exact violation, then ask for the full
+    corrected JSON" shape as `product_truth_extractor.py`'s `_reprompt_message`
+    / `hook_checker.py`'s own retry_text/retry_parsed loop -- up to
+    `max_attempts` total calls. Raises the LAST `ValueError`, unmodified and
+    un-swallowed, if still failing after the bound is exhausted -- surfacing a
+    genuine, persistent content failure clearly rather than hanging or silently
+    degrading (this codebase's stated posture everywhere else a bounded retry
+    exists).
+
+    A DIFFERENT exception type from `validate_fn` (anything not a `ValueError`)
+    is NOT retried and propagates immediately -- deliberately narrow, matching
+    every other re-prompt loop in this codebase (they only catch the specific
+    content-failure type their own validator raises, not exceptions generally).
+    """
+    if max_attempts < 1:
+        raise ValueError("call_qwen_json_validated: max_attempts must be >= 1")
+
+    model_id = model or os.getenv("MODEL_TEXT", "qwen3.7-plus")
+    client = _client()
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    last_error: Optional[ValueError] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            content = _create_with_retry(
+                client,
+                model=model_id,
+                messages=messages,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+        except _EmptyStreamContent as exc:
+            logger.error("Qwen returned empty content after all retries")
+            raise QwenJSONError(
+                f"Model {model_id} returned no content after 3 attempts: {exc}"
+            ) from exc
+
+        parsed = _parse_json_content(content, model_id)
+
+        try:
+            return validate_fn(parsed)
+        except ValueError as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            logger.warning(
+                "critic_llm: validation failed on attempt %d/%d -- re-prompting once: %s",
+                attempt, max_attempts, exc,
+            )
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response failed validation:\n"
+                    f"{exc}\n\n"
+                    "Fix ONLY this problem and return the full corrected JSON "
+                    "object in the exact same shape as instructed above."
+                ),
+            })
+
+    assert last_error is not None  # loop always sets this before falling through
+    raise last_error
+
+
+__all__ = ["call_qwen_json", "call_qwen_json_validated", "QwenJSONError"]

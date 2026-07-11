@@ -44,7 +44,12 @@ from agents.budget_gate import RATE_1080P
 from agents.video_gen_node import FALLBACK_REQUESTED_STATUS, SUCCESS_STATUS
 from graph.build import build_graph
 from tests._fakes import make_content_routed_sync_openai, make_fake_async_openai
-from tests._phase3_graph import patch_continuity_boundaries, patch_phase3_boundaries
+from tests._phase3_graph import (
+    patch_assembly_boundaries,
+    patch_continuity_boundaries,
+    patch_phase3_boundaries,
+    patch_voiceover_boundaries,
+)
 from tests.test_graph_build import (
     CHECKER_ROUTES,
     CONCEPT_AGENT_PAYLOAD,
@@ -90,6 +95,8 @@ async def test_full_pipeline_ingest_through_ken_burns_fallback(monkeypatch):
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=False)
     patch_continuity_boundaries(monkeypatch)  # Phase 4 (§5.10): clean drift, no retry loop
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
 
     graph = await build_graph()
     initial_state = {
@@ -117,6 +124,8 @@ async def test_full_pipeline_ingest_through_ken_burns_fallback(monkeypatch):
         "budget_updated",
         "shot_generated",
         "drift_scored",  # Phase 4: Continuity Agent scored every real clip
+        "vo_ready",  # Phase 5: Voiceover + Caption Agent's parallel branch
+        "master_cut_ready",  # Phase 5: Assembly Agent's fan-in join
     }, event_names
 
     values = (await graph.aget_state(config)).values
@@ -174,6 +183,28 @@ async def test_full_pipeline_ingest_through_ken_burns_fallback(monkeypatch):
     assert "persisted 3 to OSS" in values["reasoning_trace"]
     assert "[ken_burns_fallback]" in values["reasoning_trace"]
 
+    # --- Phase 5: Voiceover + Caption Agent ran as a genuine parallel branch
+    # off merge_validator, alongside treatment_agent -- not blocked by it, and
+    # its own dedicated trace key landed in final state without corrupting the
+    # treatment_agent-and-onward reasoning_trace chain above (the whole reason
+    # it's a separate key -- see graph/state.py's v7 changelog).
+    voiceover = values["voiceover"]
+    assert voiceover["audio_uri"].startswith("http://oss.example.com/jobs/test-job-e2e/")
+    assert voiceover["caption_track_uri"].startswith("http://oss.example.com/jobs/test-job-e2e/")
+    assert "[voiceover_caption_agent]" in values["voiceover_reasoning_trace"]
+    vo_event = next(e for e in custom_events if e["name"] == "vo_ready")
+    assert vo_event["data"]["caption_count"] == len(winning["beats"])
+    assert vo_event["data"]["degraded"] is False
+
+    # --- Phase 5: Assembly Agent is the fan-in join of the voiceover branch
+    # and the continuity retry loop (here a trivial single-pass loop) -- both
+    # state["master_cut_uri"] and the master_cut_ready event reflect the fake
+    # injected via patch_assembly_boundaries.
+    assert values["master_cut_uri"] == f"http://oss.example.com/jobs/test-job-e2e/master_cut.mp4"
+    master_cut_event = next(e for e in custom_events if e["name"] == "master_cut_ready")
+    assert master_cut_event["data"]["uri"] == values["master_cut_uri"]
+    assert master_cut_event["data"]["shot_count"] == len(shot_list)
+
     # --- shot_generated events: one per shot, all real (is_fallback=False) ----
     shot_events = [e for e in custom_events if e["name"] == "shot_generated"]
     assert len(shot_events) == len(shot_list)
@@ -211,6 +242,8 @@ async def test_full_pipeline_video_gen_failure_routes_to_ken_burns_without_block
     )
     patch_phase3_boundaries(monkeypatch, fail_shot_s2=True)
     patch_continuity_boundaries(monkeypatch)  # Phase 4 (§5.10): clean drift, no retry loop
+    patch_voiceover_boundaries(monkeypatch)  # Phase 5: parallel branch off merge_validator
+    patch_assembly_boundaries(monkeypatch)  # Phase 5: fan-in join off voiceover + continuity_gate
 
     graph = await build_graph()
     initial_state = {

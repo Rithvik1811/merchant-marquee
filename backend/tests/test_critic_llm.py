@@ -26,7 +26,12 @@ import httpx
 import pytest
 
 from agents import critic_llm
-from agents.critic_llm import QwenJSONError, _EmptyStreamContent, call_qwen_json
+from agents.critic_llm import (
+    QwenJSONError,
+    _EmptyStreamContent,
+    call_qwen_json,
+    call_qwen_json_validated,
+)
 from tests._fakes import FakeSyncOpenAIClient, make_fake_sync_openai
 
 
@@ -179,3 +184,142 @@ def test_missing_api_key_raises_before_any_client(monkeypatch):
 
     with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
         call_qwen_json("system rubric", "user payload")
+
+
+# ===========================================================================
+# call_qwen_json_validated -- bounded retry-on-VALIDATION-failure (video-gen-
+# fidelity branch fix). Distinct from the transport/empty-stream retries above:
+# this is the "well-formed JSON that fails the caller's OWN schema check" case,
+# which `call_qwen_json` alone has zero protection against (see its own
+# docstring's NOTE, added alongside this fix).
+# ===========================================================================
+
+
+def _reject_once_then_accept():
+    """A validate_fn that raises ValueError on its first call and returns the
+    parsed dict unchanged on any call after -- simulates a one-off content
+    failure that a re-prompt actually fixes."""
+    calls = {"n": 0}
+
+    def _validate(parsed: dict) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("simulated validation failure: bad field name")
+        return parsed
+
+    return _validate
+
+
+def test_validated_happy_path_no_retry_when_validate_fn_passes_first_try(monkeypatch):
+    client = FakeSyncOpenAIClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _shared_client_factory(client))
+
+    result = call_qwen_json_validated(
+        "system rubric", "user payload", lambda parsed: parsed
+    )
+
+    assert result == {"ok": True}
+    assert client.call_count == 1, "validate_fn passed first try -- no re-prompt needed"
+
+
+def test_validated_retries_once_on_validation_error_and_recovers(monkeypatch):
+    client = FakeSyncOpenAIClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _shared_client_factory(client))
+
+    result = call_qwen_json_validated(
+        "system rubric", "user payload", _reject_once_then_accept()
+    )
+
+    assert result == {"ok": True}
+    assert client.call_count == 2, "one failed validation + one successful re-prompt call"
+
+
+class _RecordingSyncClient:
+    """Like FakeSyncOpenAIClient, but records every `messages` list it was
+    called with -- needed to assert on the actual re-prompt turn's content,
+    which the plain fake doesn't expose."""
+
+    def __init__(self, responses: list[str]):
+        self._responses = list(responses)
+        self.call_count = 0
+        self.seen_messages: list[list[dict]] = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, model: str, messages: list[dict], **_kwargs):
+        from tests._fakes import _FakeSyncStream
+
+        self.seen_messages.append(messages)
+        content = self._responses[min(self.call_count, len(self._responses) - 1)]
+        self.call_count += 1
+        return _FakeSyncStream(content)
+
+
+def test_validated_reprompt_message_names_the_exact_error(monkeypatch):
+    """The re-prompt turn sent back to the model must name the exact error, not
+    a generic 'try again' -- mirroring product_truth_extractor.py's
+    _reprompt_message / hook_checker.py's retry pattern -- and must carry the
+    original assistant reply forward as real conversation history, not just a
+    fresh one-shot prompt."""
+    client = _RecordingSyncClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", lambda *a, **k: client)
+
+    call_qwen_json_validated("system rubric", "user payload", _reject_once_then_accept())
+
+    assert client.call_count == 2
+    second_call_messages = client.seen_messages[1]
+    assert len(second_call_messages) == 4, "system, user, assistant(raw reply), user(error) turns"
+    assert second_call_messages[0]["role"] == "system"
+    assert second_call_messages[1]["role"] == "user"
+    assert second_call_messages[2]["role"] == "assistant"
+    assert second_call_messages[3]["role"] == "user"
+    assert "bad field name" in second_call_messages[3]["content"], (
+        "the re-prompt must name the EXACT validation error, not a generic retry message"
+    )
+
+
+def test_validated_raises_clearly_after_max_attempts_exhausted(monkeypatch):
+    """Every attempt fails validation -> bounded at max_attempts (default 2),
+    never hangs, never silently degrades -- raises the real, last ValueError."""
+    client = FakeSyncOpenAIClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _shared_client_factory(client))
+
+    def _always_fail(parsed: dict) -> dict:
+        raise ValueError("simulated persistent validation failure")
+
+    with pytest.raises(ValueError, match="simulated persistent validation failure"):
+        call_qwen_json_validated("system rubric", "user payload", _always_fail)
+
+    assert client.call_count == 2, "bounded at the default max_attempts=2, not retried forever"
+
+
+def test_validated_respects_custom_max_attempts(monkeypatch):
+    client = FakeSyncOpenAIClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _shared_client_factory(client))
+
+    def _always_fail(parsed: dict) -> dict:
+        raise ValueError("still bad")
+
+    with pytest.raises(ValueError, match="still bad"):
+        call_qwen_json_validated(
+            "system rubric", "user payload", _always_fail, max_attempts=3
+        )
+
+    assert client.call_count == 3
+
+
+def test_validated_non_valueerror_from_validate_fn_is_not_retried(monkeypatch):
+    """A validate_fn exception that is NOT a ValueError propagates immediately,
+    unretried -- deliberately narrow, matching every other re-prompt loop in
+    this codebase (they only catch the specific content-failure type their own
+    validator raises)."""
+    client = FakeSyncOpenAIClient([json.dumps({"ok": True})])
+    monkeypatch.setattr("agents.critic_llm.OpenAI", _shared_client_factory(client))
+
+    def _raise_type_error(parsed: dict) -> dict:
+        raise TypeError("not a ValueError")
+
+    with pytest.raises(TypeError):
+        call_qwen_json_validated("system rubric", "user payload", _raise_type_error)
+
+    assert client.call_count == 1, "non-ValueError is not retried"
