@@ -218,7 +218,7 @@ export default function Home() {
           alignItems: "center",
           justifyContent: "space-between",
           padding: navShrunk ? "14px 48px" : "22px 48px",
-          background: navShrunk ? "rgba(249,244,234,0.86)" : "transparent",
+          background: navShrunk ? (isDark ? "rgba(18,52,59,0.86)" : "rgba(249,244,234,0.86)") : "transparent",
           backdropFilter: navShrunk ? "blur(10px)" : "none",
           borderBottom: `1px solid ${navShrunk ? "var(--hair)" : "transparent"}`,
           transition:
