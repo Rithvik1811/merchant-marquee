@@ -22,7 +22,6 @@
   color: var(--ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
   transition:
     background-color 0.3s var(--ease),
     color 0.3s var(--ease);

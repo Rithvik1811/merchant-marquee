@@ -54,6 +54,11 @@ body {
 body {
   background: var(--bg);
   color: var(--ink);
+  /* Clips decorative bleed elements (hero blobs, etc.) horizontally. Set here
+     (not on a nested wrapper div) so the browser propagates it to the
+     viewport instead of turning that div into a nested scroll container —
+     the latter breaks position: sticky on anything inside it (e.g. the nav). */
+  overflow-x: hidden;
 }
 
 * {
