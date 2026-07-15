@@ -1,12 +1,18 @@
 """
 Brand Research Node — runs before product_truth_extractor.
 
-If `brand_url` is in state, fetches the webpage, strips HTML to plain text,
-and calls the LLM to produce a concise brand identity summary (tone, positioning,
-target customer, key differentiators). Stores the result in state["brand_context"]
-so the Concept Agent can write on-brand scripts with the correct CTA voice.
+If `brand_url` is in state, extracts the page content and calls the LLM to
+produce a concise brand identity summary (tone, positioning, target customer,
+key differentiators). Stores the result in state["brand_context"] so the
+Concept Agent can write on-brand scripts with the correct CTA voice.
 
 If `brand_url` is absent, returns {} immediately (no-op — zero cost).
+
+Page extraction strategy (in priority order):
+  1. Tavily Extract API (TAVILY_API_KEY set) — returns clean, structured text
+     with JavaScript-rendered content, no HTML parsing needed.
+  2. httpx fallback (no TAVILY_API_KEY) — raw HTML fetch + regex strip.
+     Works without a Tavily account but misses JS-heavy pages.
 """
 from __future__ import annotations
 
@@ -26,8 +32,23 @@ logger = logging.getLogger("productcut.agents.brand_research_node")
 _MAX_PAGE_CHARS = 8_000  # truncate scraped text to avoid flooding context
 
 
-def _fetch_page_text(url: str) -> str:
-    """Fetch URL and return readable text, HTML stripped."""
+async def _extract_with_tavily(url: str) -> str:
+    """Use Tavily Extract API to get clean page text.
+
+    Returns the raw_content string from the first successful result, truncated
+    to _MAX_PAGE_CHARS. Raises on network or API failure (caller handles).
+    """
+    from tavily import AsyncTavilyClient  # local import — only needed when key is set
+    client = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    response = await client.extract(urls=[url])
+    results = response.get("results", [])
+    if not results:
+        raise ValueError(f"Tavily returned no results for {url}")
+    return results[0].get("raw_content", "")[:_MAX_PAGE_CHARS]
+
+
+def _fetch_page_text_httpx(url: str) -> str:
+    """Fallback: fetch URL and return readable text with HTML stripped."""
     resp = httpx.get(
         url, timeout=20.0, follow_redirects=True,
         headers={"User-Agent": "Mozilla/5.0 (compatible; ProductCut/1.0)"},
@@ -41,8 +62,17 @@ def _fetch_page_text(url: str) -> str:
     return text[:_MAX_PAGE_CHARS]
 
 
+async def _get_page_text(url: str) -> str:
+    """Extract page text using Tavily if available, httpx otherwise."""
+    if os.environ.get("TAVILY_API_KEY"):
+        logger.info("brand_research_node: using Tavily Extract for %s", url)
+        return await _extract_with_tavily(url)
+    logger.info("brand_research_node: no TAVILY_API_KEY — falling back to httpx for %s", url)
+    return await asyncio.to_thread(_fetch_page_text_httpx, url)
+
+
 async def brand_research_node(state: ProductCutState) -> dict:
-    """LangGraph node: fetch brand URL and write brand_context to state."""
+    """LangGraph node: extract brand page and write brand_context to state."""
     brand_url = state.get("brand_url", "")
     brand_name = state.get("brand_name", "")
 
@@ -51,9 +81,13 @@ async def brand_research_node(state: ProductCutState) -> dict:
         return {}
 
     try:
-        page_text = await asyncio.to_thread(_fetch_page_text, brand_url)
+        page_text = await _get_page_text(brand_url)
     except Exception as exc:
         logger.warning("brand_research_node: failed to fetch %s: %s", brand_url, exc)
+        return {}
+
+    if not page_text.strip():
+        logger.warning("brand_research_node: extracted empty text from %s — skipping LLM", brand_url)
         return {}
 
     brand_label = f'brand "{brand_name}"' if brand_name else "this brand"

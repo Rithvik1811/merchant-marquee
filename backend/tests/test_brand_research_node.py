@@ -25,11 +25,16 @@ Coverage:
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agents.brand_research_node import _fetch_page_text, brand_research_node, _MAX_PAGE_CHARS
+from agents.brand_research_node import (
+    _fetch_page_text_httpx,
+    _get_page_text,
+    brand_research_node,
+    _MAX_PAGE_CHARS,
+)
 from agents.concept_agent import (
     _abrupt_cta_problem,
     _brand_identity_block,
@@ -87,7 +92,7 @@ def _valid_json(variants: list[dict] | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# _fetch_page_text
+# _fetch_page_text_httpx (httpx fallback path)
 # ---------------------------------------------------------------------------
 
 def test_fetch_page_text_strips_script_and_style_tags():
@@ -97,7 +102,7 @@ def test_fetch_page_text_strips_script_and_style_tags():
     mock_resp.text = html
 
     with patch("agents.brand_research_node.httpx.get", return_value=mock_resp):
-        result = _fetch_page_text("https://example.com")
+        result = _fetch_page_text_httpx("https://example.com")
 
     assert "var x=1" not in result
     assert ".a{}" not in result
@@ -111,7 +116,7 @@ def test_fetch_page_text_strips_html_tags():
     mock_resp.text = html
 
     with patch("agents.brand_research_node.httpx.get", return_value=mock_resp):
-        result = _fetch_page_text("https://example.com")
+        result = _fetch_page_text_httpx("https://example.com")
 
     assert "<" not in result
     assert "Best Water Bottle" in result
@@ -125,7 +130,7 @@ def test_fetch_page_text_truncates_at_max_chars():
     mock_resp.text = html
 
     with patch("agents.brand_research_node.httpx.get", return_value=mock_resp):
-        result = _fetch_page_text("https://example.com")
+        result = _fetch_page_text_httpx("https://example.com")
 
     assert len(result) == _MAX_PAGE_CHARS
 
@@ -137,7 +142,7 @@ def test_fetch_page_text_collapses_whitespace():
     mock_resp.text = html
 
     with patch("agents.brand_research_node.httpx.get", return_value=mock_resp):
-        result = _fetch_page_text("https://example.com")
+        result = _fetch_page_text_httpx("https://example.com")
 
     assert "  " not in result
     assert "too many spaces" in result
@@ -165,7 +170,7 @@ async def test_brand_research_node_empty_brand_url_returns_empty():
 
 @pytest.mark.asyncio
 async def test_brand_research_node_fetch_error_returns_empty():
-    with patch("agents.brand_research_node._fetch_page_text", side_effect=Exception("timeout")):
+    with patch("agents.brand_research_node._get_page_text",side_effect=Exception("timeout")):
         result = await brand_research_node({"job_id": "j1", "brand_url": "https://example.com"})
     assert result == {}
 
@@ -175,7 +180,7 @@ async def test_brand_research_node_http_error_returns_empty():
     import httpx as _httpx
 
     exc = _httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
-    with patch("agents.brand_research_node._fetch_page_text", side_effect=exc):
+    with patch("agents.brand_research_node._get_page_text",side_effect=exc):
         result = await brand_research_node({"job_id": "j1", "brand_url": "https://example.com"})
     assert result == {}
 
@@ -193,7 +198,7 @@ async def test_brand_research_node_happy_path_writes_brand_context(monkeypatch):
     monkeypatch.setenv("MODEL_TEXT", "qwen-max")
 
     with (
-        patch("agents.brand_research_node._fetch_page_text", return_value="some page text"),
+        patch("agents.brand_research_node._get_page_text", new=AsyncMock(return_value="some page text")),
         patch("agents.brand_research_node.AsyncOpenAI", make_fake_async_openai([fake_summary])),
     ):
         result = await brand_research_node({
@@ -214,7 +219,7 @@ async def test_brand_research_node_no_brand_name_still_works(monkeypatch):
     monkeypatch.setenv("MODEL_TEXT", "qwen-max")
 
     with (
-        patch("agents.brand_research_node._fetch_page_text", return_value="page text"),
+        patch("agents.brand_research_node._get_page_text", new=AsyncMock(return_value="page text")),
         patch("agents.brand_research_node.AsyncOpenAI", make_fake_async_openai([fake_summary])),
     ):
         result = await brand_research_node({"job_id": "j1", "brand_url": "https://example.com"})
@@ -558,3 +563,96 @@ async def test_concept_agent_node_output_contains_brand_name_in_cta(monkeypatch)
     cta_beats = [v["beats"][-1]["line"] for v in variants]
     assert all("HydroFlask" in line for line in cta_beats), \
         f"Brand name not in CTA beats after full node execution: {cta_beats}"
+
+
+# ---------------------------------------------------------------------------
+# Tavily extraction path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_page_text_uses_tavily_when_key_set(monkeypatch):
+    """When TAVILY_API_KEY is set, _get_page_text delegates to _extract_with_tavily."""
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-fake")
+
+    with patch(
+        "agents.brand_research_node._extract_with_tavily",
+        new=AsyncMock(return_value="clean tavily content"),
+    ) as mock_tavily:
+        result = await _get_page_text("https://example.com")
+
+    mock_tavily.assert_awaited_once_with("https://example.com")
+    assert result == "clean tavily content"
+
+
+@pytest.mark.asyncio
+async def test_get_page_text_uses_httpx_fallback_when_no_key(monkeypatch):
+    """When TAVILY_API_KEY is absent, _get_page_text falls back to httpx."""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    with patch(
+        "agents.brand_research_node._fetch_page_text_httpx",
+        return_value="httpx scraped content",
+    ) as mock_httpx:
+        result = await _get_page_text("https://example.com")
+
+    mock_httpx.assert_called_once_with("https://example.com")
+    assert result == "httpx scraped content"
+
+
+@pytest.mark.asyncio
+async def test_brand_research_node_tavily_happy_path(monkeypatch):
+    """End-to-end with Tavily: clean content → LLM → brand_context written."""
+    fake_summary = "Peak Design makes premium camera gear with minimalist design."
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-fake")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake-key")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://fake.api")
+    monkeypatch.setenv("MODEL_TEXT", "qwen-max")
+
+    with (
+        patch(
+            "agents.brand_research_node._extract_with_tavily",
+            new=AsyncMock(return_value="Peak Design website content here."),
+        ),
+        patch("agents.brand_research_node.AsyncOpenAI", make_fake_async_openai([fake_summary])),
+    ):
+        result = await brand_research_node({
+            "job_id": "j1",
+            "brand_url": "https://peakdesign.com",
+            "brand_name": "Peak Design",
+        })
+
+    assert result.get("brand_context") == fake_summary
+
+
+@pytest.mark.asyncio
+async def test_brand_research_node_tavily_failure_degrades(monkeypatch):
+    """If Tavily raises, node degrades gracefully — does not crash the job."""
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-fake")
+
+    with patch(
+        "agents.brand_research_node._extract_with_tavily",
+        new=AsyncMock(side_effect=Exception("Tavily rate limit")),
+    ):
+        result = await brand_research_node({
+            "job_id": "j1",
+            "brand_url": "https://example.com",
+        })
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_brand_research_node_empty_tavily_result_skips_llm(monkeypatch):
+    """Empty string from Tavily → node skips LLM and returns {}."""
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-fake")
+
+    with patch(
+        "agents.brand_research_node._extract_with_tavily",
+        new=AsyncMock(return_value="   "),
+    ):
+        result = await brand_research_node({
+            "job_id": "j1",
+            "brand_url": "https://example.com",
+        })
+
+    assert result == {}
