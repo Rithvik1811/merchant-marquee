@@ -25,13 +25,13 @@ Coverage:
 from __future__ import annotations
 
 import json
-from typing import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agents.brand_research_node import _fetch_page_text, brand_research_node, _MAX_PAGE_CHARS
 from agents.concept_agent import (
+    _abrupt_cta_problem,
     _brand_identity_block,
     _build_system_prompt,
     _build_user_content,
@@ -171,13 +171,11 @@ async def test_brand_research_node_fetch_error_returns_empty():
 
 
 @pytest.mark.asyncio
-async def test_brand_research_node_http_error_returns_empty(monkeypatch):
+async def test_brand_research_node_http_error_returns_empty():
     import httpx as _httpx
 
-    def _bad_fetch(url: str) -> str:
-        raise _httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
-
-    with patch("agents.brand_research_node._fetch_page_text", side_effect=_bad_fetch):
+    exc = _httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
+    with patch("agents.brand_research_node._fetch_page_text", side_effect=exc):
         result = await brand_research_node({"job_id": "j1", "brand_url": "https://example.com"})
     assert result == {}
 
@@ -405,3 +403,158 @@ async def test_concept_agent_node_no_brand_fields_default_to_empty(monkeypatch):
 
     assert captured.get("brand_name") == ""
     assert captured.get("brand_context") == ""
+
+
+# ---------------------------------------------------------------------------
+# CTA bridge validator behaviour with branded CTAs
+#
+# The prompt tells the LLM: "NEVER write 'Get yours' — use 'So get your
+# HydroFlask.' or 'That's what HydroFlask is built for.'" We must verify
+# that those forms PASS the deterministic _abrupt_cta_problem guard so they
+# are not filtered out before reaching the Critic Chain.
+# ---------------------------------------------------------------------------
+
+def _beats_with_cta(cta_line: str) -> list[dict]:
+    """5-beat sequence whose last beat carries the given CTA line."""
+    return [
+        {"t_start": 0,  "t_end": 3,  "line": "It holds everything you pack."},
+        {"t_start": 3,  "t_end": 6,  "line": "Double-wall keeps cold 24 hours."},
+        {"t_start": 6,  "t_end": 10, "line": "Matte midnight-blue powder coat."},
+        {"t_start": 10, "t_end": 14, "line": "It still looks new a year later."},
+        {"t_start": 14, "t_end": 18, "line": cta_line},
+    ]
+
+
+def test_abrupt_cta_bare_brand_name_flagged():
+    # "Get HydroFlask" — 2 words, no connective, no back-reference → abrupt
+    beats = _beats_with_cta("Get HydroFlask")
+    assert _abrupt_cta_problem(beats) is not None
+
+
+def test_abrupt_cta_connective_brand_name_passes():
+    # "So get your HydroFlask." — starts with "so " → passes bridge check
+    beats = _beats_with_cta("So get your HydroFlask.")
+    assert _abrupt_cta_problem(beats) is None
+
+
+def test_abrupt_cta_reference_brand_name_passes():
+    # "That's what HydroFlask is built for." — "That's what" is a connective
+    beats = _beats_with_cta("That's what HydroFlask is built for.")
+    assert _abrupt_cta_problem(beats) is None
+
+
+def test_abrupt_cta_long_branded_cta_passes():
+    # 9 words — above ABRUPT_CTA_MAX_WORDS=8 so check is skipped entirely
+    beats = _beats_with_cta("Get your HydroFlask before the next batch sells out.")
+    assert _abrupt_cta_problem(beats) is None
+
+
+def test_abrupt_cta_back_reference_with_brand_passes():
+    # "It's your HydroFlask." — "It" matches _CTA_BRIDGE_REFERENCE_RE
+    beats = _beats_with_cta("It's your HydroFlask.")
+    assert _abrupt_cta_problem(beats) is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: brand name survives generate_script_variants output
+#
+# The fake LLM returns variants whose CTA beat contains the brand name.
+# We verify the returned variants still carry that brand name, i.e. the
+# validator did not strip or reject them just because they mention the brand.
+# ---------------------------------------------------------------------------
+
+def _four_branded_variants() -> list[dict]:
+    # Each variant has a distinct hook_type and emotional_trigger (required by _split_valid_invalid).
+    # Hooks: concrete claim uses contrast marker; pov/curiosity gap/in-media-res use 2nd-person + concrete noun.
+    # CTAs: all include brand name with a bridge connective or are 9+ words — passes _abrupt_cta_problem.
+    # grounding_truth_ids covers all 3 mandatory tiers: t0=form_factor, t1=color, t2=construction_detail.
+    data = [
+        ("v1", FRAMEWORKS[0], "concrete claim",                 "desire",    "It will not let you down.",                    "So get your HydroFlask."),
+        ("v2", FRAMEWORKS[1], "pov",                            "curiosity", "Grab your flask. Ready when you are.",         "That is what HydroFlask is built for."),
+        ("v3", FRAMEWORKS[2], "curiosity gap",                  "relief",    "Your flask holds cold. All day. Every time.",  "It is your HydroFlask ready for anything."),
+        ("v4", FRAMEWORKS[3], "relatable moment / in-media-res","FOMO",      "You fill it once. It keeps up all day.",       "Get your HydroFlask before the next batch sells out today."),
+    ]
+    return [
+        {
+            "variant_id": vid,
+            "text": f"ad text ending with {cta}",
+            "framework": fw,
+            "hook_type": ht,
+            "emotional_trigger": trigger,
+            "grounding_truth_ids": ["t0", "t1", "t2"],
+            "beats": [
+                {"t_start": 0,  "t_end": 3,  "line": hook},
+                {"t_start": 3,  "t_end": 6,  "line": "Cold stays cold for 24 hours."},
+                {"t_start": 6,  "t_end": 10, "line": "Matte blue looks the same a year later."},
+                {"t_start": 10, "t_end": 14, "line": "Double-wall keeps every degree inside."},
+                {"t_start": 14, "t_end": 18, "line": cta},
+            ],
+            "target_length_sec": DEFAULT_TARGET_LENGTH_SEC,
+        }
+        for vid, fw, ht, trigger, hook, cta in data
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_script_variants_branded_cta_survives_validation(monkeypatch):
+    """Brand name in CTA passes the validator — all 4 branded variants returned."""
+    client = FakeOpenAIClient([json.dumps({"script_variants": _four_branded_variants()})])
+    monkeypatch.setenv("MODEL_TEXT", "qwen-max")
+
+    results = await generate_script_variants(
+        "insulated water bottle",
+        _TRUTHS,
+        brand_name="HydroFlask",
+        brand_context="Premium outdoor hydration.",
+        client=client,
+    )
+
+    assert len(results) == 4, f"Expected 4 variants, got {len(results)}"
+    cta_beats = [v["beats"][-1]["line"] for v in results]
+    assert all("HydroFlask" in line for line in cta_beats), \
+        f"Brand name missing from some CTA beats: {cta_beats}"
+
+
+@pytest.mark.asyncio
+async def test_generate_script_variants_brand_name_in_output_text(monkeypatch):
+    """The 'text' field of returned variants contains the brand name."""
+    client = FakeOpenAIClient([json.dumps({"script_variants": _four_branded_variants()})])
+    monkeypatch.setenv("MODEL_TEXT", "qwen-max")
+
+    results = await generate_script_variants(
+        "insulated water bottle",
+        _TRUTHS,
+        brand_name="HydroFlask",
+        client=client,
+    )
+
+    assert all("HydroFlask" in v["text"] for v in results), \
+        "Brand name missing from variant text fields"
+
+
+@pytest.mark.asyncio
+async def test_concept_agent_node_output_contains_brand_name_in_cta(monkeypatch):
+    """Full node: state with brand_name → output script_variants have brand in CTA."""
+    monkeypatch.setenv("MODEL_TEXT", "qwen-max")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "fake")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://fake.api")
+
+    monkeypatch.setattr(
+        "agents.concept_agent.AsyncOpenAI",
+        make_fake_async_openai([json.dumps({"script_variants": _four_branded_variants()})]),
+    )
+
+    result = await concept_agent_node({
+        "job_id": "j1",
+        "brief": "insulated water bottle",
+        "product_truths": _TRUTHS,
+        "brand_name": "HydroFlask",
+        "brand_context": "Premium outdoor hydration brand.",
+        "reasoning_trace": "",
+    })
+
+    variants = result.get("script_variants", [])
+    assert len(variants) == 4, f"Expected 4 variants, got {len(variants)}"
+    cta_beats = [v["beats"][-1]["line"] for v in variants]
+    assert all("HydroFlask" in line for line in cta_beats), \
+        f"Brand name not in CTA beats after full node execution: {cta_beats}"

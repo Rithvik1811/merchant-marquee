@@ -76,12 +76,18 @@ async def brand_research_node(state: ProductCutState) -> dict:
         timeout=45.0,
     )
     try:
-        brand_context = await create_completion(
-            client,
-            model=os.environ.get("MODEL_TEXT", "qwen-max"),
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.2,
-        )
+        try:
+            brand_context = await create_completion(
+                client,
+                model=os.environ.get("MODEL_TEXT", "qwen-max"),
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.2,
+            )
+        except Exception as exc:
+            logger.warning(
+                "brand_research_node: LLM summarization failed (%s); degrading to no brand_context", exc
+            )
+            return {}
     finally:
         await client.close()
 

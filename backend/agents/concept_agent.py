@@ -52,7 +52,10 @@ MAX_HOOK_WORDS = 10
 # this set to "construction_detail" alone (now that imperfection can no longer
 # backstop it) would risk making every variant structurally unvalidatable for
 # a product with zero construction_detail facts.
-SPECIFIC_CATEGORIES = frozenset({"construction_detail", "material_character", "texture", "form_factor"})
+SPECIFIC_CATEGORIES = frozenset({
+    "construction_detail", "material_character", "texture", "form_factor",
+    "brief_or_intake_fact",  # general-purpose fallback; valid when no physical categories exist
+})
 
 _TIER1_CATEGORIES = frozenset({"form_factor"})
 _TIER2_CATEGORIES = frozenset({"color", "material", "texture"})
@@ -941,18 +944,22 @@ def _rhyme_key(word: str) -> Optional[str]:
 def _missing_required_tiers(variant: dict, truths_by_id: dict) -> list[str]:
     cited_ids = set(variant.get("grounding_truth_ids", []))
     cited_cats = {truths_by_id[tid]["category"] for tid in cited_ids if tid in truths_by_id}
+    all_cats = {t["category"] for t in truths_by_id.values()}
     problems = []
-    if not cited_cats & _TIER1_CATEGORIES:
+    # Only require a tier if at least one truth of that tier's categories exists in
+    # the full truth table. A tier that was never extracted can't be cited — don't
+    # penalize variants for truths the VL model couldn't find.
+    if all_cats & _TIER1_CATEGORIES and not cited_cats & _TIER1_CATEGORIES:
         problems.append(
             "Missing TIER 1 (form_factor): script never establishes what the product IS "
             "physically — add a truth that anchors its shape, size, and overall form."
         )
-    if not cited_cats & _TIER2_CATEGORIES:
+    if all_cats & _TIER2_CATEGORIES and not cited_cats & _TIER2_CATEGORIES:
         problems.append(
             "Missing TIER 2 (color/material/texture): script never grounds why the product "
             "feels premium — add a truth about its material or surface quality."
         )
-    if not cited_cats & _TIER3_CATEGORIES:
+    if all_cats & _TIER3_CATEGORIES and not cited_cats & _TIER3_CATEGORIES:
         problems.append(
             "Missing TIER 3 (construction_detail/material_character): script has no "
             "idiosyncratic differentiator — add a truth about what makes THIS specific product "
