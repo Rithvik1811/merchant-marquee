@@ -7,8 +7,6 @@ import Wizard from "../components/wizard/Wizard";
 import type { Photo } from "../components/wizard/types";
 import Dashboard from "../components/dashboard/Dashboard";
 import Library from "../components/library/Library";
-import { createMockJob } from "@/lib/mockStream";
-import { PRODUCT } from "@/lib/mockData";
 import type {
   Budget,
   Final,
@@ -17,7 +15,6 @@ import type {
   InterruptResolution,
   JobEvent,
   MergeValidation,
-  MockJob,
   Script,
   Shot,
   Treatment,
@@ -28,6 +25,39 @@ import "./studio.css";
 
 const STEP_MS = 340;
 const HISTORY_KEY = "pc-job-history";
+
+// Map LangGraph node names → pipeline phase display strings
+const NODE_TO_PHASE: Record<string, string> = {
+  ingest_node: "Ingest",
+  brand_research_node: "Ingest",
+  product_truth_extractor: "Truths",
+  concept_agent: "Scripts",
+  hook_checker: "Scripts",
+  pacing_checker: "Scripts",
+  body_checker: "Scripts",
+  cta_checker: "Scripts",
+  tone_checker: "Scripts",
+  meta_critic: "Scripts",
+  merge_validator: "Scripts",
+  copy_editor: "Scripts",
+  visual_direction_agent: "Treatment",
+  treatment_agent: "Treatment",
+  shot_list_agent: "Budget",
+  budget_gate: "Budget",
+  video_gen_node: "Shots",
+  ken_burns_fallback_node: "Shots",
+  continuity_agent: "Continuity",
+  continuity_gate: "Continuity",
+  voiceover_caption_agent: "Delivery",
+  assembly_agent: "Delivery",
+  format_export_node: "Delivery",
+};
+
+const FINAL_RATIOS: Final["ratios"] = [
+  { id: "9x16", label: "9:16", use: "TikTok / Reels", w: 9, h: 16 },
+  { id: "1x1", label: "1:1", use: "Instagram Feed", w: 1, h: 1 },
+  { id: "16x9", label: "16:9", use: "YouTube / Web", w: 16, h: 9 },
+];
 
 type Theme = "light" | "dark";
 type Status = "wizard" | "dashboard" | "library";
@@ -49,6 +79,7 @@ interface State {
   notes: string;
   dragOver: boolean;
 
+  jobId: string | null;
   phase: string;
   phaseLabel: string;
   elapsed: number;
@@ -95,6 +126,7 @@ function initialState(): State {
     notes: "",
     dragOver: false,
 
+    jobId: null,
     phase: "",
     phaseLabel: "",
     elapsed: 0,
@@ -107,7 +139,7 @@ function initialState(): State {
     merge: null,
 
     treatment: null,
-    budget: { shots: [], running: 0, cap: 0, unit: "" },
+    budget: { shots: [], running: 0, cap: 0, unit: "credits" },
     shots: [],
     drift: {},
     driftThreshold: 0.25,
@@ -124,12 +156,22 @@ function initialState(): State {
   };
 }
 
+// Derive API base URL from the WS base URL env var
+function getApiBase(): string {
+  const wsBase = process.env.NEXT_PUBLIC_WS_BASE_URL ?? "ws://localhost:8000";
+  return wsBase.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://");
+}
+function getWsBase(): string {
+  return process.env.NEXT_PUBLIC_WS_BASE_URL ?? "ws://localhost:8000";
+}
+
 export default function StudioPage() {
   const [state, setState] = useMergeState<State>(initialState);
 
   const fileRef = useRef<HTMLInputElement | null>(null);
   const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
-  const jobRef = useRef<MockJob | null>(null);
+  const jobRef = useRef<WebSocket | null>(null);
+  const jobIdRef = useRef<string | null>(null);   // mirror of state.jobId for callbacks
   const startedAtRef = useRef(0);
   const elapsedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -149,34 +191,27 @@ export default function StudioPage() {
   };
 
   useEffect(() => {
-    let saved: string | null = null;
+    // Load theme preference
     try {
-      saved = localStorage.getItem("pc-theme");
-    } catch {
-      // ignore
-    }
-    if (saved === "light" || saved === "dark") {
-      setState({ theme: saved });
-    }
+      const saved = localStorage.getItem("pc-theme");
+      if (saved === "light" || saved === "dark") setState({ theme: saved });
+    } catch { /* ignore */ }
 
-    let history: HistoryEntry[] = [];
+    // Load history
     try {
-      history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    } catch {
-      // ignore
-    }
-    setState({ history });
+      const history: HistoryEntry[] = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      setState({ history });
+    } catch { /* ignore */ }
 
+    // Check ?view=library URL param
     try {
       const params = new URLSearchParams(window.location.search);
       if (params.get("view") === "library") setState({ status: "library" });
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
 
     return () => {
       clearTimers();
-      jobRef.current?.stop();
+      jobRef.current?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -184,18 +219,12 @@ export default function StudioPage() {
   const toggleTheme = useCallback(() => {
     setState((s) => {
       const theme: Theme = s.theme === "dark" ? "light" : "dark";
-      try {
-        localStorage.setItem("pc-theme", theme);
-      } catch {
-        // ignore
-      }
+      try { localStorage.setItem("pc-theme", theme); } catch { /* ignore */ }
       return { theme };
     });
   }, [setState]);
 
   // ---- wizard nav ----
-  // Reads `state` directly (rather than via a setState updater) since goStep
-  // itself needs to schedule a timeout side effect — updater functions must stay pure.
   const goStep = useCallback(
     (n: 1 | 2 | 3 | 4) => {
       if (state.transitioning || n === state.step || n < 1 || n > 4) return;
@@ -215,9 +244,7 @@ export default function StudioPage() {
   }, [state.step, goStep]);
 
   // ---- files ----
-  const onPickClick = useCallback(() => {
-    fileRef.current?.click();
-  }, []);
+  const onPickClick = useCallback(() => { fileRef.current?.click(); }, []);
 
   const addFiles = useCallback(
     (fileList: FileList | null) => {
@@ -228,7 +255,7 @@ export default function StudioPage() {
         const mapped: Photo[] = Array.from(fileList)
           .filter((f) => f.type.startsWith("image/"))
           .slice(0, room)
-          .map((f) => ({ name: f.name, url: URL.createObjectURL(f) }));
+          .map((f) => ({ name: f.name, url: URL.createObjectURL(f), file: f }));
         return { photos: [...s.photos, ...mapped].slice(0, 3) };
       });
     },
@@ -236,32 +263,19 @@ export default function StudioPage() {
   );
 
   const onFileChange = useCallback(
-    (e: ChangeEvent<HTMLInputElement>) => {
-      addFiles(e.target.files);
-      e.target.value = "";
-    },
+    (e: ChangeEvent<HTMLInputElement>) => { addFiles(e.target.files); e.target.value = ""; },
     [addFiles],
   );
   const onDragOver = useCallback(
-    (e: DragEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      setState((s) => (s.dragOver ? {} : { dragOver: true }));
-    },
+    (e: DragEvent<HTMLDivElement>) => { e.preventDefault(); setState((s) => (s.dragOver ? {} : { dragOver: true })); },
     [setState],
   );
   const onDragLeave = useCallback(
-    (e: DragEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      setState({ dragOver: false });
-    },
+    (e: DragEvent<HTMLDivElement>) => { e.preventDefault(); setState({ dragOver: false }); },
     [setState],
   );
   const onDrop = useCallback(
-    (e: DragEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      setState({ dragOver: false });
-      addFiles(e.dataTransfer.files);
-    },
+    (e: DragEvent<HTMLDivElement>) => { e.preventDefault(); setState({ dragOver: false }); addFiles(e.dataTransfer.files); },
     [addFiles, setState],
   );
   const removePhoto = useCallback(
@@ -275,10 +289,7 @@ export default function StudioPage() {
   const onBriefInput = useCallback((e: ChangeEvent<HTMLInputElement>) => setState({ brief: e.target.value }), [setState]);
   const onBriefKey = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === "Enter" && state.brief.trim()) {
-        e.preventDefault();
-        goStep(3);
-      }
+      if (e.key === "Enter" && state.brief.trim()) { e.preventDefault(); goStep(3); }
     },
     [state.brief, goStep],
   );
@@ -302,21 +313,11 @@ export default function StudioPage() {
     [setState],
   );
   const onMoodKey = useCallback(
-    (e: KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        addTag("moodWords", "moodInput");
-      }
-    },
+    (e: KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") { e.preventDefault(); addTag("moodWords", "moodInput"); } },
     [addTag],
   );
   const onNeverKey = useCallback(
-    (e: KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        addTag("neverList", "neverInput");
-      }
-    },
+    (e: KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") { e.preventDefault(); addTag("neverList", "neverInput"); } },
     [addTag],
   );
   const removeTag = useCallback(
@@ -326,76 +327,198 @@ export default function StudioPage() {
     [setState],
   );
 
-  // ---- generate -> live dashboard (mock stream) ----
+  // ---- C2 event handler ----
+  // Adapts real backend C2 payloads into the State shape that Dashboard components render.
   const handleEvent = useCallback(
     (e: JobEvent) => {
       const { type, payload } = e;
       switch (type) {
-        case "node_started":
-          setState({ phase: payload.phase, phaseLabel: payload.label });
+        case "node_started": {
+          const phase = NODE_TO_PHASE[payload.node] ?? payload.node;
+          const phaseLabel = payload.label ?? phase;
+          setState({ phase, phaseLabel });
           break;
-        case "truth_extracted":
-          setState((s) => ({ truths: [...s.truths, payload.truth] }));
+        }
+
+        case "truth_extracted": {
+          // C2: {truths: [{truth_id, fact, category, source}], count}
+          const truths: Truth[] = payload.truths.map((t) => ({
+            id: t.truth_id,
+            category: t.category,
+            fact_text: t.fact,
+          }));
+          setState((s) => ({ truths: [...s.truths, ...truths] }));
           break;
-        case "critic_score":
-          setState((s) =>
-            s.scripts.some((x) => x.id === payload.script.id) ? {} : { scripts: [...s.scripts, payload.script] },
-          );
-          break;
-        case "critic_done":
-          setState({ winnerId: payload.winnerId, merge: payload.merge, activeScriptId: payload.winnerId });
-          break;
-        case "treatment_ready":
-          setState({ treatment: payload.treatment });
-          break;
-        case "budget_updated":
-          setState((s) => ({
-            budget: {
-              cap: payload.cap,
-              unit: payload.unit,
-              running: payload.running,
-              shots: s.budget.shots.some((x) => x.id === payload.shot.id) ? s.budget.shots : [...s.budget.shots, payload.shot],
+        }
+
+        case "critic_score": {
+          // C2: {scores: Record<variant_id, CriticScore>, winning_variant_ids?}
+          const newScripts: Script[] = Object.entries(payload.scores).map(([id, score], i) => ({
+            id,
+            title: `Variant ${String(i + 1).padStart(2, "0")}`,
+            winner: payload.winning_variant_ids?.includes(id),
+            scores: {
+              hook: Math.round(score.hook * 100),
+              pacing: Math.round(score.pacing * 100),
+              completion: Math.round(score.completion * 100),
+              cta: Math.round(score.cta * 100),
+              tone: Math.round(score.tone * 100),
             },
+            reasoning: score.justification,
+            lines: [],
+            total: Math.round(score.composite * 100),
           }));
-          break;
-        case "shots_init":
-          setState({ shots: payload.shots });
-          break;
-        case "shot_generated":
+          const firstWinner = payload.winning_variant_ids?.[0] ?? null;
           setState((s) => ({
-            shots: s.shots.map((sh) => (sh.id === payload.id ? { ...sh, status: payload.status } : sh)),
+            scripts: [
+              ...s.scripts,
+              ...newScripts.filter((ns) => !s.scripts.some((x) => x.id === ns.id)),
+            ],
+            winnerId: firstWinner ?? s.winnerId,
+            activeScriptId: firstWinner ?? s.activeScriptId,
           }));
           break;
-        case "drift_scored":
-          setState((s) => ({ drift: { ...s.drift, [payload.shotId]: payload.score } }));
+        }
+
+        case "merge_validated": {
+          // C2: {result: dict, attempt_number: number}
+          const result = payload.result as Record<string, unknown>;
+          const passed = result["passed"] === true || result["status"] === "pass";
+          setState({
+            merge: {
+              status: passed ? "pass" : "fail",
+              repairPath: String(result["repair_path"] ?? ""),
+              metaCriticSwapFired: Boolean(result["meta_critic_swap_fired"]),
+              note: String(result["note"] ?? result["justification"] ?? ""),
+              seam: {
+                location: String((result["seam"] as Record<string, unknown>)?.["location"] ?? ""),
+                before: String((result["seam"] as Record<string, unknown>)?.["before"] ?? ""),
+                after: String((result["seam"] as Record<string, unknown>)?.["after"] ?? ""),
+              },
+            },
+          });
           break;
-        case "interrupt_requested":
-          setState({ interrupt: payload.interrupt });
+        }
+
+        case "treatment_ready": {
+          // C2: {treatment: {director_persona, color_story, pacing_philosophy, beat_treatments}}
+          const t = payload.treatment;
+          setState({
+            treatment: {
+              director_persona: t.director_persona,
+              color_story: t.color_story,
+              pacing_philosophy: t.pacing_philosophy,
+              beats: t.beat_treatments.map((b) => ({
+                id: String(b.beat_index),
+                script_quote: b.script_quote,
+                truth_fact_id: b.truth_fact_id,
+                why_not_generic: b.why_not_generic,
+              })),
+            },
+          });
           break;
-        case "interrupt_resolved":
-          setState({ interrupt: null, interruptResolution: payload.resolution });
+        }
+
+        case "budget_updated": {
+          // C2: {ledger: {cap, spent, per_shot: Record<shot_id, amount>}, over_cap}
+          const ledger = payload.ledger;
+          setState((s) => {
+            const budgetShots = Object.entries(ledger.per_shot).map(([id, alloc], i) => ({
+              id,
+              label: s.shots.find((sh) => sh.id === id)?.label ?? `Shot ${i + 1}`,
+              alloc,
+              justification: "",
+            }));
+            return {
+              budget: {
+                cap: ledger.cap,
+                unit: s.budget.unit || "credits",
+                running: ledger.spent,
+                shots: budgetShots,
+              },
+            };
+          });
           break;
-        case "job_complete":
+        }
+
+        case "shot_generated": {
+          // C2: {shot_id, generated?, status, is_fallback}
+          const { shot_id, status, is_fallback } = payload;
+          setState((s) => {
+            const exists = s.shots.find((sh) => sh.id === shot_id);
+            if (exists) {
+              return {
+                shots: s.shots.map((sh) =>
+                  sh.id === shot_id ? { ...sh, status, fallback: is_fallback } : sh
+                ),
+              };
+            }
+            const newShot: Shot = {
+              id: shot_id,
+              label: `Shot ${s.shots.length + 1}`,
+              camera: "",
+              move: "",
+              duration: "",
+              fallback: is_fallback,
+              status,
+            };
+            return { shots: [...s.shots, newShot] };
+          });
+          break;
+        }
+
+        case "drift_scored": {
+          // C2: {shot_id, drift_score, threshold, passed, attempt}
+          setState((s) => ({
+            drift: { ...s.drift, [payload.shot_id]: payload.drift_score },
+            driftThreshold: payload.threshold,
+          }));
+          break;
+        }
+
+        case "interrupt_requested": {
+          // C2: {review: {shot_id, drift_score, candidate_frame_uris}, queue_position?}
+          const review = payload.review;
+          const interrupt: Interrupt = {
+            shotId: review.shot_id,
+            label: `Shot ${review.shot_id.slice(-6)}`,
+            driftScore: review.drift_score,
+            reason: "Continuity drift exceeded retry cap. Please review the generated candidates.",
+            candidates: review.candidate_frame_uris.length
+              ? review.candidate_frame_uris.map((uri, i) => ({ id: `c${i}`, note: uri }))
+              : [{ id: "c0", note: "No candidate frames available" }],
+          };
+          setState({ interrupt });
+          break;
+        }
+
+        case "job_complete": {
+          // C2: {master_cut_uri, exports, voiceover?}
           if (elapsedIntervalRef.current) {
             clearInterval(elapsedIntervalRef.current);
             elapsedIntervalRef.current = null;
           }
+          const final: Final = { duration: "18s", ratios: FINAL_RATIOS };
           setState((s) => {
             const entry: HistoryEntry = {
-              productName: payload.product?.name || PRODUCT.name,
+              productName: s.brief || "Product Ad",
               date: Date.now(),
               truths: s.truths,
-              final: payload.final,
+              final,
             };
             const history = [entry, ...s.history].slice(0, 20);
-            try {
-              localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-            } catch {
-              // ignore
-            }
-            return { final: payload.final, jobDone: true, phase: "Delivery", history };
+            try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
+            return { final, jobDone: true, phase: "Delivery", history };
           });
           break;
+        }
+
+        // Informational / future panels — no state update needed yet
+        case "vo_ready":
+        case "master_cut_ready":
+        case "edit_routed":
+          break;
+
         default:
           break;
       }
@@ -403,43 +526,105 @@ export default function StudioPage() {
     [setState],
   );
 
-  const onGenerate = useCallback(() => {
+  // ---- WebSocket connection ----
+  const openWebSocket = useCallback(
+    (jobId: string, resolution?: string) => {
+      // Close existing connection
+      if (jobRef.current) {
+        jobRef.current.onmessage = null;
+        jobRef.current.close();
+        jobRef.current = null;
+      }
+
+      const wsBase = getWsBase();
+      const url = resolution
+        ? `${wsBase}/ws/${jobId}?resolution=${encodeURIComponent(resolution)}`
+        : `${wsBase}/ws/${jobId}`;
+
+      const ws = new WebSocket(url);
+      jobRef.current = ws;
+
+      ws.onmessage = (event: MessageEvent) => {
+        try {
+          const msg: { type: string; payload: unknown } = JSON.parse(event.data as string);
+          // Skip transport lifecycle events — not part of C2
+          if (msg.type === "run.started" || msg.type === "run.completed") return;
+          if (msg.type === "run.error") {
+            console.error("[ProductCut] graph error:", (msg.payload as Record<string, unknown>)?.error);
+            return;
+          }
+          handleEvent(msg as JobEvent);
+        } catch (err) {
+          console.error("[ProductCut] WS parse error:", err);
+        }
+      };
+
+      ws.onerror = (err) => console.error("[ProductCut] WebSocket error:", err);
+      ws.onclose = () => console.log("[ProductCut] WebSocket closed for job:", jobId);
+    },
+    [handleEvent],
+  );
+
+  // ---- generate -> live dashboard ----
+  const onGenerate = useCallback(async () => {
     if (state.transitioning) return;
-    const payload = {
-      brief: state.brief,
-      photoCount: state.photos.length,
-      direction: { moodWords: state.moodWords, referenceAd: state.refLink, neverDo: state.neverList, notes: state.notes },
-    };
-    console.log("[ProductCut] POST /api/ingest", payload);
-    setState({ transitioning: true });
+
+    const apiBase = getApiBase();
+
+    // Build multipart form
+    const formData = new FormData();
+    formData.append("brief", state.brief);
+    if (state.moodWords.length) formData.append("mood_words", JSON.stringify(state.moodWords));
+    if (state.refLink) formData.append("reference_ad", state.refLink);
+    if (state.neverList.length) formData.append("never_do", state.neverList.join(", "));
+    if (state.notes) formData.append("notes", state.notes);
+    state.photos.forEach((photo) => {
+      if (photo.file) formData.append("photos", photo.file, photo.name);
+    });
+
+    let jobId: string;
+    try {
+      const res = await fetch(`${apiBase}/jobs`, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`POST /jobs returned ${res.status}`);
+      const data = (await res.json()) as { job_id: string };
+      jobId = data.job_id;
+    } catch (err) {
+      console.error("[ProductCut] Failed to create job:", err);
+      return;
+    }
+
+    jobIdRef.current = jobId;
+    setState({ transitioning: true, jobId });
     const t = setTimeout(() => {
       setState({ transitioning: false, status: "dashboard", elapsed: 0, jobDone: false });
       startedAtRef.current = Date.now();
-      const el = setInterval(() => {
-        setState({ elapsed: Date.now() - startedAtRef.current });
-      }, 500);
+      const el = setInterval(() => setState({ elapsed: Date.now() - startedAtRef.current }), 500);
       elapsedIntervalRef.current = el;
       pushTimer(el);
-      const job = createMockJob();
-      jobRef.current = job;
-      job.on(handleEvent);
-      job.start();
+      openWebSocket(jobId);
     }, STEP_MS);
     pushTimer(t);
-  }, [state, handleEvent, setState]);
+  }, [state, setState, openWebSocket]);
 
-  const resolveInterrupt = useCallback((resolution: InterruptResolution) => {
-    jobRef.current?.resume(resolution);
-  }, []);
+  const resolveInterrupt = useCallback(
+    (resolution: InterruptResolution) => {
+      const jobId = jobIdRef.current;
+      if (!jobId) return;
+      setState({ interrupt: null, interruptResolution: resolution });
+      openWebSocket(jobId, resolution);
+    },
+    [openWebSocket, setState],
+  );
 
   const resetPipeline = useCallback(() => {
     clearTimers();
-    jobRef.current?.stop();
+    jobRef.current?.close();
     jobRef.current = null;
+    jobIdRef.current = null;
     setState((s) => ({ ...initialState(), theme: s.theme, history: s.history }));
   }, [setState]);
 
-  // ---- library ("My Ads") ----
+  // ---- library ----
   const openLibrary = useCallback(() => setState({ status: "library" }), [setState]);
   const closeLibrary = useCallback(() => {
     setState((s) => ({ status: s.truths.length ? "dashboard" : "wizard" }));
@@ -457,7 +642,7 @@ export default function StudioPage() {
         winnerId: null,
         merge: null,
         treatment: null,
-        budget: { shots: [], running: 0, cap: 0, unit: "" },
+        budget: { shots: [], running: 0, cap: 0, unit: "credits" },
         shots: [],
         drift: {},
         interrupt: null,
@@ -573,13 +758,15 @@ export default function StudioPage() {
           interrupt={state.interrupt}
           interruptResolution={state.interruptResolution}
           onApprove={() => resolveInterrupt("approve")}
-          onRetry={() => resolveInterrupt("retry")}
-          onFallback={() => resolveInterrupt("fallback")}
+          onRetry={() => resolveInterrupt("retry_with_edit")}
+          onFallback={() => resolveInterrupt("accept_fallback")}
           final={state.final}
         />
       )}
 
-      {state.status === "library" && <Library history={state.history} onClose={closeLibrary} onOpen={openHistoryItem} />}
+      {state.status === "library" && (
+        <Library history={state.history} onClose={closeLibrary} onOpen={openHistoryItem} />
+      )}
     </div>
   );
 }

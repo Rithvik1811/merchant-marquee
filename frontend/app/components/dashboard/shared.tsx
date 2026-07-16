@@ -9,13 +9,15 @@ export const SCORE_META: { key: ScoreKey; label: string }[] = [
 ];
 
 export const CATEGORY: Record<string, string> = {
-  material: "Material",
+  // Real backend categories (graph/state.py v11)
   color: "Color",
+  material: "Material",
   texture: "Texture",
-  distinguishing_mark: "Mark",
-  size: "Size",
-  condition: "Condition",
-  shape: "Shape",
+  construction_detail: "Construction",
+  material_character: "Character",
+  scale_cue: "Scale",
+  brief_or_intake_fact: "Brief",
+  form_factor: "Form factor",
 };
 
 export function categoryLabel(cat: string): string {

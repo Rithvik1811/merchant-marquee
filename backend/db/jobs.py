@@ -288,6 +288,34 @@ async def delete_job(conn: psycopg.AsyncConnection, job_id: str) -> None:
     await conn.commit()
 
 
+async def list_jobs(
+    conn: psycopg.AsyncConnection,
+    seller_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List jobs (newest first), optionally filtered by seller_id.
+
+    Returns summary rows: job_id, brief, status, created_at. Intended for the
+    Library panel -- not full state reconstruction (use read_job_state for that).
+    """
+    async with conn.cursor() as cur:
+        if seller_id is not None:
+            await cur.execute(
+                """SELECT job_id, brief, status, created_at
+                   FROM jobs WHERE seller_id = %s
+                   ORDER BY created_at DESC LIMIT %s""",
+                (seller_id, limit),
+            )
+        else:
+            await cur.execute(
+                """SELECT job_id, brief, status, created_at
+                   FROM jobs ORDER BY created_at DESC LIMIT %s""",
+                (limit,),
+            )
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 __all__ = [
     "connect",
     "init_tables",
@@ -295,4 +323,5 @@ __all__ = [
     "upsert_seller_direction",
     "read_job_state",
     "delete_job",
+    "list_jobs",
 ]

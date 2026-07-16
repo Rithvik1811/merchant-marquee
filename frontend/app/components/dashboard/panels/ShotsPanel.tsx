@@ -10,15 +10,15 @@ interface ShotsPanelProps {
 }
 
 function statusMeta(status: ShotStatus | undefined) {
-  if (status === "done") return { label: "done", color: "var(--ink-soft)" };
+  if (status === "passed") return { label: "done", color: "var(--ink-soft)" };
   if (status === "fallback") return { label: "fallback", color: "var(--accent)" };
   if (status === "generating") return { label: "generating", color: "var(--ink)" };
-  if (status === "retrying") return { label: "retry", color: "var(--warn)" };
-  return { label: "queued", color: "var(--faint)" };
+  if (status === "review" || status === "fallback_requested") return { label: "retry", color: "var(--warn)" };
+  return { label: "pending", color: "var(--faint)" };
 }
 
 export default function ShotsPanel({ shots, shotOpenId, onToggle }: ShotsPanelProps) {
-  const shotsDone = shots.filter((x) => x.status === "done" || x.status === "fallback").length;
+  const shotsDone = shots.filter((x) => x.status === "passed" || x.status === "fallback").length;
 
   return (
     <div>
@@ -34,8 +34,8 @@ export default function ShotsPanel({ shots, shotOpenId, onToggle }: ShotsPanelPr
         {shots.map((sh) => {
           const m = statusMeta(sh.status);
           const isFallback = sh.status === "fallback";
-          const isReal = sh.status === "done";
-          const isGenerating = sh.status === "generating" || sh.status === "retrying";
+          const isReal = sh.status === "passed";
+          const isGenerating = sh.status === "generating" || sh.status === "review" || sh.status === "fallback_requested";
           const open = shotOpenId === sh.id;
           const thumbBg: CSSProperties = isFallback
             ? { backgroundColor: "transparent", backgroundImage: "repeating-linear-gradient(45deg, var(--accent) 0 6px, var(--paper) 6px 12px)" }
