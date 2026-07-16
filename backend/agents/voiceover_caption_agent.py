@@ -1,21 +1,24 @@
 """
-Voiceover + Caption Agent -- CosyVoice v2 (cosyvoice-v2, DashScope international)
-with per-beat pacing control (Phase 5).
+Voiceover + Caption Agent -- CosyVoice v3-flash (cosyvoice-v3-flash, DashScope
+Singapore/intl) with per-beat pacing control (Phase 5).
 Spec of record: docs/TECHNICAL_DOCUMENTATION.md §5.11.
 
-TTS ENGINE: CosyVoice v2 (DashScope native), replacing ElevenLabs.
-Keeps the entire hackathon stack within the Qwen/Alibaba Cloud ecosystem.
-NOTE: cosyvoice-v3 (which supports instruct_text emotion control) is only
-available in the Beijing/mainland region. cosyvoice-v2 is used here because
-this account runs on the international (US/Singapore) region. The Voice
-Direction Agent (agents/voice_direction_agent.py) still rewrites each
-ScriptBeat.line into natural spoken English and assigns emotion + pacing --
-the spoken_text rewrite reaches TTS directly (more natural phrasing, better
-TTS prosody), and pacing maps to cosyvoice-v2's speech_rate parameter.
-Emotion tagging is preserved in state for forward-compatibility with v3 once
-the international region supports it.
-When no directed beats are present (e.g. the Voice Direction Agent was
-skipped), falls back to the raw beat lines at normal speech_rate.
+TTS ENGINE: CosyVoice v3-flash (DashScope native), confirmed available on the
+Singapore/intl region (wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference).
+Uses DASHSCOPE_TTS_API_KEY (the WebSocket JWT token) — NOT the standard
+DASHSCOPE_API_KEY (REST key). SpeechSynthesizer speaks WebSocket; the WS URL
+and key are separate from the REST API path used by text/vision agents.
+
+NOTE on instruction/emotion: cosyvoice-v3 supports emotion control via the
+`instruction` constructor parameter, but the instruction capability returned
+error 428 (not included in this account's subscription tier). Emotion from the
+Voice Direction Agent therefore shapes delivery only through the spoken_text
+rewrite (contractions, phrasing, natural flow), not TTS-level instruction.
+Pacing maps to speech_rate (0.85/1.0/1.10). Emotion is preserved in state for
+forward-compatibility if instruction access is unlocked later.
+
+When no directed beats are present, falls back to the raw beat lines at
+normal speech_rate.
 
 Confirmed against the ACTUAL merged code:
   * `graph.state.WinningScript` (C1, frozen): {text, beats: list[ScriptBeat],
@@ -75,9 +78,9 @@ OUTPUT AUDIO FORMAT -- MP3 (libmp3lame); ffmpeg re-encodes every per-beat clip
 through `aformat` before concatenation, so the output format is fixed
 regardless of the per-beat source format.
 
-CREDENTIALS: DashScope reads DASHSCOPE_API_KEY from the environment automatically
-(same key used by every other DashScope call in this codebase). Voice and model
-are env-overridable (COSYVOICE_MODEL_ID / COSYVOICE_VOICE_ID). See .env.example.
+CREDENTIALS: DASHSCOPE_TTS_API_KEY (WebSocket JWT token, different from the
+REST DASHSCOPE_API_KEY). SpeechSynthesizer uses WebSocket, not HTTP REST.
+Voice, model, and WS URL are env-overridable. See .env.example.
 """
 from __future__ import annotations
 
@@ -98,11 +101,20 @@ from graph.state import DirectedBeat, ProductCutState, WinningScript
 
 logger = logging.getLogger("productcut.agents.voiceover_caption_agent")
 
-# CosyVoice v2 model/voice, env-overridable. cosyvoice-v2 is the international-
-# region model (v3 is Beijing-only). longxiaochun_v2 is a deep commercial
-# narrator; other options: longyingxiao (female), longjiqi (male).
-COSYVOICE_MODEL_ID = os.getenv("COSYVOICE_MODEL_ID", "cosyvoice-v2")
-COSYVOICE_VOICE_ID = os.getenv("COSYVOICE_VOICE_ID", "longxiaochun_v2")
+# CosyVoice v3-flash model/voice, env-overridable.
+# Confirmed available on Singapore/intl region (derisk/test_cosyvoice3_intl.py).
+# longanyang is the instruction-capable v3-flash voice (instruction currently
+# unavailable in this subscription tier, but voice quality is still superior).
+# Other v3-flash voices: longyingxiao (female), longxiaochun (male).
+COSYVOICE_MODEL_ID = os.getenv("COSYVOICE_MODEL_ID", "cosyvoice-v3-flash")
+COSYVOICE_VOICE_ID = os.getenv("COSYVOICE_VOICE_ID", "longanyang")
+# WebSocket URL for DashScope TTS (SpeechSynthesizer speaks WS, not HTTP REST).
+# DASHSCOPE_TTS_API_KEY is the WebSocket JWT token (sk-ws-...), separate from
+# the standard DASHSCOPE_API_KEY REST key.
+COSYVOICE_WS_URL = os.getenv(
+    "COSYVOICE_WS_URL",
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference",
+)
 
 # CosyVoice synthesizes one short line per call -- generous margin above the
 # handful-of-seconds a single beat's line should realistically take.
@@ -150,17 +162,17 @@ def _call_cosyvoice_sync(
     text: str,
     pacing: str = "normal",
 ) -> str:
-    """Blocking CosyVoice v2 synthesis of one line -> local temp MP3 path.
+    """Blocking CosyVoice v3-flash synthesis of one line -> local temp MP3 path.
 
-    Returns the local path to the synthesized audio (never a remote URL) so the
-    caller can `ffmpeg.probe` its real duration and concatenate it with sibling
-    beats. `pacing` controls the speech_rate multiplier; cosyvoice-v2 does not
-    support instruct_text emotion control (that is v3-only, Beijing region).
+    Uses the WebSocket-based SpeechSynthesizer (DASHSCOPE_TTS_API_KEY + WS URL).
+    `pacing` controls the speech_rate multiplier. Instruction-based emotion
+    control is not used (error 428 on this account's subscription tier).
     """
     import dashscope
     from dashscope.audio.tts_v2 import SpeechSynthesizer, AudioFormat
 
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    # TTS uses the WebSocket JWT token, not the standard REST API key.
+    api_key = os.environ.get("DASHSCOPE_TTS_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
     if api_key:
         dashscope.api_key = api_key
 
@@ -171,6 +183,7 @@ def _call_cosyvoice_sync(
         voice=COSYVOICE_VOICE_ID,
         format=AudioFormat.MP3_22050HZ_MONO_256KBPS,
         speech_rate=speech_rate,
+        url=COSYVOICE_WS_URL,
     )
     audio_bytes: bytes = synthesizer.call(text)
     if not audio_bytes:
@@ -520,6 +533,7 @@ async def voiceover_caption_agent_node(
 __all__ = [
     "COSYVOICE_MODEL_ID",
     "COSYVOICE_VOICE_ID",
+    "COSYVOICE_WS_URL",
     "PACING_SPEECH_RATE",
     "DEFAULT_COSYVOICE_TIMEOUT_SEC",
     "MIN_ESTIMATED_BEAT_SEC",

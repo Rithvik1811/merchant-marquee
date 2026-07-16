@@ -151,6 +151,7 @@ def test_call_cosyvoice_sync_creates_temp_file(monkeypatch):
             captured["model"] = kwargs.get("model")
             captured["voice"] = kwargs.get("voice")
             captured["speech_rate"] = kwargs.get("speech_rate")
+            captured["url"] = kwargs.get("url")
 
         def call(self, text):
             captured["text"] = text
@@ -166,6 +167,7 @@ def test_call_cosyvoice_sync_creates_temp_file(monkeypatch):
         assert captured["voice"] == COSYVOICE_VOICE_ID
         assert captured["text"] == "hello world"
         assert captured["speech_rate"] == pytest.approx(1.10)
+        assert "dashscope-intl" in captured["url"]
     finally:
         os.remove(path)
 
