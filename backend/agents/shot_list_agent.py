@@ -178,7 +178,9 @@ NEGATIVE_PROMPT_BOILERPLATE = (
     # every conceivable wrong object (that would burn char budget legitimate
     # per-shot negative terms need) -- just the one empirically observed
     # attractor plus one generic-but-concrete substitution phrase.
-    ", object substitution, product transforming into a different object"
+    ", object substitution, product transforming into a different object, "
+    "pulsing light, light flicker, exposure flicker, iris breathing, "
+    "changing brightness, inconsistent lighting, light animation"
 )
 
 # Phone-related wrong-object terms are only safe to use as negatives when the
@@ -408,7 +410,13 @@ camera_move affordance rubric — a move is MOTIVATED only when the cited fact n
 - pan         -> lateral geometry worth traversing.
 NEVER compound/stacked moves — stacked camera moves visibly break current text-to-video models. static/push_in are safest (may run full length); orbit is highest-risk (keep short).
 
-human-contact affordance rubric — a HUMAN-INTERACTION shot_type (product_in_hand / worn_in_use) is MOTIVATED only when a cited fact names a part whose function is human contact — a handle, strap, grip, rim, spout, clasp, zipper pull, button, drawstring, band, trigger, or an equivalent named part — or a scale_cue/form_factor fact establishing the object is hand- or body-scale. When such a fact exists, the shot's contact point MUST be that fact's text, verbatim — same grounding discipline as every other shot. Reject "it's this kind of product, show someone using it" with no such fact cited. When at least one such fact exists among the product's truths, the shot list MUST include at least one human-interaction beat — people buy the moment of use, not the object; a wearable/carryable product shown only as still-life surfaces is a demo reel, not an ad. Omit human-interaction shots ONLY when no such fact exists."""
+human-contact affordance rubric — a HUMAN-INTERACTION shot_type (product_in_hand / worn_in_use) is MOTIVATED only when a cited fact names a part whose function is human contact — a handle, strap, grip, rim, spout, clasp, zipper pull, button, drawstring, band, trigger, or an equivalent named part — or a scale_cue/form_factor fact establishing the object is hand- or body-scale. When such a fact exists, the shot's contact point MUST be that fact's text, verbatim — same grounding discipline as every other shot. Reject "it's this kind of product, show someone using it" with no such fact cited. When such facts exist in the product's truths, the number of human-interaction shots should be product-type-aware — calibrate dynamically, do not force:
+- For hand-portable or wearable products (bags, shoes, watches, apparel, tools held in use) where 2 or more cited truths describe human-contact parts (handle, strap, grip, clasp, zipper, band, button, etc.) or a scale_cue confirming the product is body-scale: include 2–3 human-interaction shots, distributed across the arc (one in the opening/context zone, one in the demo zone, optionally one in the lifestyle/CTA zone). Each must cite a DIFFERENT fact about a different part or use moment — never repeat the same fact across two human shots.
+- For non-portable or non-contact products (large appliances, furniture, wall art, purely decorative objects) where human-contact facts are absent or sparse: 1 human-interaction shot is appropriate when a single contact fact exists; 0 when none exist.
+- NEVER force a human shot when no cited fact names a human-contact part or body-scale cue. The motivation must come from the fact, not from the product category.
+- NEVER repeat the same human-contact fact across two human-interaction shots — each must cite a distinct fact.
+People buy the moment of use, not the object; but a forced "someone using it" shot with no cited fact is equally hollow. Dynamic calibration based on the actual fact inventory is the standard.
+Omit human-interaction shots entirely ONLY when no human-contact or body-scale fact exists among the product's truths."""
 
 
 # ---------------------------------------------------------------------------

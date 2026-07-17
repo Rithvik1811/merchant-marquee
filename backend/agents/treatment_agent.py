@@ -274,6 +274,18 @@ HARD RULES:
   no paraphrasing, no partial-match approximations.
 - Every visual_approach/why_not_generic must reason from the beat's
   narrative function and the cited fact, not from what kind of product this is.
+- LIGHTING RULE: Your color_story MUST describe the lighting as static,
+  named cinematographic light sources — e.g. "soft key light from camera-left
+  at 45°, a fill from camera-right two stops under, a hair-light rim from
+  behind". Name the fixture or source (key, fill, rim, practical, bounce
+  card), its direction (camera-left/right, overhead, 45°, backlit), and its
+  quality (soft/hard, diffused, specular). NEVER use words that imply dynamic
+  or changing light: "moody", "low-key", "dramatic", "atmospheric", "cinematic
+  ambiance", "dancing", "shifting", "flickering", "pulsing", "contrasting
+  shadows", "rich highlights", "evocative". The lighting must read as something
+  a real gaffer set and locked — not a mood adjective. The video generation
+  model interprets dynamic lighting words as instructions to animate the
+  lighting, causing visible brightness flicker. Static source names prevent this.
 
 Return ONLY valid JSON in this exact shape, no preamble or commentary:
 

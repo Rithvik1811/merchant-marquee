@@ -279,7 +279,8 @@ DEFAULT_WAIT_TIMEOUT_SEC = float(os.getenv("VIDEO_GEN_WAIT_TIMEOUT_SEC", "180"))
 
 _QUALITY_BOILERPLATE = (
     "photorealistic, professional commercial cinematography, sharp focus, "
-    "high detail, natural color, no artifacts"
+    "high detail, natural color, no artifacts, "
+    "constant exposure throughout, stable studio lighting, no light flicker"
 )
 
 # video-gen-fidelity PHASE 1 fix. Root cause (confirmed against a real failed
