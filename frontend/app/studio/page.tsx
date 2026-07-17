@@ -615,7 +615,18 @@ export default function StudioPage() {
       };
 
       ws.onerror = (err) => console.error("[ProductCut] WebSocket error:", err);
-      ws.onclose = () => console.log("[ProductCut] WebSocket closed for job:", jobId);
+      ws.onclose = () => {
+        console.log("[ProductCut] WebSocket closed for job:", jobId);
+        jobRef.current = null;
+        // If the job isn't done, re-open automatically to resume the graph run.
+        setState((s) => {
+          if (!s.jobDone) {
+            // Delay slightly to avoid hammering the server on rapid close/open cycles.
+            setTimeout(() => openWebSocket(jobId), 2000);
+          }
+          return {};
+        });
+      };
     },
     [handleEvent],
   );

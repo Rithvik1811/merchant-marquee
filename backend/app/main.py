@@ -317,25 +317,37 @@ async def ws_run(
             logger.warning("Could not check state for resume of %s: %s", job_id, exc)
 
     if input_data is None:
-        # Fresh run — load persisted job state from DB
-        initial_state: dict = {"job_id": job_id}
+        # Check if a checkpoint already exists — if so, resume from it (pass None).
+        # Only start fresh when there is no prior checkpoint for this thread.
         try:
-            from db.jobs import connect as db_connect, read_job_state
-            conn = await db_connect()
-            try:
-                db_state = await read_job_state(conn, job_id)
-                if db_state:
-                    initial_state.update(db_state)
-            finally:
-                await conn.close()
-        except Exception as exc:
-            logger.warning("Could not load DB state for job %s: %s", job_id, exc)
+            snapshot = await graph.aget_state(config)
+            has_checkpoint = snapshot is not None and snapshot.values
+        except Exception:
+            has_checkpoint = False
 
-        if brand_name:
-            initial_state["brand_name"] = brand_name
-        if brand_url:
-            initial_state["brand_url"] = brand_url
-        input_data = initial_state
+        if has_checkpoint:
+            logger.info("Reconnect: resuming job %s from existing checkpoint (next=%s)", job_id, getattr(snapshot, 'next', None))
+            input_data = None
+        else:
+            # Truly fresh run — load persisted job state from DB
+            initial_state: dict = {"job_id": job_id}
+            try:
+                from db.jobs import connect as db_connect, read_job_state
+                conn = await db_connect()
+                try:
+                    db_state = await read_job_state(conn, job_id)
+                    if db_state:
+                        initial_state.update(db_state)
+                finally:
+                    await conn.close()
+            except Exception as exc:
+                logger.warning("Could not load DB state for job %s: %s", job_id, exc)
+
+            if brand_name:
+                initial_state["brand_name"] = brand_name
+            if brand_url:
+                initial_state["brand_url"] = brand_url
+            input_data = initial_state
 
     try:
         await websocket.send_json(

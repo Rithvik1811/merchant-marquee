@@ -68,6 +68,8 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 
+from langchain_core.callbacks.manager import adispatch_custom_event
+
 from agents._retry import create_completion
 from agents.justification_validator import BANNED_WORD, BEAT_FUNCTIONS, validate_justifications
 from graph.state import BeatTreatment, ProductTruth, ScriptBeat, Treatment, VisualDirection, WinningScript
@@ -555,6 +557,9 @@ async def treatment_agent_node(state: dict) -> dict:
         trace_note += f" {fallback_count} beat(s) used the literal lowest-risk fallback after failed validation."
     if treatment.get("character_anchor"):
         trace_note += " Script implies a person -- character_anchor set for Cast continuity."
+
+    await adispatch_custom_event("treatment_ready", {"treatment": treatment})
+
     return {
         "treatment": treatment,
         "reasoning_trace": state.get("reasoning_trace", "") + trace_note,
