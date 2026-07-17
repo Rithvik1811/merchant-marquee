@@ -43,7 +43,7 @@ export default function BudgetPanel({ budget, budgetOpenId, onToggle }: BudgetPa
             >
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 12, color: "var(--ink)", flex: 1 }}>{sh.label}</span>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" }}>{sh.alloc}</span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" }}>${Number(sh.alloc).toFixed(2)}</span>
               </div>
               {open && (
                 <p style={{ margin: "6px 0 0", fontSize: "11.5px", lineHeight: 1.5, color: "var(--ink-soft)" }}>{sh.justification}</p>
