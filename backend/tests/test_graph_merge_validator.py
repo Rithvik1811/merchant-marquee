@@ -33,6 +33,8 @@ never touches that placeholder edge.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from graph.build import build_graph
@@ -159,3 +161,68 @@ async def test_merge_validator_falls_back_on_unrepairable_pacing_failure(monkeyp
     assert all("product_category" not in shot for shot in shot_list)
     assert final["budget_ledger"]["cap"] > 0
     assert final["budget_ledger"] == budget_event["data"]["ledger"]
+
+
+@pytest.mark.asyncio
+async def test_merge_validator_reports_job_failed_when_zero_variants_survive(monkeypatch):
+    """Reproduces a real crash, confirmed on a live run: Concept Agent produced
+    0/4 valid script variants (even after its targeted re-prompt), so
+    meta_critic_node received script_variants=[] and short-circuited to
+    meta_critic_result.outcome == "all_excluded_failure" with no
+    merge_candidate at all. merge_validator_node used to let
+    _candidate_from_state's ValueError propagate unhandled, crashing the
+    whole graph run. It must now report job_failed and let the graph reach
+    END gracefully instead -- this is the regression test for that fix.
+    """
+    monkeypatch.setattr(
+        "agents.product_truth_extractor.AsyncOpenAI",
+        make_fake_async_openai([TRUTH_EXTRACTOR_PAYLOAD]),
+    )
+    # Empty script_variants on every call (including the targeted re-prompt --
+    # FakeOpenAIClient reuses the last response for calls beyond the list) is
+    # exactly how a real "0/4 valid after re-prompt" run looks from Concept
+    # Agent's own return value: generate_script_variants logs a warning and
+    # returns [] rather than raising, so this is real, reachable behavior, not
+    # a contrived state.
+    monkeypatch.setattr(
+        "agents.concept_agent.AsyncOpenAI",
+        make_fake_async_openai([json.dumps({"script_variants": []})]),
+    )
+    # hook/pacing/body/cta/tone checkers all short-circuit to `return {}` on
+    # empty script_variants (confirmed in agents/hook_checker.py and mirrored
+    # across the other four) -- zero LLM calls happen on this path, so no
+    # agents.critic_llm.OpenAI patch is needed at all.
+
+    graph = await build_graph()
+    initial_state = {
+        "job_id": "test-job-merge-validator-zero-variants",
+        "product_photos": ["http://example.com/a.jpg"],
+        "brief": "charcoal briquettes for backyard grilling",
+    }
+    config = {"configurable": {"thread_id": "test-job-merge-validator-zero-variants"}}
+
+    custom_events = [
+        event
+        async for event in graph.astream_events(initial_state, config=config, version="v2")
+        if event.get("event") == "on_custom_event"
+    ]
+
+    event_names = {e["name"] for e in custom_events}
+    # The old crash meant NEITHER of these could ever fire for this state shape.
+    assert "job_failed" in event_names
+    assert "merge_validated" not in event_names  # never got as far as validating anything
+
+    failed_event = next(e for e in custom_events if e["name"] == "job_failed")
+    assert failed_event["data"]["stage"] == "merge_validator"
+    assert failed_event["data"]["reason"]  # non-empty, seller-visible text
+    assert "all_excluded_failure" not in failed_event["data"]["reason"]  # no raw internals leaked to the user
+
+    final = (await graph.aget_state(config)).values
+    assert "job_failure" in final
+    assert final["job_failure"]["stage"] == "merge_validator"
+    assert "winning_script" not in final  # never produced -- nothing valid to build one from
+    assert "treatment" not in final  # graph genuinely stopped here, didn't limp into Phase 2
+
+    # The graph actually reached END (not stuck mid-run / not still pending a node).
+    snapshot = await graph.aget_state(config)
+    assert snapshot.next == ()

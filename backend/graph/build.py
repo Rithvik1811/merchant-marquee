@@ -232,6 +232,7 @@ def _build_uncompiled() -> StateGraph:
             "fallback": "visual_direction_agent",      # was "treatment_agent"
             "voice_direction_agent": "voice_direction_agent",   # NEW
             "visual_direction_agent": "visual_direction_agent",
+            "job_failed": END,   # merge_validator_node found no candidate to merge at all
         },
     )
     return builder
@@ -258,7 +259,18 @@ def _route_after_merge_validation_with_vo(state: ProductCutState) -> list[str]:
     Hashable | Sequence[Hashable]]`). The "copy_editor"/"meta_critic" retry
     branches are unaffected -- winning_script isn't final yet on those paths, so
     neither sub-branch fires.
+
+    Checks state["job_failure"] BEFORE calling route_after_merge_validation:
+    merge_validator_node sets it (instead of appending a merge_attempts entry)
+    on its terminal-failure path -- no candidate to validate at all -- and
+    route_after_merge_validation itself raises on an empty merge_attempts, so
+    calling it here first would just crash the routing step instead of the
+    node. Confirmed as the real graceful-failure path via a real run: Concept
+    Agent produced 0 valid variants -> meta_critic_result.outcome ==
+    "all_excluded_failure" -> merge_validator_node had no candidate.
     """
+    if state.get("job_failure"):
+        return ["job_failed"]
     route = route_after_merge_validation(state)
     if route in ("finalize", "fallback"):
         return ["visual_direction_agent", "voice_direction_agent"]
