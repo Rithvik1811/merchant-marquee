@@ -15,6 +15,7 @@ from agents._oss import (
     persist_remote_video_to_oss,
     upload_audio_to_oss,
     upload_json_to_oss,
+    upload_photo_to_oss,
     upload_video_to_oss,
 )
 
@@ -117,6 +118,29 @@ def test_upload_json_to_oss_puts_file_with_json_content_type(tmp_path):
     assert key == "jobs/job-7/captions.json"
     assert headers["Content-Type"] == "application/json"
     assert url.startswith("https://oss.example.invalid/jobs/job-7/captions.json")
+
+
+def test_upload_photo_to_oss_puts_file_under_photos_subfolder(tmp_path):
+    local = tmp_path / "photo1.jpg"
+    local.write_bytes(b"fake-jpg")
+    bucket = _FakeBucket()
+
+    url = upload_photo_to_oss(str(local), "job-7", "photo1.jpg", bucket=bucket)
+
+    key, path, headers = bucket.uploads[0]
+    assert key == "jobs/job-7/photos/photo1.jpg"
+    assert headers["Content-Type"] == "image/jpeg"
+    assert url.startswith("https://oss.example.invalid/jobs/job-7/photos/photo1.jpg")
+
+
+def test_upload_photo_to_oss_guesses_content_type_from_extension(tmp_path):
+    local = tmp_path / "photo2.png"
+    local.write_bytes(b"fake-png")
+    bucket = _FakeBucket()
+
+    upload_photo_to_oss(str(local), "job-7", "photo2.png", bucket=bucket)
+
+    assert bucket.uploads[0][2]["Content-Type"] == "image/png"
 
 
 def test_persist_remote_video_cleans_up_temp_even_on_upload_failure(tmp_path):

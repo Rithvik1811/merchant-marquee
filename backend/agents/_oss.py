@@ -44,6 +44,7 @@ otherwise misname a job-wide asset as if it belonged to one shot.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import tempfile
 from typing import Callable, Optional
@@ -170,6 +171,32 @@ def upload_master_cut_to_oss(
     return _put_and_sign(key, local_path, "video/mp4", bucket=bucket)
 
 
+def upload_photo_to_oss(
+    local_path: str,
+    job_id: str,
+    filename: str,
+    *,
+    bucket: Optional[object] = None,
+) -> str:
+    """Upload one seller-submitted product photo to the job's OSS namespace.
+
+    Same shape as `upload_export_to_oss` -- keyed via `oss_job_asset_key` under
+    a `photos/` subfolder (`jobs/{job_id}/photos/{filename}`) so photos don't
+    collide with the job's other job-level assets (voiceover, captions,
+    master cut, exports) in the same `jobs/{job_id}/` root. Content-Type is
+    guessed from the filename extension, falling back to "image/jpeg" for an
+    unrecognized/missing one -- the wizard's file input already restricts to
+    `accept="image/*"` before a photo ever reaches this call.
+
+    First caller: app/main.py's POST /jobs ingest endpoint, replacing the
+    local-disk write whose http://localhost:.../uploads/... URLs DashScope's
+    vision model cannot reach (only signed OSS URLs are externally fetchable).
+    """
+    key = oss_job_asset_key(job_id, f"photos/{filename}")
+    content_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    return _put_and_sign(key, local_path, content_type, bucket=bucket)
+
+
 def upload_json_to_oss(
     local_path: str,
     job_id: str,
@@ -265,6 +292,7 @@ __all__ = [
     "upload_audio_to_oss",
     "upload_master_cut_to_oss",
     "upload_export_to_oss",
+    "upload_photo_to_oss",
     "upload_json_to_oss",
     "persist_remote_video_to_oss",
 ]

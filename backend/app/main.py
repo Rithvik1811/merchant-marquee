@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
@@ -59,9 +60,23 @@ logger = logging.getLogger("productcut.app")
 UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", "./uploads"))
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Base URL the graph will use when building absolute photo URLs for DashScope.
-# Must be reachable by DashScope's servers in prod (use a public URL).
+# Base URL the graph will use when building absolute photo URLs for DashScope,
+# only used when PHOTO_STORAGE=local. Must be reachable by DashScope's
+# servers in prod (use a public URL) -- localhost never is, which is exactly
+# why PHOTO_STORAGE defaults to "oss" below.
 BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8000")
+
+# Where uploaded product photos are persisted:
+#   "oss"   (default) -- agents/_oss.py uploads to the real OSS bucket and
+#            returns a signed, externally-fetchable GET URL. Required for any
+#            run where product_truth_extractor's vision-model call needs to
+#            actually reach the photos (i.e. every real run).
+#   "local" -- old behaviour: written to UPLOADS_DIR and served from this
+#            process at BACKEND_BASE_URL/uploads/... . Only useful for
+#            testing the ingest/wizard flow itself without touching OSS --
+#            DashScope cannot fetch a localhost URL, so a run started this
+#            way will still fail at product_truth_extractor.
+PHOTO_STORAGE = os.environ.get("PHOTO_STORAGE", "oss").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,7 +135,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve locally-uploaded photos in dev (in prod, use signed OSS URLs)
+# Serves photos only when PHOTO_STORAGE=local; harmless no-op mount otherwise
+# (kept mounted unconditionally so flipping the env var doesn't need a code change).
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 # ---------------------------------------------------------------------------
@@ -157,8 +173,10 @@ async def create_job_endpoint(
 ) -> dict:
     """Accept a seller's brief + photos + optional direction; return a job_id.
 
-    Photos are saved to UPLOADS_DIR/{job_id}/ and exposed at /uploads/{job_id}/{name}.
-    In production swap _save_photos for OSS upload (agents/_oss.py).
+    Photos are uploaded to OSS (agents/_oss.py) by default, returning signed
+    GET URLs the vision model can actually fetch; set PHOTO_STORAGE=local to
+    fall back to the old UPLOADS_DIR/{job_id}/ + /uploads/{job_id}/{name} path
+    for local-only testing (see _save_photos / PHOTO_STORAGE above).
     """
     job_id = str(uuid.uuid4())
 
@@ -201,10 +219,22 @@ async def create_job_endpoint(
 
 
 async def _save_photos(photos: list[UploadFile], job_id: str) -> list[str]:
-    refs: list[str] = []
     valid = [p for p in photos if p and p.filename]
     if not valid:
-        return refs
+        return []
+    if PHOTO_STORAGE == "local":
+        return await _save_photos_local(valid, job_id)
+    return await _save_photos_oss(valid, job_id)
+
+
+async def _save_photos_local(valid: list[UploadFile], job_id: str) -> list[str]:
+    """Legacy path (PHOTO_STORAGE=local): write to disk, serve via /uploads.
+
+    Kept only for local-only testing of the ingest/wizard flow -- these URLs
+    are not reachable by DashScope, so a real pipeline run needs PHOTO_STORAGE
+    left at its "oss" default.
+    """
+    refs: list[str] = []
     job_dir = UPLOADS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     for photo in valid:
@@ -212,6 +242,31 @@ async def _save_photos(photos: list[UploadFile], job_id: str) -> list[str]:
         content = await photo.read()
         (job_dir / safe).write_bytes(content)
         refs.append(f"{BACKEND_BASE_URL}/uploads/{job_id}/{safe}")
+    return refs
+
+
+async def _save_photos_oss(valid: list[UploadFile], job_id: str) -> list[str]:
+    """Default path: upload each photo to OSS, return signed GET URLs.
+
+    Deliberately does not catch/fall back on OSS errors -- if OSS is
+    unreachable or misconfigured while PHOTO_STORAGE=oss (the default), the
+    request should fail loudly with a 500 rather than silently degrade to a
+    localhost URL DashScope can't fetch (the exact bug this replaces).
+    """
+    from agents._oss import upload_photo_to_oss
+
+    refs: list[str] = []
+    for photo in valid:
+        safe = Path(photo.filename).name  # type: ignore[arg-type]
+        content = await photo.read()
+        fd, tmp_path = tempfile.mkstemp(suffix=Path(safe).suffix or ".jpg", prefix="ingest_photo_")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(content)
+            refs.append(upload_photo_to_oss(tmp_path, job_id, safe))
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
     return refs
 
 
