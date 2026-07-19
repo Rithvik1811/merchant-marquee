@@ -21,37 +21,11 @@ import type {
   Truth,
 } from "@/lib/types";
 import { useMergeState } from "@/lib/useMergeState";
+import { PHASES, NODE_TO_PHASE } from "@/lib/phases";
 import "./studio.css";
 
 const STEP_MS = 340;
 const HISTORY_KEY = "pc-job-history";
-
-// Map LangGraph node names → pipeline phase display strings
-const NODE_TO_PHASE: Record<string, string> = {
-  ingest_node: "Ingest",
-  brand_research_node: "Ingest",
-  product_truth_extractor: "Truths",
-  concept_agent: "Scripts",
-  hook_checker: "Scripts",
-  pacing_checker: "Scripts",
-  body_checker: "Scripts",
-  cta_checker: "Scripts",
-  tone_checker: "Scripts",
-  meta_critic: "Scripts",
-  merge_validator: "Scripts",
-  copy_editor: "Scripts",
-  visual_direction_agent: "Treatment",
-  treatment_agent: "Treatment",
-  shot_list_agent: "Budget",
-  budget_gate: "Budget",
-  video_gen_node: "Shots",
-  ken_burns_fallback_node: "Shots",
-  continuity_agent: "Continuity",
-  continuity_gate: "Continuity",
-  voiceover_caption_agent: "Delivery",
-  assembly_agent: "Delivery",
-  format_export_node: "Delivery",
-};
 
 const FINAL_RATIOS: Final["ratios"] = [
   { id: "9x16", label: "9:16", use: "TikTok / Reels", w: 9, h: 16 },
@@ -79,8 +53,10 @@ interface State {
   dragOver: boolean;
 
   jobId: string | null;
-  phase: string;
-  phaseLabel: string;
+  // Highest pipeline stage index (into PHASES) any real C2 event has proven
+  // reached; -1 = nothing received yet. Never guessed ahead of real events —
+  // see handleEvent's phase bumps below.
+  maxPhaseIdx: number;
   elapsed: number;
   jobDone: boolean;
 
@@ -125,8 +101,7 @@ function initialState(): State {
     dragOver: false,
 
     jobId: null,
-    phase: "",
-    phaseLabel: "",
+    maxPhaseIdx: -1,
     elapsed: 0,
     jobDone: false,
 
@@ -339,14 +314,22 @@ export default function StudioPage() {
 
   // ---- C2 event handler ----
   // Adapts real backend C2 payloads into the State shape that Dashboard components render.
+  // Monotonic max: only ever advances, and only in response to a real event —
+  // never lets a later-arriving event regress an earlier, already-proven stage.
+  const bumpPhase = useCallback(
+    (idx: number) => setState((s) => (idx > s.maxPhaseIdx ? { maxPhaseIdx: idx } : {})),
+    [setState],
+  );
+
   const handleEvent = useCallback(
     (e: JobEvent) => {
       const { type, payload } = e;
       switch (type) {
         case "node_started": {
-          const phase = NODE_TO_PHASE[payload.node] ?? payload.node;
-          const phaseLabel = payload.label ?? phase;
-          setState({ phase, phaseLabel });
+          // Not currently emitted by the real backend (see lib/phases.ts), but
+          // respected if it ever is, via the same real-event-only cascade.
+          const phase = NODE_TO_PHASE[payload.node];
+          if (phase) bumpPhase(PHASES.indexOf(phase));
           break;
         }
 
@@ -358,6 +341,7 @@ export default function StudioPage() {
             fact_text: t.fact,
           }));
           setState((s) => ({ truths: [...s.truths, ...truths] }));
+          bumpPhase(PHASES.indexOf("Truths"));
           break;
         }
 
@@ -387,6 +371,7 @@ export default function StudioPage() {
             winnerId: firstWinner ?? s.winnerId,
             activeScriptId: firstWinner ?? s.activeScriptId,
           }));
+          bumpPhase(PHASES.indexOf("Scripts"));
           break;
         }
 
@@ -407,6 +392,7 @@ export default function StudioPage() {
               },
             },
           });
+          bumpPhase(PHASES.indexOf("Scripts"));
           break;
         }
 
@@ -426,6 +412,7 @@ export default function StudioPage() {
               })),
             },
           });
+          bumpPhase(PHASES.indexOf("Treatment"));
           break;
         }
 
@@ -448,6 +435,7 @@ export default function StudioPage() {
               },
             };
           });
+          bumpPhase(PHASES.indexOf("Budget"));
           break;
         }
 
@@ -478,6 +466,7 @@ export default function StudioPage() {
             };
             return { shots: [...s.shots, newShot] };
           });
+          bumpPhase(PHASES.indexOf("Shots"));
           break;
         }
 
@@ -487,6 +476,7 @@ export default function StudioPage() {
             drift: { ...s.drift, [payload.shot_id]: payload.drift_score },
             driftThreshold: payload.threshold,
           }));
+          bumpPhase(PHASES.indexOf("Continuity"));
           break;
         }
 
@@ -503,6 +493,7 @@ export default function StudioPage() {
               : [{ id: "c0", note: "No candidate frames available" }],
           };
           setState({ interrupt });
+          bumpPhase(PHASES.indexOf("Continuity"));
           break;
         }
 
@@ -528,8 +519,9 @@ export default function StudioPage() {
             };
             const history = [entry, ...s.history].slice(0, 20);
             try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
-            return { final, jobDone: true, phase: "Delivery", history };
+            return { final, jobDone: true, history };
           });
+          bumpPhase(PHASES.indexOf("Delivery"));
           break;
         }
 
@@ -543,7 +535,7 @@ export default function StudioPage() {
           break;
       }
     },
-    [setState],
+    [setState, bumpPhase],
   );
 
   // ---- WebSocket connection ----
@@ -696,8 +688,7 @@ export default function StudioPage() {
       setState({
         status: "dashboard",
         jobDone: true,
-        phase: "Delivery",
-        phaseLabel: "",
+        maxPhaseIdx: PHASES.length - 1,
         truths: entry.truths,
         scripts: [],
         activeScriptId: null,
@@ -790,8 +781,7 @@ export default function StudioPage() {
 
       {state.status === "dashboard" && (
         <Dashboard
-          phase={state.phase}
-          phaseLabel={state.phaseLabel}
+          maxPhaseIdx={state.maxPhaseIdx}
           elapsed={state.elapsed}
           jobDone={state.jobDone}
           onResetPipeline={resetPipeline}
