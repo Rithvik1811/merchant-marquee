@@ -29,12 +29,33 @@ export const PHASE_RUNNING_LABEL: Record<Phase, string> = {
   Delivery: "Assembling the final cut…",
 };
 
-// LangGraph node name -> phase, for the (currently unwired but frozen-C2)
-// "node_started" event -- see graph/events.py's NodeStartedPayload. Kept so
-// handleEvent can respect it correctly if a future backend change starts
-// emitting it, without guessing a sequence in the meantime.
+// LangGraph node name -> phase, for the real `node_started` C2 event that
+// app/main.py's `_KNOWN_NODE_NAMES` synthesizes from `on_chain_start` (Bug 8
+// there) -- this IS live, not speculative; keep node names in sync with that
+// set and with graph/build.py's `add_node` calls, not with events.py's
+// NodeStartedPayload docstring alone.
+//
+// After `merge_validator` (end of Scripts), the graph forks into TWO parallel
+// branches (graph/build.py's merge_validator conditional edge fans out to both
+// `visual_direction_agent` and `voice_direction_agent` -- see
+// docs/TECHNICAL_DOCUMENTATION.md / CLAUDE.md: "Voiceover generation runs in
+// parallel with video-gen"):
+//   - video branch: visual_direction_agent -> treatment_agent -> shot_list_agent
+//     -> budget_gate -> video_gen -> ken_burns_fallback -> continuity_agent
+//     -> continuity_gate -> assembly_agent
+//   - voice branch: voice_direction_agent -> voiceover_caption_agent -> assembly_agent
+// The voice branch's nodes can start (and finish) well before Treatment/
+// Budget/Shots/Continuity do, so `voice_direction_agent`/`voiceover_caption_agent`
+// must NOT map to a phase here -- doing so would bump maxPhaseIdx (a
+// monotonic max, see studio/page.tsx's bumpPhase) straight to "Delivery"
+// while those still-blank panels are marked "done" in the nav, which is
+// exactly the "Delivery underlined while the Scripts panel is what's still
+// showing" bug. `assembly_agent` is registered with `defer=True` (build.py),
+// meaning it only ever starts once BOTH branches have reached it -- that
+// makes its node_started a genuine, safe signal that Shots/Continuity are
+// really done, so it (and format_export_node, which runs after it) are the
+// only real "Delivery" gates here.
 export const NODE_TO_PHASE: Record<string, Phase> = {
-  ingest_node: "Ingest",
   brand_research_node: "Ingest",
   product_truth_extractor: "Truths",
   concept_agent: "Scripts",
@@ -50,11 +71,10 @@ export const NODE_TO_PHASE: Record<string, Phase> = {
   treatment_agent: "Treatment",
   shot_list_agent: "Budget",
   budget_gate: "Budget",
-  video_gen_node: "Shots",
-  ken_burns_fallback_node: "Shots",
+  video_gen: "Shots",
+  ken_burns_fallback: "Shots",
   continuity_agent: "Continuity",
   continuity_gate: "Continuity",
-  voiceover_caption_agent: "Delivery",
   assembly_agent: "Delivery",
   format_export_node: "Delivery",
 };
