@@ -455,7 +455,15 @@ async def ws_run(
         return
 
     graph = websocket.app.state.graph
-    config = {"configurable": {"thread_id": job_id}}
+    # Default recursion_limit=25 is too low for this graph: the
+    # video_gen -> ken_burns_fallback -> continuity_agent -> continuity_gate
+    # retry cycle (graph/build.py's own docstring: "can take an unbounded
+    # number of superstep passes") needs ~15 initial supersteps plus up to
+    # MAX_AUTO_RETRIES (default 3) loop passes x 4 supersteps each -- the same
+    # math tests/test_continuity_loop_e2e.py already raises its recursion_limit
+    # to 50 for, but that fix was never ported to this real run path. Confirmed
+    # live: a real job hit GraphRecursionError at the default limit of 25.
+    config = {"configurable": {"thread_id": job_id}, "recursion_limit": 100}
 
     # Bug 1: per-job concurrency lock — reject a second concurrent run on same thread
     lock = _run_locks.setdefault(job_id, asyncio.Lock())

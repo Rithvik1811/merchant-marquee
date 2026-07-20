@@ -25,9 +25,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Optional
 
+import psycopg
+from psycopg.rows import dict_row
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.runnables import RunnableConfig
 from pydantic import (
@@ -54,6 +57,7 @@ from agents.pacing_checker import (
     NUM_EARLY_BEATS,
     check_pacing,
 )
+from db.jobs import update_job_status
 from graph.state import ProductCutState
 
 logger = logging.getLogger("productcut.critics.merge_validator")
@@ -728,6 +732,51 @@ def route_after_merge_validation(state: ProductCutState) -> str:
     return "fallback"  # 'pacing', or None (no coherence verdict was obtainable)
 
 
+def _describe_merge_failure(state: ProductCutState) -> str:
+    """Human-readable, seller-safe reason for why there is no merge candidate.
+
+    meta_critic_result.notes is the most specific thing available (e.g. "no
+    variants supplied" for the all_excluded_failure case confirmed on a real
+    run: Concept Agent produced 0 valid script variants, so nothing ever
+    reached the critic chain for meta_critic to pick a candidate from).
+    """
+    mcr = state.get("meta_critic_result") or {}
+    outcome = mcr.get("outcome") or "unknown"
+    notes = mcr.get("notes")
+    if outcome == "all_excluded_failure":
+        return (
+            "We couldn't generate a usable ad script for this product -- every "
+            "draft was rejected by our quality checks. " + (notes or "")
+        ).strip()
+    return f"We couldn't finish this job (script stage failed: {outcome}). " + (notes or "")
+
+
+async def _report_job_failure(state: ProductCutState, config: RunnableConfig, reason: str) -> None:
+    """Dispatch job_failed (C2) and best-effort persist status='failed' to RDS.
+
+    Mirrors agents/format_export_node.py's update_job_status usage on the
+    success path -- same connect/try/finally/best-effort-log-on-exception
+    shape, so a DB hiccup here still lets the C2 event (the part the running
+    frontend actually needs live) go out.
+    """
+    await adispatch_custom_event(
+        "job_failed",
+        {"reason": reason, "stage": "merge_validator"},
+        config=config,
+    )
+    job_id = state.get("job_id")
+    database_url = os.environ.get("DATABASE_URL")
+    if job_id and database_url:
+        try:
+            conn = await psycopg.AsyncConnection.connect(database_url, row_factory=dict_row)
+            try:
+                await update_job_status(conn, job_id, "failed")
+            finally:
+                await conn.close()
+        except Exception as exc:
+            logger.warning("merge_validator_node: could not update job status: %s", exc)
+
+
 async def merge_validator_node(state: ProductCutState, config: RunnableConfig) -> dict:
     """LangGraph node wrapper (§5.4.7): validates the pending merge candidate,
     appends a §6-shaped merge_attempts[] entry, and — only on a pass or the
@@ -736,8 +785,33 @@ async def merge_validator_node(state: ProductCutState, config: RunnableConfig) -
     though this node calls it internally too, purely to decide whether IT should
     do the fallback assembly / set winning_script this turn (single source of truth,
     not a re-implementation).
+
+    Terminal-failure path: if there is genuinely no candidate to validate
+    (_candidate_from_state raises -- confirmed on a real run to happen when
+    meta_critic_result.outcome == "all_excluded_failure", i.e. Concept Agent
+    produced zero valid script variants), this used to propagate an unhandled
+    ValueError that crashed the whole WS run with a backend traceback the
+    frontend never surfaced (the connection just dropped). It now reports a
+    real job_failed C2 event + a "failed" job status instead, and returns
+    state["job_failure"] so graph/build.py's routing sends this run straight
+    to END rather than continuing with no winning_script.
     """
-    candidate = _candidate_from_state(state)
+    try:
+        candidate = _candidate_from_state(state)
+    except ValueError:
+        reason = _describe_merge_failure(state)
+        logger.error(
+            "merge_validator_node: no merge candidate -- failing job gracefully. %s "
+            "(meta_critic_result=%r)",
+            reason, state.get("meta_critic_result"),
+        )
+        await _report_job_failure(state, config, reason)
+        trace_note = f"\n[merge_validator] no candidate to validate -- job_failed: {reason}"
+        return {
+            "job_failure": {"reason": reason, "stage": "merge_validator"},
+            "reasoning_trace": state.get("reasoning_trace", "") + trace_note,
+        }
+
     prior_attempts = state.get("merge_attempts") or []
     attempt_number = len(prior_attempts) + 1
     # agents.copy_editor.copy_editor_node (built in parallel) writes its result to

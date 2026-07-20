@@ -444,6 +444,14 @@ class ProductCutState(TypedDict, total=False):
     pending_merge_candidate: NotRequired[dict]
     coherence_validation_result: NotRequired[dict]
     last_copy_edit: NotRequired[dict]
+    # Set by merge_validator_node when there is genuinely no merge candidate to
+    # validate (e.g. meta_critic_result.outcome == "all_excluded_failure" --
+    # every script variant was rejected by the critic chain). Its presence is
+    # the terminal-failure signal build.py's routing checks BEFORE
+    # route_after_merge_validation (which requires a non-empty merge_attempts
+    # and would itself raise on this exact state). Job-level, unlike
+    # Shot.failure_reason above which is per-shot.
+    job_failure: NotRequired[dict]
     winning_script: WinningScript
     # v12: per-beat spoken-English rewrites + emotion/pacing metadata, written by
     # voice_direction_agent_node (serial pre-step before voiceover_caption_agent),

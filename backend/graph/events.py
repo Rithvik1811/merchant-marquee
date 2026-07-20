@@ -62,6 +62,18 @@ version: 5
         flagged here, pending a sync with whoever builds the dashboard's
         Assembly panel. `total_duration_sec` is the ffprobe'd (real, not
         planned) duration of the finished mezzanine.
+  - v6: added "job_failed" event type + JobFailedPayload. Fixes a real,
+        reproduced bug: merge_validator_node used to raise an unhandled
+        ValueError (crashing the whole WS run with a backend traceback the
+        frontend never surfaced) whenever meta_critic_result had no usable
+        merge_candidate -- concretely, meta_critic_result.outcome ==
+        "all_excluded_failure" (every script variant rejected by the critic
+        chain, confirmed on a real run). merge_validator_node now catches
+        that condition, dispatches this event with a real reason instead of
+        crashing, and graph/build.py routes straight to END rather than
+        continuing with no winning_script. This is the pipeline's only
+        terminal-failure signal; every prior "the job stops" path was either
+        `job_complete` (success) or an actual unhandled exception.
 """
 from __future__ import annotations
 
@@ -102,6 +114,7 @@ EventType = Literal[
     "merge_validated",
     "vo_ready",
     "master_cut_ready",
+    "job_failed",
 ]
 
 
@@ -216,6 +229,17 @@ class MasterCutReadyPayload(TypedDict):
     total_duration_sec: float  # ffprobe'd (real, not planned) duration of the finished mezzanine
 
 
+class JobFailedPayload(TypedDict):
+    """The pipeline hit a genuine terminal failure it cannot recover from --
+    currently fired only by merge_validator_node when meta_critic_result has
+    no usable merge_candidate (e.g. outcome == "all_excluded_failure"). The
+    frontend's only other "the job stopped" signal is job_complete (success);
+    this is the failure counterpart, meant to be user-visible rather than a
+    dropped WebSocket connection."""
+    reason: str    # human-readable, safe to show a seller directly
+    stage: str     # which node/phase detected the failure, e.g. "merge_validator"
+
+
 EventPayload = Union[
     NodeStartedPayload,
     TruthExtractedPayload,
@@ -231,6 +255,7 @@ EventPayload = Union[
     MergeValidatedPayload,
     VoReadyPayload,
     MasterCutReadyPayload,
+    JobFailedPayload,
 ]
 
 
@@ -289,5 +314,6 @@ __all__ = [
     "MergeValidatedPayload",
     "VoReadyPayload",
     "MasterCutReadyPayload",
+    "JobFailedPayload",
     "build_event",
 ]
