@@ -871,9 +871,96 @@ async def _call_wan_video_gen_intl(
 
 
 # ---------------------------------------------------------------------------
-# Real Wan2.6-i2v-us call (native dashscope SDK -- see module docstring's
-# KNOWN GAP on region/base-URL configuration).
-# Dispatches to _call_wan_video_gen_intl when INTL env vars are set.
+# HappyHorse 1.1-i2v (US Virginia) raw REST caller.
+# Same input schema as Wan 2.7 intl: media = [{"type": "first_frame", "url": ...}]
+# Uses the primary US API key + DASHSCOPE_VIDEO_BASE_URL.
+# ---------------------------------------------------------------------------
+async def _call_happyhorse_video_gen(
+    *,
+    image_url: str,
+    prompt: str,
+    negative_prompt: str,
+    duration_sec: float,
+    resolution: str,
+    seed: Optional[int] = None,
+) -> str:
+    api_key = os.environ["DASHSCOPE_API_KEY"]
+    base_url = os.environ.get("DASHSCOPE_VIDEO_BASE_URL", "https://dashscope-us.aliyuncs.com/api/v1")
+    model = os.environ["MODEL_VIDEO"]
+
+    body: dict = {
+        "model": model,
+        "input": {
+            "prompt": prompt,
+            "media": [{"type": "first_frame", "url": image_url}],
+        },
+        "parameters": {
+            "duration": int(round(duration_sec)),
+            "resolution": resolution,
+        },
+    }
+    if negative_prompt:
+        body["input"]["negative_prompt"] = negative_prompt
+    if seed is not None:
+        body["parameters"]["seed"] = seed
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-DashScope-Async": "enable",
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await asyncio.wait_for(
+                client.post(
+                    f"{base_url}/services/aigc/video-generation/video-synthesis",
+                    headers=headers,
+                    json=body,
+                    timeout=30,
+                ),
+                timeout=DEFAULT_WAIT_TIMEOUT_SEC,
+            )
+            if resp.status_code != 200:
+                raise VideoGenAPIError(f"HappyHorse submit failed: HTTP {resp.status_code}: {resp.text[:200]}")
+
+            task_id = resp.json()["output"]["task_id"]
+            deadline = asyncio.get_event_loop().time() + DEFAULT_WAIT_TIMEOUT_SEC
+
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(10)
+                poll = await client.get(
+                    f"{base_url}/tasks/{task_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=30,
+                )
+                data = poll.json()
+                status = data.get("output", {}).get("task_status")
+                if status == "SUCCEEDED":
+                    return data["output"]["video_url"]
+                if status == "FAILED":
+                    code = data.get("output", {}).get("code", "")
+                    message = data.get("output", {}).get("message", "")
+                    raise VideoGenAPIError(
+                        f"HappyHorse task FAILED (code={code!r}, message={message!r})"
+                    )
+
+            raise VideoGenTimeoutError(
+                f"HappyHorse task did not complete within {DEFAULT_WAIT_TIMEOUT_SEC:.0f}s"
+            )
+    except asyncio.TimeoutError as exc:
+        raise VideoGenTimeoutError(
+            f"HappyHorse generation exceeded the {DEFAULT_WAIT_TIMEOUT_SEC:.0f}s wait timeout"
+        ) from exc
+    except (VideoGenTimeoutError, VideoGenAPIError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise VideoGenAPIError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Primary video-gen dispatcher.
+# Routes: HappyHorse (US REST) → Wan 2.7 INTL (SG REST) → Wan 2.6 (US SDK).
 # ---------------------------------------------------------------------------
 async def _call_wan_video_gen(
     *,
@@ -884,12 +971,25 @@ async def _call_wan_video_gen(
     resolution: str,
     seed: Optional[int] = None,
 ) -> str:
-    """Submit + wait for one Wan generation. Returns the video URL on success.
+    """Submit + wait for one video generation. Returns the video URL on success.
     Raises VideoGenTimeoutError / VideoGenAPIError on failure -- never retries.
 
-    Routes to `_call_wan_video_gen_intl` (raw REST, Wan 2.7 schema) when INTL
-    env vars are set; otherwise uses the dashscope SDK (Wan 2.6 schema).
+    Routing priority:
+      1. MODEL_VIDEO starts with "happyhorse" → _call_happyhorse_video_gen (US REST)
+      2. INTL env vars all present         → _call_wan_video_gen_intl (SG REST)
+      3. Otherwise                         → dashscope SDK (Wan 2.6 US)
     """
+    model = os.environ.get("MODEL_VIDEO", "")
+    if model.startswith("happyhorse"):
+        return await _call_happyhorse_video_gen(
+            image_url=image_url,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            duration_sec=duration_sec,
+            resolution=resolution,
+            seed=seed,
+        )
+
     if _use_intl_video():
         return await _call_wan_video_gen_intl(
             image_url=image_url,
@@ -904,7 +1004,6 @@ async def _call_wan_video_gen(
     video_base_url = os.getenv("DASHSCOPE_VIDEO_BASE_URL")
     if video_base_url:
         dashscope.base_http_api_url = video_base_url
-    model = os.environ["MODEL_VIDEO"]
 
     call_kwargs = dict(
         model=model,
