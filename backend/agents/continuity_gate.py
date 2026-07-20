@@ -117,18 +117,12 @@ own docstring). `same_object == false` -- regardless of `confidence`, per the
 identity prompt's own "do not give the benefit of the doubt" instruction -- is
 treated as a HARD failure, routed by a SEPARATE, ADDITIVE decision layered
 BEFORE the existing drift-threshold branch below:
-  * 1st hard identity failure for a shot -> exactly ONE automatic retry (same
-    mechanism as an over-threshold drift auto-retry -- `status="pending"`,
-    `retry_count` incremented -- but NOT counted against `MAX_AUTO_RETRIES`,
-    and logged/traced distinctly for observability). A fresh sample can escape
-    a bad generation mode a drift-style retry would also fix, so it gets its
-    own one-shot budget rather than being folded into the drift retry cap.
-  * 2nd CONSECUTIVE hard identity failure for the same shot -> routes STRAIGHT
-    to `fallback_requested` (Ken-Burns), skipping both the remaining
-    `MAX_AUTO_RETRIES` budget and human review entirely -- two wrong-object
-    generations in a row means the prompt/reference combination itself is
-    unfixable by resampling, so burning the normal retry/review budget
-    chasing it would just delay an inevitable fallback.
+  * Every hard identity failure for a shot -> automatic retry (`status="pending"`,
+    `retry_count` incremented, NOT counted against `MAX_AUTO_RETRIES`). The streak
+    counter (`IDENTITY_HARD_FAIL_STREAK_KEY`) is still incremented on every failure
+    for observability, but there is NO Ken-Burns routing path for identity failures
+    -- we keep re-sampling regardless of streak length. Budget overrun is preferred
+    over falling back to a static Ken-Burns clip.
   * A CONSECUTIVE-failure streak is tracked via `IDENTITY_HARD_FAIL_STREAK_KEY`,
     an extra, undeclared key written directly onto the Shot dict (not a C1
     schema field -- `graph.shot_schema.validate_shot_list`'s `extra="forbid"`
@@ -256,9 +250,9 @@ async def continuity_gate_node(
     shots are auto-retried up to MAX_AUTO_RETRIES times; once those retries are
     exhausted the best-available generated clip is AUTO-ACCEPTED as-is (stamped
     with CONTINUITY_APPROVED_KEY, kept `status="passed"`), never routed to the
-    Ken-Burns static-image fallback. (Ken-Burns remains reserved for hard infra
-    failures raised by Video-Gen itself, and for the two-consecutive hard-identity
-    failure path below.)
+    Ken-Burns static-image fallback. Hard identity failures (same_object=false) are
+    always retried regardless of streak -- Ken-Burns is NOT triggered for identity
+    failures.
 
     Returns updated `shot_list` (statuses/retry_counts patched), the (unchanged)
     `human_review_queue` passed through, and `reasoning_trace`.
@@ -280,7 +274,6 @@ async def continuity_gate_node(
     n_review = 0
     n_within = 0
     n_identity_retry = 0
-    n_identity_fallback = 0
 
     for shot in shots:
         shot_id = shot["shot_id"]
@@ -311,31 +304,17 @@ async def continuity_gate_node(
 
         if identity and identity.get("same_object") is False:
             streak = shot.get(IDENTITY_HARD_FAIL_STREAK_KEY, 0) + 1
-            if streak >= 2:
-                updated_shots.append(
-                    {**shot, "status": FALLBACK_REQUESTED_STATUS, IDENTITY_HARD_FAIL_STREAK_KEY: streak}
-                )
-                n_identity_fallback += 1
-                logger.warning(
-                    "Continuity Gate: shot %s failed the IDENTITY check TWICE in a "
-                    "row (same_object=false, confidence=%s) -- routing straight to "
-                    "Ken-Burns fallback instead of exhausting the normal drift "
-                    "retry/review budget on an unfixable prompt/reference combo.",
-                    shot_id, identity.get("confidence"),
-                )
-            else:
-                updated_shots.append(
-                    {**shot, "status": PENDING_STATUS, "retry_count": shot.get("retry_count", 0) + 1,
-                     IDENTITY_HARD_FAIL_STREAK_KEY: streak}
-                )
-                n_identity_retry += 1
-                logger.warning(
-                    "Continuity Gate: shot %s failed the IDENTITY check (same_object="
-                    "false, confidence=%s) -- distinct from a normal drift retry: one "
-                    "automatic re-sample allowed (not counted against MAX_AUTO_RETRIES) "
-                    "-> pending.",
-                    shot_id, identity.get("confidence"),
-                )
+            updated_shots.append(
+                {**shot, "status": PENDING_STATUS, "retry_count": shot.get("retry_count", 0) + 1,
+                 IDENTITY_HARD_FAIL_STREAK_KEY: streak}
+            )
+            n_identity_retry += 1
+            logger.warning(
+                "Continuity Gate: shot %s failed the IDENTITY check (same_object="
+                "false, confidence=%s, consecutive_streak=%d) -- re-sampling "
+                "(Ken-Burns disabled for identity failures; retrying regardless of streak).",
+                shot_id, identity.get("confidence"), streak,
+            )
             continue
 
         drift = float(entry["drift_score"])
@@ -373,9 +352,7 @@ async def continuity_gate_node(
     trace_note = (
         f"\n[continuity_gate] {n_within} shot(s) within drift threshold; "
         f"{n_retry} auto-retried; {n_review} auto-accepted (retries exhausted); "
-        f"{n_identity_retry} auto-retried for a HARD IDENTITY failure; "
-        f"{n_identity_fallback} routed straight to Ken-Burns after a second "
-        "consecutive identity failure."
+        f"{n_identity_retry} auto-retried for a HARD IDENTITY failure (Ken-Burns disabled)."
     )
     return {
         "shot_list": updated_shots,
