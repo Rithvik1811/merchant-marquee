@@ -225,20 +225,8 @@ export default function Home() {
             "padding .4s var(--ease), background-color .4s var(--ease), border-color .4s var(--ease)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ position: "relative", width: 18, height: 18, border: "1.3px solid var(--ink)", flex: "0 0 auto" }}>
-            <span
-              style={{
-                position: "absolute",
-                width: 4,
-                height: 4,
-                borderRadius: "50%",
-                background: "var(--accent)",
-                top: 3,
-                left: 3,
-              }}
-            />
-          </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+          <img src="/mm-logo.png" alt="Merchant Marquee" style={{ height: 24, width: "auto", flex: "0 0 auto" }} />
           <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 19 }}>Merchant Marquee</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
@@ -654,10 +642,8 @@ export default function Home() {
 
       {/* FOOTER */}
       <footer data-rid="footer" style={{ borderTop: "1px solid var(--hair)", padding: "30px 48px", display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 1180, margin: "0 auto" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-          <div style={{ position: "relative", width: 15, height: 15, border: "1.2px solid var(--ink)", flex: "0 0 auto" }}>
-            <span style={{ position: "absolute", width: "3.5px", height: "3.5px", borderRadius: "50%", background: "var(--accent)", top: "2.5px", left: "2.5px" }} />
-          </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <img src="/mm-logo.png" alt="Merchant Marquee" style={{ height: 18, width: "auto", flex: "0 0 auto" }} />
           <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 15, color: "var(--ink-soft)" }}>Merchant Marquee</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 28, fontFamily: "var(--font-sans)", fontSize: "12.5px", color: "var(--faint)" }}>
