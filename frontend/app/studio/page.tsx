@@ -33,6 +33,122 @@ const FINAL_RATIOS: Final["ratios"] = [
   { id: "16x9", label: "16:9", use: "YouTube / Web", w: 16, h: 9 },
 ];
 
+// Matches backend/agents/continuity_agent.py's DRIFT_THRESHOLD default (0.35,
+// env-overridable via CONTINUITY_DRIFT_THRESHOLD) — the raw checkpoint state
+// doesn't persist the threshold actually used for a past run, so this is the
+// best available reconstruction for a reopened job's Continuity panel.
+const CONTINUITY_DEFAULT_THRESHOLD = 0.35;
+
+interface SnapshotHydration {
+  truths: Truth[];
+  scripts: Script[];
+  winnerId: string | null;
+  treatment: Treatment | null;
+  budget: Budget & { running: number };
+  shots: Shot[];
+  drift: Record<string, number>;
+  driftThreshold: number;
+}
+
+// Rebuilds every dashboard panel's data straight from a real GET
+// /jobs/{id}/state checkpoint snapshot (the raw ProductCutState — see
+// backend/graph/state.py), NOT from the C2 WebSocket event shapes handleEvent
+// consumes. The two are different shapes for the same underlying data (e.g.
+// the live truth_extracted event wraps facts as {truths: [...]}, but the raw
+// checkpoint field is `product_truths`) — reading the wrong key silently
+// yields an empty panel instead of an error, which is what previously made
+// reopening a completed job show only budget/final instead of the full
+// dashboard. Shared by openHistoryItem so a reopened job renders identically
+// to how a live job's dashboard looks once complete.
+function hydrateFromSnapshot(st: Record<string, unknown>): SnapshotHydration {
+  const rawTruths = st["product_truths"] as
+    | Array<{ truth_id: string; fact: string; category: Truth["category"] }>
+    | undefined;
+  const truths: Truth[] = (rawTruths ?? []).map((t) => ({ id: t.truth_id, category: t.category, fact_text: t.fact }));
+
+  const rawCriticScores = st["critic_scores"] as
+    | Record<string, { hook: number; pacing: number; completion: number; cta: number; tone: number; composite: number; justification: string }>
+    | undefined;
+  const winningScript = st["winning_script"] as { beats?: Array<{ line: string }>; source_variant_ids?: string[] } | undefined;
+  const winnerId = winningScript?.source_variant_ids?.[0] ?? null;
+  const scripts: Script[] = Object.entries(rawCriticScores ?? {}).map(([id, score], i) => ({
+    id,
+    title: `Variant ${String(i + 1).padStart(2, "0")}`,
+    scores: {
+      hook: Math.round(score.hook * 100),
+      pacing: Math.round(score.pacing * 100),
+      completion: Math.round(score.completion * 100),
+      cta: Math.round(score.cta * 100),
+      tone: Math.round(score.tone * 100),
+    },
+    reasoning: score.justification,
+    lines: id === winnerId && winningScript?.beats?.length ? winningScript.beats.map((b) => b.line) : [],
+    total: Math.round(score.composite * 100),
+  }));
+
+  const rawTreatment = st["treatment"] as
+    | {
+        director_persona: string;
+        color_story: string;
+        pacing_philosophy: string;
+        beat_treatments?: Array<{ beat_index: number; script_quote: string; truth_fact_id: string; why_not_generic: string }>;
+      }
+    | undefined;
+  const treatment: Treatment | null = rawTreatment
+    ? {
+        director_persona: rawTreatment.director_persona,
+        color_story: rawTreatment.color_story,
+        pacing_philosophy: rawTreatment.pacing_philosophy,
+        beats: (rawTreatment.beat_treatments ?? []).map((b) => ({
+          id: String(b.beat_index),
+          script_quote: b.script_quote,
+          truth_fact_id: b.truth_fact_id,
+          why_not_generic: b.why_not_generic,
+        })),
+      }
+    : null;
+
+  const rawShotList = st["shot_list"] as Array<{ shot_id: string; status?: Shot["status"] }> | undefined;
+  const rawLedger = st["budget_ledger"] as { cap: number; spent: number; per_shot: Record<string, number> } | undefined;
+  const rawGenerated = st["generated_shots"] as Record<string, { video_uri: string; drift_score?: number }> | undefined;
+  const shotIndexById = new Map((rawShotList ?? []).map((s, i) => [s.shot_id, i]));
+
+  const budget: Budget & { running: number } = rawLedger
+    ? {
+        cap: rawLedger.cap,
+        unit: "credits",
+        running: rawLedger.spent,
+        shots: Object.entries(rawLedger.per_shot ?? {}).map(([id, alloc]) => ({
+          id,
+          label: `Shot ${(shotIndexById.get(id) ?? 0) + 1}`,
+          alloc,
+          justification: "",
+        })),
+      }
+    : { shots: [], running: 0, cap: 0, unit: "credits" };
+
+  const shots: Shot[] = (rawShotList ?? []).map((s, i) => {
+    const gen = rawGenerated?.[s.shot_id];
+    return {
+      id: s.shot_id,
+      label: `Shot ${i + 1}`,
+      camera: "",
+      move: "",
+      duration: "",
+      fallback: s.status === "fallback",
+      status: s.status,
+      ...(gen?.video_uri ? { videoUri: gen.video_uri } : {}),
+    };
+  });
+
+  const drift: Record<string, number> = {};
+  for (const [id, gen] of Object.entries(rawGenerated ?? {})) {
+    if (typeof gen.drift_score === "number") drift[id] = gen.drift_score;
+  }
+
+  return { truths, scripts, winnerId, treatment, budget, shots, drift, driftThreshold: CONTINUITY_DEFAULT_THRESHOLD };
+}
+
 type Theme = "light" | "dark";
 type Status = "wizard" | "dashboard" | "library";
 
@@ -654,8 +770,10 @@ export default function StudioPage() {
             });
             return;
           }
-          // Rehydrate truths so the panel isn't blank after reconnect.
-          const rawTruths = st["truths"] as Array<{ truth_id: string; fact: string; category: string }> | undefined;
+          // Rehydrate truths so the panel isn't blank after reconnect. Raw
+          // checkpoint state uses ProductCutState's real field name
+          // (`product_truths`), not the C2 event's "truths" wrapper key.
+          const rawTruths = st["product_truths"] as Array<{ truth_id: string; fact: string; category: string }> | undefined;
           if (rawTruths?.length) {
             setState((s) => {
               if (s.truths.length) return {};
@@ -901,25 +1019,22 @@ export default function StudioPage() {
   const openHistoryItem = useCallback(
     async (entry: HistoryEntry) => {
       let final = entry.final;
-      let truths = entry.truths;
+      let hydrated: SnapshotHydration | null = null;
 
-      // DB-only entry: no cached data — fetch full state from checkpoint
-      if (entry.jobId && !final) {
+      // Always pull the real checkpoint snapshot when we have a job_id — a
+      // cached HistoryEntry (written by job_complete's history-entry, or
+      // seeded from GET /jobs) only ever carries truths+final, never
+      // scripts/treatment/budget/shots/drift, so reopening must fetch the
+      // full GET /jobs/{id}/state snapshot every time to populate every panel,
+      // not just skip the fetch because *some* cached data already exists.
+      if (entry.jobId) {
         try {
           const res = await fetch(`${getApiBase()}/jobs/${entry.jobId}/state`);
           if (res.ok) {
             const data: { state?: Record<string, unknown> } = await res.json();
             const st = data.state ?? {};
-            // Reconstruct truths
-            const rawTruths = st["truths"] as Array<{ truth_id: string; fact: string; category: string }> | undefined;
-            if (rawTruths?.length) {
-              truths = rawTruths.map((t) => ({
-                id: t.truth_id,
-                fact_text: t.fact,
-                category: t.category as import("@/lib/types").TruthCategory,
-              }));
-            }
-            // Reconstruct final
+            hydrated = hydrateFromSnapshot(st);
+
             const masterCutUri = st["master_cut_uri"] as string | undefined;
             const ex = st["exports"] as { aspect_9x16?: string; aspect_1x1?: string; aspect_16x9?: string } | undefined;
             if (ex) {
@@ -934,7 +1049,7 @@ export default function StudioPage() {
               };
             }
           }
-        } catch { /* best-effort */ }
+        } catch { /* best-effort — fall back to cached entry fields below */ }
       }
 
       if (entry.jobId && final) {
@@ -959,15 +1074,16 @@ export default function StudioPage() {
         status: "dashboard",
         jobDone: true,
         maxPhaseIdx: PHASES.length - 1,
-        truths,
-        scripts: [],
-        activeScriptId: null,
-        winnerId: null,
+        truths: hydrated?.truths.length ? hydrated.truths : entry.truths,
+        scripts: hydrated?.scripts ?? [],
+        activeScriptId: hydrated?.winnerId ?? null,
+        winnerId: hydrated?.winnerId ?? null,
         merge: null,
-        treatment: null,
-        budget: { shots: [], running: 0, cap: 0, unit: "credits" },
-        shots: [],
-        drift: {},
+        treatment: hydrated?.treatment ?? null,
+        budget: hydrated?.budget ?? { shots: [], running: 0, cap: 0, unit: "credits" },
+        shots: hydrated?.shots ?? [],
+        drift: hydrated?.drift ?? {},
+        driftThreshold: hydrated?.driftThreshold ?? CONTINUITY_DEFAULT_THRESHOLD,
         interrupt: null,
         interruptResolution: null,
         final,
