@@ -308,6 +308,59 @@ async def list_jobs_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# DELETE /jobs/{job_id}  — remove a job from My Ads (real DB + OSS delete)
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job_endpoint(job_id: str) -> dict:
+    """Permanently delete a job: its `jobs`/`seller_direction` DB rows and its
+    OSS asset prefix. Confirmation lives client-side (Library asks before
+    calling this) — this endpoint itself deletes unconditionally, matching
+    every other mutating endpoint here (no soft-delete/undo).
+    """
+    from db.jobs import connect as db_connect, read_job_state, delete_job
+
+    try:
+        conn = await db_connect()
+        try:
+            existing = await read_job_state(conn, job_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail=f"job {job_id!r} not found")
+            await delete_job(conn, job_id)
+        finally:
+            await conn.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("delete_job DB delete failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=503, detail="Database unavailable — could not delete job.")
+
+    # Best-effort OSS cleanup: the DB row (the source of truth for My Ads) is
+    # already gone at this point, so a failure here just leaves orphaned OSS
+    # objects rather than blocking the user-visible delete.
+    oss_deleted = 0
+    if os.environ.get("OSS_ACCESS_KEY_ID"):
+        try:
+            from agents._oss import delete_job_assets
+            oss_deleted = await asyncio.to_thread(delete_job_assets, job_id)
+        except Exception as exc:
+            logger.warning("delete_job OSS cleanup failed for %s: %s", job_id, exc)
+
+    # Best-effort local-upload cleanup (dev fallback path in _save_photos).
+    try:
+        job_dir = UPLOADS_DIR / job_id
+        if job_dir.is_dir():
+            import shutil
+            shutil.rmtree(job_dir, ignore_errors=True)
+    except Exception as exc:
+        logger.warning("delete_job local upload cleanup failed for %s: %s", job_id, exc)
+
+    _run_locks.pop(job_id, None)
+    return {"job_id": job_id, "deleted": True, "oss_objects_deleted": oss_deleted}
+
+
+# ---------------------------------------------------------------------------
 # GET /jobs/{job_id}/state  — graph checkpoint snapshot
 # ---------------------------------------------------------------------------
 
