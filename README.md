@@ -79,7 +79,7 @@ flowchart TD
     end
 ```
 
-**Solid arrows** are graph edges (control and data flow). **Dashed arrows** are live streaming channels to the frontend via `astream_events` → WebSocket. Diamonds are decision nodes that can loop, pause, or branch. The `interrupt: Human Review` is a genuine LangGraph `interrupt()` — the graph checkpoints, surfaces the shot in the UI, and resumes from the checkpoint on seller response.
+**Solid arrows** are graph edges. **Dashed arrows** are live streaming channels via `astream_events` → WebSocket. Diamonds are decision nodes that can loop, pause, or branch. `interrupt: Human Review` is a genuine LangGraph `interrupt()` — the graph checkpoints and resumes from the checkpoint on seller response.
 
 ---
 
@@ -87,19 +87,19 @@ flowchart TD
 
 | Stage | Node(s) | What happens |
 |---|---|---|
-| **1 — Ingest** | `Ingest Node` | Validates photos (2–3), stores to OSS, captures optional seller direction (mood words, never-do, freeform) |
-| **2 — Product Truths** | `Product Truth Extractor` (Qwen-VL) | Extracts 6–10 specific, non-generic facts from the actual uploaded photos — exact colors, materials, textures, scale cues. Every fact gets a `truth_id` that flows through all downstream nodes |
-| **3 — Scripts** | `Concept Agent` (Qwen-Max) | Generates 4 structurally distinct 15–30s ad scripts, each forced to use a different copywriting framework (PAS, AIDA, BAB, Hook-Problem-Solution), hook type, and emotional trigger. Each script must cite ≥ 2 product truth IDs |
-| **4 — Critic Chain** | Hook / Pacing / Body / CTA / Tone checkers → `Meta-Critic` | Five specialist checkers score all four scripts in parallel across orthogonal axes (hook strength, timing math, body completion, CTA clarity, tone fit). Meta-Critic cross-pollinates: picks the best-scoring hook, body, and CTA from across all variants and merges them into one script |
-| **5 — Merge Validation** | `Merge Coherence Validator` + `Copy Editor` | An independent Qwen-Plus node cold-reads the merged script for voice consistency and promise-payoff match — it never shares context with the Meta-Critic that built it. Voice seam failures route to the Copy Editor (constrained polish only); promise-payoff failures route back to the Meta-Critic for a swap |
-| **6 — Treatment** | `Treatment Agent` (Qwen-Plus) | Writes a director's treatment: persona, color story, pacing philosophy, and per-beat justifications each required to cite a verbatim script quote and a product truth ID |
-| **7 — Shot List** | `Shot-List Agent` (two Qwen calls) + `Justification Validator` | Call A produces only justifications (script quote + truth ID + treatment ref); a deterministic validator checks them before Call B ever runs. Call B produces camera/composition fields conditioned on the validated justifications. 3–7 shots, no product category field anywhere in the schema |
-| **8 — Budget Gate** | `Budget Gate` (deterministic) | Grounding-weighted allocation (hook/CTA shots and truth-grounded shots get more budget). If over cap: priority-ordered deterministic reduce — downgrade resolution, cut lowest-weight shots, redistribute via waterfill. Never re-invokes the Shot-List Agent's LLM calls |
-| **9 — Video Gen** | `Video-Gen Node` (Wan 2.6 i2v) + `Ken-Burns Fallback` | Shots fan out in parallel via LangGraph `Send()`. Every shot is image-to-video with the seller's reference photo — never pure text-to-video. Hard API failures degrade immediately to a Ken-Burns pan/zoom on the source photo |
-| **10 — Continuity** | `Continuity Agent` (Qwen-VL) | Checks each clip for product-identity drift (early-frame categorical check) and cross-shot style consistency. Up to 2 auto-retries per shot; exhausted retries raise a real `interrupt()` for seller approval |
-| **11 — Voiceover** | `Voiceover + Caption Agent` (Qwen TTS) | Runs as a parallel branch from script finalization — doesn't wait on video gen. Produces a synced audio track and caption timing file aligned to beat timestamps |
-| **12 — Assembly** | `Assembly Agent` (ffmpeg) | Stitches approved shots in script order, overlays the voiceover, burns captions and CTA text into each shot's reserved `text_overlay_zone`. Deterministic — no LLM call |
-| **13 — Export** | `Format Export Node` (ffmpeg) | Recomposes the master cut into 9:16, 1:1, and 16:9 using the pre-reserved text overlay zones. Zero additional video-gen cost |
+| **1 — Ingest** | `Ingest Node` | Validates photos (2–3), stores to OSS, captures optional seller direction |
+| **2 — Product Truths** | `Product Truth Extractor` (Qwen-VL) | Extracts 6–10 specific facts from uploaded photos — colors, materials, textures, scale cues. Every fact gets a `truth_id` that flows through all downstream nodes |
+| **3 — Scripts** | `Concept Agent` (Qwen-Max) | Generates 4 structurally distinct ad scripts, each using a different copywriting framework (PAS, AIDA, BAB, Hook-Problem-Solution) |
+| **4 — Critic Chain** | Hook / Pacing / Body / CTA / Tone checkers → `Meta-Critic` | Five specialist checkers score all four scripts in parallel. Meta-Critic cross-pollinates: picks the best hook, body, and CTA from across all variants and merges them |
+| **5 — Merge Validation** | `Merge Coherence Validator` + `Copy Editor` | Independent Qwen-Plus node cold-reads the merged script. Voice failures route to the Copy Editor; promise-payoff failures route back to the Meta-Critic |
+| **6 — Treatment** | `Treatment Agent` (Qwen-Plus) | Director's treatment: persona, color story, pacing philosophy, per-beat justifications citing verbatim script quotes and truth IDs |
+| **7 — Shot List** | `Shot-List Agent` + `Justification Validator` | Two sequential Qwen calls. Call A: justifications only → validated. Call B: camera/composition fields conditioned on validated justifications |
+| **8 — Budget Gate** | `Budget Gate` (deterministic) | Grounding-weighted allocation. If over cap: priority-ordered reduce — downgrade resolution, cut lowest-weight shots, redistribute via waterfill. No LLM re-invocation |
+| **9 — Video Gen** | `Video-Gen Node` (Wan 2.7 i2v) + `Ken-Burns Fallback` | Shots fan out in parallel via LangGraph `Send()`. Every shot is image-to-video with the seller's reference photo. Hard failures degrade to Ken-Burns pan/zoom |
+| **10 — Continuity** | `Continuity Agent` (Qwen-VL) | Early-frame identity check + drift score per shot. Up to 2 auto-retries; exhausted retries raise a real `interrupt()` for seller approval |
+| **11 — Voiceover** | `Voiceover + Caption Agent` (Qwen TTS) | Parallel branch from script finalization. Synced audio track + caption timing aligned to beat timestamps |
+| **12 — Assembly** | `Assembly Agent` (ffmpeg) | Stitches approved shots, overlays voiceover, burns captions and CTA into each shot's reserved zone |
+| **13 — Export** | `Format Export Node` (ffmpeg) | Recomposes master cut into 9:16, 1:1, and 16:9. Zero additional video-gen cost |
 
 ---
 
@@ -134,48 +134,33 @@ flowchart TD
 | **LLM / Reasoning** | Qwen-Max, Qwen-Plus (DashScope OpenAI-compatible endpoint) |
 | **Vision** | Qwen-VL (product truth extraction, continuity drift scoring) |
 | **Speech** | Qwen TTS / CosyVoice (DashScope Singapore endpoint) |
-| **Video Generation** | Wan 2.6 image-to-video (DashScope US endpoint) |
+| **Video Generation** | Wan 2.7 image-to-video (DashScope endpoint) |
 | **Video Assembly** | ffmpeg (deterministic — no LLM calls) |
 | **Database** | Alibaba Cloud RDS PostgreSQL (jobs, budget ledger, LangGraph checkpoints) |
 | **Storage** | Alibaba Cloud OSS (photos, shot clips, final videos) |
-| **Deployment** | Alibaba Cloud ECS — Docker Compose, GitHub Actions auto-deploy on push to `master` |
+| **Deployment** | Alibaba Cloud ECS — Docker Compose + Nginx, GitHub Actions auto-deploy on push to `master` |
 | **Realtime** | LangGraph `astream_events` → FastAPI WebSocket → browser |
-
----
-
-## Key Design Decisions
-
-**Why LangGraph, not CrewAI or AutoGen.** The pipeline is a budget-capped DAG with parallel fan-out, a count-limited retry loop, and resumable checkpointed execution — none of which map cleanly to conversational role-based delegation. LangGraph's `Send()`, conditional edges, `interrupt()`, and Postgres checkpointer are all first-class primitives, not workarounds.
-
-**Script-driven direction, not category-driven.** Every camera/composition choice in the shot list must be justified by a verbatim quote from the actual winning script and a real product truth ID. The `product_category` field does not exist anywhere in the schema — it was removed as the seam through which template-based genericness re-enters the pipeline.
-
-**The Meta-Critic never grades its own merge.** The Merge Coherence Validator is a structurally separate node that receives the Meta-Critic's output but shares no call context with the reasoning that produced it — a cold read by a different model call, not the merge-writer re-confirming its own work.
-
-**Budget allocation is real dollars, not an abstract proxy.** `allocated_budget = duration_sec × rate(resolution_tier)` — Wan pricing is flat per second per resolution. Every per-shot allocation, the running total, and the hard cap are real figures visible on the live dashboard.
-
-**Graceful degradation, never a blocking failure.** Hard video-gen API failures degrade immediately to a Ken-Burns ffmpeg fallback. Identity drift goes to 2 auto-retries then a human `interrupt()`, never an infinite loop. The Budget Gate's reduce pass only cuts (never merges) shots from the already-validated list — no new content re-enters the pipeline at the gate.
 
 ---
 
 ## Deployment
 
-The system runs on Alibaba Cloud ECS behind Docker Compose, with GitHub Actions auto-deploying on every push to `master`.
+Runs on Alibaba Cloud ECS behind Nginx + Docker Compose, continuously deployed via GitHub Actions on every push to `master`.
 
 ```
-ECS instance (43.112.113.40)
-├── productcut-backend-1   FastAPI + LangGraph  :8000
-└── productcut-frontend-1  Next.js              :3000
+ECS instance (43.112.113.40) — merchantmarquee.com
+├── Nginx (reverse proxy, SSL termination)
+├── merchant-marquee-backend-1   FastAPI + LangGraph  :8000
+└── merchant-marquee-frontend-1  Next.js              :3000
 ```
 
-Every push to `master` → GitHub Actions SSHes into ECS → `git pull` → `docker compose -f docker-compose.prod.yml up --build -d`. Build time is fast because Docker layer caching preserves the Python pip and npm install layers between deploys.
-
-Environment secrets (API keys, DB URL, OSS credentials) live in `backend/.env` on the ECS instance and are injected at runtime via `env_file` — never baked into the image.
+Every push to `master` → GitHub Actions SSHes into ECS → `git pull` → `docker compose up --build -d`. Environment secrets (API keys, DB URL, OSS credentials) live in `backend/.env` on the ECS instance — never baked into the image.
 
 ---
 
 ## Live Demo
 
-**[merchant-marquee.com](http://43.112.113.40:3000)** — upload any product photos and try it live.
+**[https://merchantmarquee.com](https://merchantmarquee.com)** — upload any product photos and try it live.
 
 ---
 
