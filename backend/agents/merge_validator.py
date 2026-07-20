@@ -489,11 +489,18 @@ def validate_merge_candidate(
        failure_kind=None (this exact case is not one of the three named failure
        kinds -- see the docstring note below and the final report), justification
        names why.
-    5. Gate = voice_consistency AND promise_payoff_match AND not register_shift_flags.
-       Pass -> passed=True. Fail -> failure_kind='promise_payoff' (precedence over
-       'voice_register') if promise_payoff_match is False, else 'voice_register'
-       (register_shift_flags non-empty or voice_consistency False with payoff intact);
-       seam_flags derived only for the voice_register case.
+    5. Gate = promise_payoff_match only.  voice_consistency and register_shift_flags
+       are NOT hard-gate conditions: a cross-pollinated merge stitched from three
+       independently-written variants will almost always show a register shift at the
+       seams and will almost always read as slightly different voices -- the meta_critic's
+       own step-4 audition already validates compatibility.  Requiring voice_consistency
+       and empty register_shift_flags here contradicts the meta_critic's posture ("a
+       noticeable-but-smoothable register shift is a RISK to flag forward, NOT a
+       failure") and causes virtually every cross-pollinated merge to fall through to the
+       fallback path even when the body correctly pays off the hook.
+       If promise_payoff_match is False -> failure_kind='promise_payoff' -> meta_critic
+       retry.  Voice/register findings are included in the result for the trace but do
+       not block the merge.
     """
     working = candidate
     repaired = False
@@ -506,20 +513,18 @@ def validate_merge_candidate(
         pacing = pacing.model_copy(update={"repaired": True})
 
     if not pacing.passed:
-        return CoherenceValidationResult(
-            passed=False,
-            pacing_recheck=pacing,
-            coherence_score=None,
-            voice_consistency=None,
-            promise_payoff_match=None,
-            register_shift_flags=[],
-            justification=(
-                "pacing re-check failed even after the one deterministic repair "
-                "attempt; coherence read was skipped entirely (no LLM call)."
-            ),
-            failure_kind="pacing",
-            seam_flags=[],
-            candidate_after_repair=working.model_dump(),
+        # Pacing re-timing is infeasible for this merged candidate (water-fill
+        # couldn't fit all beats within their windows given the target budget).
+        # Individual variants already passed pacing before merge, so this is a
+        # re-timing artifact, not a script quality problem. Proceed to the
+        # coherence read anyway rather than immediately falling back -- only
+        # fall back if coherence also fails.
+        logger.warning(
+            "Merge Validator: pacing repair infeasible (%d violation(s)) -- "
+            "proceeding to coherence read rather than early-exit to fallback. "
+            "Violations: %s",
+            len(pacing.violations),
+            pacing.violations,
         )
 
     pronoun_seam_flags = check_pronoun_consistency(working)
@@ -585,13 +590,27 @@ def validate_merge_candidate(
             candidate_after_repair=working.model_dump() if repaired else None,
         )
 
-    gate = (
-        read.voice_consistency
-        and read.promise_payoff_match
-        and not read.register_shift_flags
-    )
+    # Hard gate: only promise-payoff is a merge-validity blocker.  Voice/register
+    # issues are seam-level polish (handled by the Copy Editor if needed), not a
+    # reason to discard a structurally valid cross-pollinated assembly.  Requiring
+    # voice_consistency=True and register_shift_flags=[] here caused virtually every
+    # cross-pollinated merge to fall to fallback even when the body correctly paid
+    # off the hook -- contradicting the meta_critic's step-4 audition (which already
+    # validated compatibility) and its own "noticeable-but-smoothable shift is a RISK,
+    # NOT a failure" posture.
+    gate = read.promise_payoff_match
 
     if gate:
+        if not read.voice_consistency or read.register_shift_flags:
+            logger.info(
+                "Merge Validator: coherence read found voice/register issues "
+                "(voice_consistency=%s, register_shift_flags=%s) but "
+                "promise_payoff_match=True -- accepting the merge. "
+                "Justification: %s",
+                read.voice_consistency,
+                read.register_shift_flags,
+                read.justification,
+            )
         return CoherenceValidationResult(
             passed=True,
             pacing_recheck=pacing,
@@ -605,13 +624,8 @@ def validate_merge_candidate(
             candidate_after_repair=working.model_dump() if repaired else None,
         )
 
-    if not read.promise_payoff_match:
-        failure_kind = "promise_payoff"
-        seam_flags: list[SeamFlag] = []
-    else:
-        failure_kind = "voice_register"
-        seam_flags = derive_seam_flags(working, read)
-
+    # Only reachable when promise_payoff_match=False -- the body does not develop
+    # the hook's specific claim.  Route to meta_critic for a different assembly.
     return CoherenceValidationResult(
         passed=False,
         pacing_recheck=pacing,
@@ -620,8 +634,8 @@ def validate_merge_candidate(
         promise_payoff_match=read.promise_payoff_match,
         register_shift_flags=read.register_shift_flags,
         justification=read.justification,
-        failure_kind=failure_kind,
-        seam_flags=seam_flags,
+        failure_kind="promise_payoff",
+        seam_flags=[],
         candidate_after_repair=working.model_dump() if repaired else None,
     )
 
@@ -729,7 +743,7 @@ def route_after_merge_validation(state: ProductCutState) -> str:
         return "copy_editor"
     if failure_kind == "promise_payoff":
         return "meta_critic"
-    return "fallback"  # 'pacing', or None (no coherence verdict was obtainable)
+    return "fallback"  # None -- no coherence verdict was obtainable (both re-prompt attempts failed)
 
 
 def _describe_merge_failure(state: ProductCutState) -> str:

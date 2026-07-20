@@ -125,13 +125,23 @@ async def lifespan(app: FastAPI):
     logger.info("Building LangGraph graph...")
     app.state.graph = await build_graph(exit_stack=app.state.exit_stack)
     logger.info("Graph compiled and ready.")
-    # Bug 6: ensure jobs/seller_direction tables exist before serving any traffic
+    # Bug 6: ensure jobs/seller_direction tables exist before serving any traffic;
+    # then immediately abandon any jobs that were mid-run when the backend died —
+    # stale checkpoints resume at the wrong pipeline step and pollute "My Ads".
     try:
-        from db.jobs import connect as db_connect, init_tables
+        from db.jobs import connect as db_connect, init_tables, abandon_incomplete_jobs
         conn = await db_connect()
         try:
             await init_tables(conn)
             logger.info("DB tables verified/created.")
+            abandoned = await abandon_incomplete_jobs(conn)
+            if abandoned:
+                logger.info(
+                    "Startup: deleted %d incomplete job(s) that did not finish before "
+                    "the last shutdown: %s",
+                    len(abandoned),
+                    abandoned,
+                )
         finally:
             await conn.close()
     except Exception as exc:
@@ -511,6 +521,35 @@ async def ws_run(
                 return
 
             if has_checkpoint:
+                # Verify the job still exists in our DB.  Startup cleanup deletes
+                # incomplete jobs so their stale checkpoints are never resumed --
+                # a checkpoint without a DB row means the job was abandoned.
+                try:
+                    from db.jobs import connect as db_connect, read_job_state
+                    _chk_conn = await db_connect()
+                    try:
+                        _chk_db_state = await read_job_state(_chk_conn, job_id)
+                    finally:
+                        await _chk_conn.close()
+                except Exception as _exc:
+                    logger.error("DB check failed for stale-checkpoint guard on %s: %s", job_id, _exc)
+                    _chk_db_state = None  # fail safe: treat as abandoned
+
+                if not _chk_db_state:
+                    logger.info(
+                        "Stale checkpoint for %s: DB row gone (job was abandoned on last restart) "
+                        "-- rejecting resume.",
+                        job_id,
+                    )
+                    await websocket.send_json(_envelope("run.error", job_id, {
+                        "error": "This job did not finish and was removed when the backend restarted. Please submit a new job."
+                    }))
+                    try:
+                        await websocket.close()
+                    except Exception:
+                        pass
+                    return
+
                 logger.info("Reconnect: resuming %s from checkpoint (next=%s)", job_id, list(getattr(snapshot, "next", [])))
                 input_data = None  # astream_events resumes from checkpoint when input is None
             else:

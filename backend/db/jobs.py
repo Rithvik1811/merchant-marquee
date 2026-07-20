@@ -302,6 +302,26 @@ async def delete_job(conn: psycopg.AsyncConnection, job_id: str) -> None:
     await conn.commit()
 
 
+async def abandon_incomplete_jobs(conn: psycopg.AsyncConnection) -> list[str]:
+    """Delete every job that is not in a terminal state ('completed' or 'failed').
+
+    Called once at startup before serving traffic.  Jobs that were mid-run when
+    the backend was killed will never resume correctly (the LangGraph graph
+    re-starts from a stale checkpoint mid-pipeline, often with wrong env vars or
+    model state), so it is cleaner to remove them entirely and let the user
+    re-submit.  ON DELETE CASCADE removes the matching seller_direction rows.
+
+    Returns the list of abandoned job_ids so the caller can log them.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "DELETE FROM jobs WHERE status NOT IN ('completed', 'complete', 'failed') RETURNING job_id"
+        )
+        rows = await cur.fetchall()
+    await conn.commit()
+    return [r["job_id"] for r in rows]
+
+
 async def list_jobs(
     conn: psycopg.AsyncConnection,
     seller_id: Optional[str] = None,
@@ -338,5 +358,6 @@ __all__ = [
     "read_job_state",
     "update_job_status",
     "delete_job",
+    "abandon_incomplete_jobs",
     "list_jobs",
 ]

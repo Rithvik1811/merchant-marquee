@@ -800,6 +800,8 @@ async def _call_wan_video_gen_intl(
     base_url = os.environ["DASHSCOPE_INTL_VIDEO_BASE_URL"]
     model = os.environ["MODEL_VIDEO_INTL"]
 
+    logger.info("Video-Gen INTL: submitting model=%s to %s", model, base_url)
+
     body: dict = {
         "model": model,
         "input": {

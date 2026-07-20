@@ -7,10 +7,10 @@ Recomposes the master cut into three aspect ratios:
   1:1   (1080×1080) — Feed
   16:9  (1920×1080) — YouTube / landscape
 
-Uses FFmpeg center-crop + scale on the already-generated master cut —
-no additional LLM or video-gen cost. The reserved negative space baked into
-the shot schema means the product is never cropped off by any of these
-recompositions (the text-overlay zone is known and safe).
+Uses FFmpeg blurred-background fill on the already-generated master cut —
+no additional LLM or video-gen cost. Each format scales the video to fit
+entirely within the target frame (no cropping of content) and fills any
+letterbox/pillarbox space with a blurred version of the same frame.
 
 Stores signed OSS URLs in state["exports"] as:
   {"aspect_9x16": url, "aspect_1x1": url, "aspect_16x9": url}
@@ -48,37 +48,6 @@ EXPORT_FILENAMES: dict[str, str] = {
 }
 
 
-def _crop_params(
-    src_w: int, src_h: int, tgt_w: int, tgt_h: int
-) -> tuple[int, int, int, int]:
-    """Return (crop_w, crop_h, x_offset, y_offset) to center-crop src to tgt ratio.
-
-    The crop preserves as much of the frame as possible before scaling.
-    When source is wider than target → crop the sides.
-    When source is taller than target → crop top/bottom.
-    All values are forced even so libx264 never rejects them.
-    """
-    src_ratio = src_w / src_h
-    tgt_ratio = tgt_w / tgt_h
-
-    if src_ratio > tgt_ratio:
-        # Source is wider — crop left and right
-        crop_h = src_h
-        crop_w = int(src_h * tgt_ratio)
-        crop_w -= crop_w % 2
-        crop_x = (src_w - crop_w) // 2
-        crop_y = 0
-    else:
-        # Source is taller (or equal) — crop top and bottom
-        crop_w = src_w
-        crop_h = int(src_w / tgt_ratio)
-        crop_h -= crop_h % 2
-        crop_x = 0
-        crop_y = (src_h - crop_h) // 2
-
-    return crop_w, crop_h, crop_x, crop_y
-
-
 def _render_export(
     src_path: str,
     out_path: str,
@@ -87,13 +56,27 @@ def _render_export(
     src_w: int,
     src_h: int,
 ) -> None:
-    """Center-crop + scale the master cut to one target format and write to out_path."""
-    crop_w, crop_h, crop_x, crop_y = _crop_params(src_w, src_h, tgt_w, tgt_h)
+    """Fit the master cut into tgt_w×tgt_h without cropping (blurred-background fill).
+
+    The foreground is scaled to fit entirely inside the target frame.
+    The background is the same frame scaled to fill (cropped) then blurred,
+    eliminating letterbox/pillarbox black bars while preserving all content.
+    """
     inp = ffmpeg.input(src_path)
+    split = inp.video.filter_multi_output("split")
+    bg = (
+        split[0]
+        .filter("scale", tgt_w, tgt_h, force_original_aspect_ratio="increase")
+        .filter("crop", tgt_w, tgt_h)
+        .filter("gblur", sigma=20)
+    )
+    fg = split[1].filter(
+        "scale", tgt_w, tgt_h,
+        force_original_aspect_ratio="decrease",
+        force_divisible_by=2,
+    )
     video = (
-        inp.video
-        .filter("crop", crop_w, crop_h, crop_x, crop_y)
-        .filter("scale", tgt_w, tgt_h, flags="lanczos")
+        ffmpeg.overlay(bg, fg, x="(W-w)/2", y="(H-h)/2")
         .filter("setsar", 1)
     )
     (
@@ -183,13 +166,13 @@ async def format_export_node(state: ProductCutState) -> dict:
         payload["voiceover"] = voiceover
     await adispatch_custom_event("job_complete", payload)
 
-    # Update job status to "complete" in RDS (best-effort; never blocks the return).
+    # Update job status to "completed" in RDS (best-effort; never blocks the return).
     database_url = os.environ.get("DATABASE_URL")
     if database_url:
         try:
             conn = await psycopg.AsyncConnection.connect(database_url, row_factory=dict_row)
             try:
-                await update_job_status(conn, job_id, "complete")
+                await update_job_status(conn, job_id, "completed")
             finally:
                 await conn.close()
         except Exception as exc:
