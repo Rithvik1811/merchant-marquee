@@ -62,6 +62,8 @@ import json
 import logging
 from typing import Optional
 
+from openai import APIError
+
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.runnables import RunnableConfig
 from pydantic import (
@@ -1083,12 +1085,42 @@ def meta_critic(
     # opposed to transport) failure, which killed the whole graph run on
     # one-off LLM phrasing variance in a sibling checker (Body-Checker).
     survivor_id_set = set(survivor_ids)
-    out = call_qwen_json_validated(
-        _META_SYSTEM_PROMPT,
-        user_prompt,
-        lambda raw: _validate_llm_output(raw, survivor_id_set),
-        model=model,
-    )
+    try:
+        out = call_qwen_json_validated(
+            _META_SYSTEM_PROMPT,
+            user_prompt,
+            lambda raw: _validate_llm_output(raw, survivor_id_set),
+            model=model,
+        )
+    except APIError as exc:
+        # DashScope content-filter (DataInspectionFailed) fires intermittently on
+        # meta-critic responses. Retrying the same prompt won't help — skip straight
+        # to the composite-score fallback so the pipeline can continue.
+        if "DataInspectionFailed" in str(exc):
+            logger.warning(
+                "Meta-Critic: content-filter block (DataInspectionFailed) — "
+                "using composite-score fallback %s", fallback_id
+            )
+            fb = idx[fallback_id]
+            return MetaCriticResult(
+                outcome="fallback_no_compatible_merge",
+                merge_candidate=MergeCandidate(
+                    hook_variant_id=fallback_id,
+                    body_variant_id=fallback_id,
+                    cta_variant_id=fallback_id,
+                    hook=fb.hook,
+                    body=fb.body,
+                    cta=fb.cta,
+                    substitutions=[],
+                    rationale=[],
+                ),
+                disqualified=disqualified,
+                composite_scores=composites,
+                fallback_variant_id=fallback_id,
+                survivor_ids=survivor_ids,
+                notes="content-filter fallback: DataInspectionFailed",
+            )
+        raise
 
     target = _target_length(variants, survivor_ids)
 
