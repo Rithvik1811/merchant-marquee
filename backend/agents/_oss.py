@@ -292,6 +292,39 @@ def sign_existing_key(
     return b.sign_url("GET", key, SIGNED_URL_TTL_SEC, slash_safe=True, params=params or {})
 
 
+def delete_job_assets(job_id: str, *, bucket: Optional[object] = None) -> int:
+    """Delete every OSS object under a job's `jobs/{job_id}/` prefix.
+
+    Every asset this module writes (photos, shot clips, VO audio, master cut,
+    format exports) lives under `oss_job_asset_key`/`oss_object_key`'s shared
+    `jobs/{job_id}/` root, so one prefix listing + batch delete removes the
+    whole job's OSS footprint. Called by the `DELETE /jobs/{job_id}` endpoint
+    when a seller removes an ad from My Ads. Returns the number of objects
+    deleted; a job with no OSS assets (e.g. failed before upload) returns 0.
+
+    Uses `bucket.list_objects(prefix=...)` directly (paginating via
+    `next_marker`/`is_truncated`) rather than `oss2.ObjectIterator`, so an
+    injected fake `bucket` only needs `list_objects`/`batch_delete_objects` —
+    the same duck-typed contract every other function in this module relies on.
+    """
+    b = bucket if bucket is not None else _build_bucket()
+    prefix = f"jobs/{job_id}/"
+    keys: list[str] = []
+    marker = ""
+    while True:
+        result = b.list_objects(prefix=prefix, marker=marker, max_keys=1000)
+        keys.extend(obj.key for obj in result.object_list)
+        if not result.is_truncated:
+            break
+        marker = result.next_marker
+    deleted = 0
+    for i in range(0, len(keys), 1000):  # OSS batch-delete caps at 1000 keys/call
+        chunk = keys[i : i + 1000]
+        b.batch_delete_objects(chunk)
+        deleted += len(chunk)
+    return deleted
+
+
 __all__ = [
     "SIGNED_URL_TTL_SEC",
     "oss_object_key",
@@ -303,4 +336,5 @@ __all__ = [
     "upload_export_to_oss",
     "upload_json_to_oss",
     "persist_remote_video_to_oss",
+    "delete_job_assets",
 ]

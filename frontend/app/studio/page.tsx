@@ -870,6 +870,34 @@ export default function StudioPage() {
   const closeLibrary = useCallback(() => {
     setState((s) => ({ status: s.truths.length ? "dashboard" : "wizard" }));
   }, [setState]);
+  const deleteHistoryItem = useCallback(
+    async (entry: HistoryEntry) => {
+      if (!entry.jobId) {
+        // Local-only entry with no backend job (shouldn't normally happen once
+        // DB seeding runs, but drop it client-side rather than getting stuck).
+        setState((s) => {
+          const history = s.history.filter((h) => h !== entry);
+          try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
+          return { history };
+        });
+        return;
+      }
+      try {
+        const res = await fetch(`${getApiBase()}/jobs/${entry.jobId}`, { method: "DELETE" });
+        if (!res.ok && res.status !== 404) throw new Error(`DELETE /jobs/${entry.jobId} returned ${res.status}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to delete ad";
+        setState({ error: msg });
+        return;
+      }
+      setState((s) => {
+        const history = s.history.filter((h) => h.jobId !== entry.jobId);
+        try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
+        return { history };
+      });
+    },
+    [setState],
+  );
   const openHistoryItem = useCallback(
     async (entry: HistoryEntry) => {
       let final = entry.final;
@@ -1091,7 +1119,7 @@ export default function StudioPage() {
       )}
 
       {state.status === "library" && (
-        <Library history={state.history} onClose={closeLibrary} onOpen={openHistoryItem} />
+        <Library history={state.history} onClose={closeLibrary} onOpen={openHistoryItem} onDelete={deleteHistoryItem} />
       )}
     </div>
   );
