@@ -26,11 +26,13 @@ class _FakeSnapshot:
 class _FakeGraph:
     def __init__(self, events: list[dict]):
         self._events = events
+        self.astream_events_config = None
 
     async def aget_state(self, *_args, **_kwargs):
         return _FakeSnapshot()
 
-    async def astream_events(self, *_args, **_kwargs):
+    async def astream_events(self, *_args, config=None, **_kwargs):
+        self.astream_events_config = config
         for event in self._events:
             yield event
 
@@ -44,24 +46,54 @@ def test_known_c2_event_is_translated_and_unknown_falls_back_to_passthrough():
 
     with TestClient(app) as client:
         # Lifespan already compiled the real graph on startup; swap it for
-        # our fake so this run is fully synthetic and instant.
+        # our fake so this run is fully synthetic and instant. Restored in
+        # the finally block so a later test file sharing this same `app`
+        # singleton (e.g. test_continuity_loop_e2e.py, when the full suite
+        # runs in one pytest session) doesn't inherit this fake graph.
+        real_graph = app.state.graph
         app.state.graph = _FakeGraph(fake_events)
+        try:
+            with client.websocket_connect("/ws/testjob") as ws:
+                started = ws.receive_json()
+                assert started["type"] == "run.started"
 
-        with client.websocket_connect("/ws/testjob") as ws:
-            started = ws.receive_json()
-            assert started["type"] == "run.started"
+                known = ws.receive_json()
+                assert known["type"] == "truth_extracted", "recognized C2 type must use its real event name"
+                assert known["job_id"] == "testjob"
+                assert known["payload"] == {"truths": [], "count": 0}, "must be build_event's payload, not the wrapped {name, data} shape"
 
-            known = ws.receive_json()
-            assert known["type"] == "truth_extracted", "recognized C2 type must use its real event name"
-            assert known["job_id"] == "testjob"
-            assert known["payload"] == {"truths": [], "count": 0}, "must be build_event's payload, not the wrapped {name, data} shape"
+                unknown = ws.receive_json()
+                assert unknown["type"] == "on_custom_event", "unrecognized custom event must fall back to generic passthrough"
+                assert unknown["payload"]["name"] == "not_a_real_c2_type"
 
-            unknown = ws.receive_json()
-            assert unknown["type"] == "on_custom_event", "unrecognized custom event must fall back to generic passthrough"
-            assert unknown["payload"]["name"] == "not_a_real_c2_type"
+                lifecycle = ws.receive_json()
+                assert lifecycle["type"] == "on_chain_start", "non-custom LangGraph events always use generic passthrough"
 
-            lifecycle = ws.receive_json()
-            assert lifecycle["type"] == "on_chain_start", "non-custom LangGraph events always use generic passthrough"
+                completed = ws.receive_json()
+                assert completed["type"] == "run.completed"
+        finally:
+            app.state.graph = real_graph
 
-            completed = ws.receive_json()
-            assert completed["type"] == "run.completed"
+
+def test_ws_run_raises_recursion_limit_above_langgraph_default():
+    """Confirmed on a real run: the video_gen -> ken_burns_fallback ->
+    continuity_agent -> continuity_gate retry cycle plus the pipeline's own
+    linear supersteps can exceed LangGraph's default recursion_limit of 25,
+    raising GraphRecursionError and failing the job. tests/test_continuity_loop_e2e.py
+    already raises its own recursion_limit to 50 for exactly this reason --
+    this locks in the equivalent fix for the real WebSocket run path.
+    """
+    fake_graph = _FakeGraph([])
+
+    with TestClient(app) as client:
+        real_graph = app.state.graph
+        app.state.graph = fake_graph
+        try:
+            with client.websocket_connect("/ws/testjob") as ws:
+                ws.receive_json()  # run.started
+                ws.receive_json()  # run.completed
+        finally:
+            app.state.graph = real_graph
+
+    assert fake_graph.astream_events_config is not None
+    assert fake_graph.astream_events_config.get("recursion_limit", 0) > 25
