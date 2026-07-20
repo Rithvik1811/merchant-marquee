@@ -140,7 +140,7 @@ export default function Dashboard(props: DashboardProps) {
       >
         <div style={{ maxWidth: 1180, margin: "0 auto", display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
           <div style={{ lineHeight: 1.25 }}>
-            <div style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 17 }}>ProductCut</div>
+            <div style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 17 }}>Merchant Marquee</div>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, letterSpacing: "0.4px", color: "var(--faint)" }}>{jobStatusLine}</div>
           </div>
           <div

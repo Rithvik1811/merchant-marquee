@@ -26,18 +26,14 @@ export default function Header({ theme, onToggleTheme }: HeaderProps) {
       }}
     >
       <Link href="/" style={{ display: "flex", alignItems: "center", gap: 13, textDecoration: "none", color: "inherit" }}>
-        <div
-          style={{
-            width: 30,
-            height: 30,
-            borderRadius: 8,
-            border: "1.5px solid var(--tan)",
-            background: "linear-gradient(135deg, var(--tan) 0 46%, transparent 46% 100%)",
-          }}
+        <img
+          src="/mm-logo.png"
+          alt="Merchant Marquee"
+          style={{ height: 32, width: "auto", flex: "0 0 auto" }}
         />
         <div style={{ display: "flex", alignItems: "baseline", gap: 11 }}>
           <span style={{ fontFamily: "var(--font-serif)", fontWeight: 500, fontSize: 24, letterSpacing: "-0.3px" }}>
-            ProductCut
+            Merchant Marquee
           </span>
           <span
             style={{
@@ -48,7 +44,7 @@ export default function Header({ theme, onToggleTheme }: HeaderProps) {
               color: "var(--muted)",
             }}
           >
-            ad-film studio
+            product ad studio
           </span>
         </div>
       </Link>

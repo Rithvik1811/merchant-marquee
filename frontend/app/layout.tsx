@@ -22,9 +22,9 @@ const spaceMono = Space_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ProductCut — ad-film studio",
+  title: "Merchant Marquee — product ad studio",
   description:
-    "ProductCut turns your real product photos into a grounded short-form ad — every claim traced to a fact, nothing invented.",
+    "Merchant Marquee turns your real product photos into a grounded short-form ad — every claim traced to a fact, nothing invented.",
 };
 
 export default function RootLayout({
