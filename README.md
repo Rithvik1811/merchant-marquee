@@ -25,58 +25,59 @@ Small Etsy and Shopify sellers can't afford professional video ads ($300–$1,50
 
 ```mermaid
 flowchart TD
-    U[Seller: photos + brief + optional intake] --> ING[Ingest Node]
-    ING --> PTE[Product Truth Extractor\nQwen-VL — specific facts, colors, materials]
-    PTE --> CA[Concept Agent\nQwen-Max — 4 scripts, forced distinct frameworks]
+    IN([Seller · Photos + Brief]) --> ING[Ingest Node]
+    ING --> PTE[Product Truth Extractor\nQwen-VL]
+    PTE --> CA[Concept Agent\nQwen-Max · 4 scripts]
 
-    CA --> HC[Hook-Checker]
-    CA --> PC[Pacing-Checker — deterministic timing math]
-    CA --> BC[Body-Checker]
-    CA --> CC[CTA-Checker]
-    CA --> TC[Tone-Checker]
-    HC --> MC[Meta-Critic\nweighted aggregate + cross-pollinate merge]
-    PC --> MC
-    BC --> MC
-    CC --> MC
-    TC --> MC
+    CA --> HC[Hook-Checker\nQwen]
+    CA --> PAC[Pacing-Checker\ndeterministic]
+    CA --> BC[Body-Checker\nQwen]
+    CA --> CC[CTA-Checker\nQwen]
+    CA --> TC[Tone-Checker\nQwen]
+    HC & PAC & BC & CC & TC --> MC[Meta-Critic\nQwen-Max · cross-pollinate + merge]
 
-    MC -->|merge candidate| CV{Merge Coherence Validator\nindependent re-check}
-    CV -->|voice/register fail| CE[Copy Editor\nconstrained seam polish]
-    CE --> CV
-    CV -->|promise-payoff fail| MC
-    CV -->|pass| WIN[winning_script finalized]
+    MC --> MCV{Merge Coherence Validator\nQwen-Plus}
+    MCV -->|voice / register fail| CE[Copy Editor\nQwen-Plus]
+    CE --> MCV
+    MCV -->|promise-payoff fail| MC
+    MCV -->|pass| WIN([winning_script])
 
-    WIN --> TA[Treatment Agent\ndirector persona, color story, per-beat justification]
-    TA --> SL[Shot-List Agent\ncamera-literate schema + justification]
-    SL --> JV{Justification Validator\ndeterministic quote + truth check}
-    JV -->|invalid| SL
-    JV -->|valid| BG{Budget Gate}
-    BG -->|over cap| SL
-    BG -->|ok| VGFO[Fan-out per shot via Send]
+    WIN --> TA[Treatment Agent\nQwen-Plus]
+    WIN --> VOX[Voiceover + Caption Agent\nQwen TTS]
 
-    VGFO --> VG[Video-Gen Node\nWan i2v — reference photo required]
-    VG -->|hard failure| FB[Ken-Burns Fallback\nffmpeg pan/zoom on source photo]
-    VG --> CTY[Continuity Agent\nQwen-VL — drift + identity check]
-    CTY -->|drift, retries < 2| VG
-    CTY -->|retries exhausted| HR[interrupt: Human Review]
-    CTY -->|pass| ASM
+    TA --> SLA[Shot-List Agent\nQwen-Plus · call A → call B]
+    SLA --> JV{Justification Validator\ndeterministic}
+    JV -->|invalid| SLA
+    JV -->|valid| BG[Budget Gate\ndeterministic · grounding-weighted]
 
-    WIN --> VOX[Voiceover + Caption Agent\nQwen TTS — parallel branch]
-    VOX --> ASM[Assembly Agent\nffmpeg — stitch + captions + CTA burn-in]
-    FB --> ASM
-    ASM --> FMT[Format Export\nffmpeg — 9:16 / 1:1 / 16:9]
+    BG -->|Send per shot| VG[Video-Gen Node\nWan 2.7 i2v]
+    VG -->|hard infra fail| KB[Ken-Burns Fallback\nffmpeg · pan/zoom]
+    VG --> CTY[Continuity Agent\nQwen-VL · identity + drift]
+    CTY -->|identity fail / drift retry| VG
+    CTY -->|pass / retries exhausted| ASM[Assembly Agent\nffmpeg]
+    KB --> ASM
+    VOX --> ASM
+
+    ASM --> FMT[Format Export\nffmpeg · 9:16 / 1:1 / 16:9]
     FMT --> OSS[(Alibaba OSS)]
-    OSS --> FE[Frontend]
+    OSS --> OUT([merchantmarquee.com])
 
-    BL[(Budget Ledger)] -.->|live stream| FE
-    MC -.->|reasoning trace| FE
-    CTY -.->|drift scores| FE
+    BG -.->|budget stream| OUT
+    MC -.->|reasoning stream| OUT
+    CTY -.->|drift stream| OUT
 
-    subgraph Alibaba Cloud
+    subgraph CLOUD[Alibaba Cloud]
         OSS
-        DB[(RDS PostgreSQL\nJobs + LangGraph checkpoints)]
-        BL
+        DB[(RDS PostgreSQL\njobs · checkpoints)]
     end
+
+    classDef llm fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    classDef det fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef io fill:#fef9c3,stroke:#ca8a04,color:#713f12
+
+    class PTE,CA,HC,BC,CC,TC,MC,CE,MCV,TA,SLA,CTY,VOX,VG llm
+    class ING,PAC,JV,BG,KB,ASM,FMT det
+    class IN,WIN,OUT io
 ```
 
 **Solid arrows** are graph edges. **Dashed arrows** are live streaming channels via `astream_events` → WebSocket. Diamonds are decision nodes that can loop, pause, or branch. `interrupt: Human Review` is a genuine LangGraph `interrupt()` — the graph checkpoints and resumes from the checkpoint on seller response.
