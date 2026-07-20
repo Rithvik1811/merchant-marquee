@@ -37,7 +37,7 @@ export default function Header({ theme, onToggleTheme }: HeaderProps) {
         />
         <div style={{ display: "flex", alignItems: "baseline", gap: 11 }}>
           <span style={{ fontFamily: "var(--font-serif)", fontWeight: 500, fontSize: 24, letterSpacing: "-0.3px" }}>
-            ProductCut
+            Merchant Marquee
           </span>
           <span
             style={{
@@ -48,7 +48,7 @@ export default function Header({ theme, onToggleTheme }: HeaderProps) {
               color: "var(--muted)",
             }}
           >
-            ad-film studio
+            product ad studio
           </span>
         </div>
       </Link>

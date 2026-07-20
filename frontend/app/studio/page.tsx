@@ -864,11 +864,11 @@ export default function StudioPage() {
 
           handleEvent(msg as JobEvent);
         } catch (err) {
-          console.error("[ProductCut] WS parse error:", err);
+          console.error("[Merchant Marquee] WS parse error:", err);
         }
       };
 
-      ws.onerror = (err) => console.error("[ProductCut] WebSocket error:", err);
+      ws.onerror = (err) => console.error("[Merchant Marquee] WebSocket error:", err);
 
       ws.onclose = () => {
         // Bug 2: ignore close events from a WS we already replaced.

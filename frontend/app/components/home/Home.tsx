@@ -191,7 +191,7 @@ export default function Home() {
   }, [setState]);
 
   const onPlayDemo = useCallback(() => {
-    console.log("[ProductCut] play demo — wire real video src here");
+    console.log("[Merchant Marquee] play demo — wire real video src here");
   }, []);
 
   const reveal = useCallback(
@@ -239,7 +239,7 @@ export default function Home() {
               }}
             />
           </div>
-          <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 19 }}>ProductCut</span>
+          <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 19 }}>Merchant Marquee</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
           <div data-rid="nav-links" style={{ display: "flex", alignItems: "center", gap: 24 }}>
@@ -321,8 +321,21 @@ export default function Home() {
           >
             Three photos in. One <em style={{ fontStyle: "italic", color: "var(--accent)" }}>honest</em> ad out.
           </h1>
+          <p
+            style={{
+              margin: "0 0 22px",
+              fontFamily: "var(--font-serif)",
+              fontStyle: "italic",
+              fontSize: "clamp(19px, 2.2vw, 26px)",
+              lineHeight: 1.4,
+              color: "var(--accent)",
+              maxWidth: "30ch",
+            }}
+          >
+            Put every product in the spotlight.
+          </p>
           <p style={{ margin: "0 0 42px", fontSize: 18, lineHeight: 1.6, color: "var(--ink-soft)", maxWidth: "46ch" }}>
-            ProductCut reads your real product photos, pins down what&rsquo;s actually true about it, and has a team of
+            Merchant Marquee reads your real product photos, pins down what&rsquo;s actually true about it, and has a team of
             writing &amp; directing agents script, shoot, and cut a short ad — grounded in facts, not filler.
           </p>
           <Link
@@ -645,7 +658,7 @@ export default function Home() {
           <div style={{ position: "relative", width: 15, height: 15, border: "1.2px solid var(--ink)", flex: "0 0 auto" }}>
             <span style={{ position: "absolute", width: "3.5px", height: "3.5px", borderRadius: "50%", background: "var(--accent)", top: "2.5px", left: "2.5px" }} />
           </div>
-          <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 15, color: "var(--ink-soft)" }}>ProductCut</span>
+          <span style={{ fontFamily: "var(--font-serif)", fontStyle: "italic", fontSize: 15, color: "var(--ink-soft)" }}>Merchant Marquee</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 28, fontFamily: "var(--font-sans)", fontSize: "12.5px", color: "var(--faint)" }}>
           <a href="#how" className="pch-footer-link" style={{ textDecoration: "none", color: "var(--faint)" }}>

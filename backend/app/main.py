@@ -153,7 +153,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutdown: released graph resources.")
 
 
-app = FastAPI(title="ProductCut Backend", lifespan=lifespan)
+app = FastAPI(title="Merchant Marquee Backend", lifespan=lifespan)
 
 # CORS: allow the Next.js dev server and any configured frontend origin
 _CORS_ORIGINS = os.environ.get(
@@ -184,7 +184,7 @@ async def health() -> dict:
         checkpointer_type = type(cp).__name__ if cp else "none"
     return JSONResponse({
         "status": "ok",
-        "service": "productcut-backend",
+        "service": "merchant-marquee-backend",
         "graph_ready": graph is not None,
         "checkpointer": checkpointer_type,
         "ts": _now_iso(),
