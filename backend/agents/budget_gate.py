@@ -145,15 +145,10 @@ W_TYPE: dict[str, float] = {
 }
 TRUTH_BONUS = 1.10  # applied when the cited truth is one of the "specific" categories below
 
-# Shot-type composition set naming the human-interaction shots the reduce path
-# below protects from being the first thing cut under a tight cap (§5.7 reduce,
-# extended for the video-gen-fidelity redesign). MUST exactly match
-# agents/video_gen_node.py's own `_HUMAN_INTERACTION_SHOT_TYPES` — kept as a
-# separate local constant rather than imported, since video_gen_node.py already
-# imports RATE_720P/RATE_1080P FROM this module, and importing back the other
-# direction would create a circular dependency. If this set changes, update
-# that one too.
-HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
+# feature/open-world-v2: shot_type is now free-form. Whether a shot is a
+# human-interaction shot is the VDA's judgment, carried as the `is_human_shot`
+# boolean field on each Shot. The protect-from-first-cut logic below reads
+# shot.get("is_human_shot", False) instead of matching against a frozen set.
 
 # The ProductTruth categories that make a product SPECIFIC, not generic — the
 # facts you cannot guess without actually looking at the photos (§5.7).
@@ -254,7 +249,7 @@ def _choose_drop_index(working: list[Shot], weights: list[float]) -> int:
     Normally this is just the lowest-weight shot (`_argmin`). But the
     video-gen-fidelity creative-direction redesign added a deliberate priority
     override: if the lowest-weight shot is the SOLE remaining human-interaction
-    shot (`HUMAN_INTERACTION_SHOT_TYPES` — product_in_hand / worn_in_use) in
+    shot (is_human_shot == True, per the VDA's judgment) in
     `working`, cutting it would silently erase the ad's entire human-usage
     story beat. This is not hypothetical — a real live pipeline run caught
     exactly this: the human-usage shot was the cheapest-weighted survivor and
@@ -283,11 +278,11 @@ def _choose_drop_index(working: list[Shot], weights: list[float]) -> int:
     already be human-interaction-typed), not a scenario worth blocking on.
     """
     drop_index = _argmin(weights)
-    if working[drop_index].get("shot_type") not in HUMAN_INTERACTION_SHOT_TYPES:
+    if not working[drop_index].get("is_human_shot", False):
         return drop_index
 
     human_indices = [
-        i for i, s in enumerate(working) if s.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES
+        i for i, s in enumerate(working) if s.get("is_human_shot", False)
     ]
     if len(human_indices) > 1:
         return drop_index  # another human-interaction shot survives either way
@@ -545,7 +540,6 @@ __all__ = [
     "W_TYPE",
     "TRUTH_BONUS",
     "SPECIFIC_TRUTH_CATEGORIES",
-    "HUMAN_INTERACTION_SHOT_TYPES",
     "BudgetResult",
     "allocate_budget",
     "budget_gate_node",

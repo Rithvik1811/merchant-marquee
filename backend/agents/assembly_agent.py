@@ -230,10 +230,8 @@ VIDEO_FADE_SEC = 0.5
 # convention for short-form ad tails is 0.5 – 1.5 s; 1.0 s is the midpoint.
 TAIL_SILENCE_SEC = 1.0
 
-# PHASE 3 point 3 -- mirrored from agents/shot_list_agent.py's own
-# HUMAN_INTERACTION_SHOT_TYPES (hand-kept in sync, same posture
-# video_gen_node.py's own mirrored copy already uses).
-_HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
+# feature/open-world-v2: shot_type is now free-form. Human-shot detection uses
+# the is_human_shot boolean field (VDA judgment) instead of a frozen set.
 
 # Stage-1 intermediate segments favor speed (re-encoded again in Stage 2);
 # Stage 2 is the mezzanine deliverable and favors quality.
@@ -862,7 +860,7 @@ async def _assemble_master_cut_impl(
                 # never the hook/cta, which keep the original end-trim default).
                 prefer_start_trim = (
                     not is_last_segment
-                    and seg.shot.get("shot_type") in _HUMAN_INTERACTION_SHOT_TYPES
+                    and seg.shot.get("is_human_shot", False)
                     and seg.shot.get("beat_role") not in ("hook", "cta")
                 )
                 seg_duration = await asyncio.to_thread(

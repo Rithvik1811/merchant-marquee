@@ -1,20 +1,15 @@
 """
 Phase 1-5: LangGraph graph -- Product Truth Extractor -> Concept Agent -> 5 parallel
-Critic Chain checkers -> Meta-Critic -> Merge Coherence Validator -> (Copy Editor
-loop-back | Meta-Critic swap retry | fallback) -> winning_script finalized ->
-[Treatment Agent -> Shot-List Agent -> Budget Gate -> Video-Gen Node -> Ken-Burns
-Fallback Node -> Continuity Agent -> Continuity Gate -> (retry loop back to
-Video-Gen | Assembly Agent)] IN PARALLEL WITH [Voiceover + Caption Agent ->
-Assembly Agent] -> END.
+Critic Chain checkers -> Meta-Critic -> winning_script finalized ->
+[Visual Direction Agent -> Treatment Agent -> Shot-List Agent -> Budget Gate ->
+Video-Gen Node -> Ken-Burns Fallback Node -> Continuity Agent -> Continuity Gate ->
+(retry loop back to Video-Gen | Assembly Agent)] IN PARALLEL WITH
+[Voice Direction Agent -> Voiceover + Caption Agent -> Assembly Agent] -> END.
 
-The full Critic Chain (§5.4) is wired end to end, including the Merge Coherence
-Validator (§5.4.7) and Copy Editor (§5.4.8). `winning_script` is set by
-merge_validator_node on EITHER a full pass ("finalize") or a terminal fallback
-("fallback") -- both are legitimate, usable winning scripts (the fallback is
-the single highest composite-scoring original variant, not a degraded/partial
-result), so BOTH route into Treatment Agent rather than only "finalize". Phase 2
-(Treatment Agent §5.5, Shot-List Agent §5.6, Budget Gate §5.7) and Phase 3
-(Video-Gen Node §5.8, Ken-Burns Fallback Node §5.9) are wired in after it.
+The Critic Chain (§5.4) scores all 4 script variants; Meta-Critic picks the
+best-scoring one and writes it to `winning_script` directly. No cross-pollination
+merge. Phase 2 (Treatment Agent §5.5, Shot-List Agent §5.6, Budget Gate §5.7) and
+Phase 3 (Video-Gen Node §5.8, Ken-Burns Fallback Node §5.9) run after it.
 
 Phase 4 (§5.10) adds the Continuity Agent (Qwen-VL drift scoring) and the
 Continuity Gate (capped retry + human-in-the-loop) after Ken-Burns, plus a
@@ -29,16 +24,9 @@ this file directly: a retry loop is a graph-topology feature that can only be
 exercised in the compiled graph.
 
 Phase 5 (§5.11) adds the Voiceover + Caption Agent as a SECOND parallel branch
-off `merge_validator` -- it reads only `winning_script`, not `treatment`/
-`shot_list`/`generated_shots`, so it does not need to wait behind Video-Gen or
-Continuity and starts the same superstep as `treatment_agent`. Wired via
-`_route_after_merge_validation_with_vo` (below), which wraps the pure
-`route_after_merge_validation` (kept untouched -- it is independently
-unit-tested and also called internally by `merge_validator_node`) to fan out
-to BOTH `treatment_agent` and `voiceover_caption_agent` on "finalize"/
-"fallback", per this node's own documented wiring plan
-(agents/voiceover_caption_agent.py, "HOW THIS COMPOSES WITH THE REST OF THE
-GRAPH").
+off meta_critic -- it reads only `winning_script`, not `treatment`/`shot_list`/
+`generated_shots`, so it does not need to wait behind Video-Gen or Continuity and
+starts the same superstep as `visual_direction_agent`.
 
 Phase 5 (§5.12) adds the Assembly Agent as a genuine FAN-IN JOIN of the two
 branches above: `voiceover_caption_agent -> assembly_agent` and
@@ -107,11 +95,9 @@ from agents.budget_gate import budget_gate_node
 from agents.concept_agent import concept_agent_node
 from agents.continuity_agent import continuity_agent_node
 from agents.continuity_gate import continuity_gate_node, route_after_continuity_gate
-from agents.copy_editor import copy_editor_node
 from agents.cta_tone_checkers import cta_checker_node, tone_checker_node
 from agents.hook_checker import hook_checker_node
 from agents.ken_burns_fallback_node import ken_burns_fallback_node
-from agents.merge_validator import merge_validator_node, route_after_merge_validation
 from agents.meta_critic import meta_critic_node
 from agents.pacing_checker import pacing_checker_node
 from agents.product_research_node import product_research_node
@@ -166,13 +152,14 @@ def _build_uncompiled() -> StateGraph:
     builder.add_edge("cta_checker", "meta_critic")
     builder.add_edge("tone_checker", "meta_critic")
 
-    builder.add_node("merge_validator", merge_validator_node)
-    builder.add_node("copy_editor", copy_editor_node)
-    builder.add_edge("meta_critic", "merge_validator")
-    builder.add_edge("copy_editor", "merge_validator")
+    # feature/open-world-v2: the cross-pollination merge / Copy Editor loop is
+    # removed. meta_critic_node now writes `winning_script` directly (the single
+    # best-scoring variant) and routes straight into the two post-script parallel
+    # branches -- see `_route_after_meta_critic` below. merge_validator / copy_editor
+    # are no longer nodes in this graph.
 
-    # Phase 2 (§5.5-5.7): both "finalize" and "fallback" set a real, usable
-    # winning_script (see module docstring) -- neither is a dead end anymore.
+    # Phase 2 (§5.5-5.7): the winning_script set by meta_critic feeds the visual
+    # branch (and the voice branch) directly.
     builder.add_node("visual_direction_agent", visual_direction_agent_node)
     builder.add_edge("visual_direction_agent", "treatment_agent")
     builder.add_node("treatment_agent", treatment_agent_node)
@@ -223,58 +210,44 @@ def _build_uncompiled() -> StateGraph:
     )
 
     builder.add_conditional_edges(
-        "merge_validator",
-        _route_after_merge_validation_with_vo,
+        "meta_critic",
+        _route_after_meta_critic,
         {
-            "finalize": "visual_direction_agent",      # was "treatment_agent"
-            "copy_editor": "copy_editor",
-            "meta_critic": "meta_critic",
-            "fallback": "visual_direction_agent",      # was "treatment_agent"
-            "voice_direction_agent": "voice_direction_agent",   # NEW
             "visual_direction_agent": "visual_direction_agent",
-            "job_failed": END,   # merge_validator_node found no candidate to merge at all
+            "voice_direction_agent": "voice_direction_agent",
+            "job_failed": END,   # meta_critic_node found no surviving variant
         },
     )
     return builder
 
 
-def _route_after_merge_validation_with_vo(state: ProductCutState) -> list[str]:
-    """Conditional-edge path function: wraps `route_after_merge_validation` (kept
-    untouched -- it's independently unit-tested in test_merge_validator.py and
-    also called internally by merge_validator_node itself, both against its
-    original bare-str contract) to additionally fan out to TWO parallel
-    sub-branches whenever winning_script is actually final ("finalize" or
-    "fallback" -- both set a real, usable winning_script per the module docstring
-    above): the visual branch (`visual_direction_agent` -> treatment_agent -> ...)
-    and the voice branch (`voice_direction_agent` -> voiceover_caption_agent ->
-    assembly_agent). The Voice Direction Agent rewrites each beat for spoken
-    delivery + emotion/pacing before the voiceover node synthesizes it, so this
-    fans to `voice_direction_agent` (the head of that sub-branch) rather than
-    directly to `voiceover_caption_agent`.
+def _route_after_meta_critic(state: ProductCutState) -> list[str]:
+    """Conditional-edge path function after the Meta-Critic (feature/open-world-v2).
+
+    meta_critic_node now writes `winning_script` directly (the single
+    best-scoring surviving variant -- no cross-pollination merge, no Merge
+    Coherence Validator / Copy Editor loop). Once winning_script is final, fan
+    out to the TWO post-script parallel sub-branches:
+      * the visual branch  (`visual_direction_agent` -> treatment_agent -> ...)
+      * the voice branch    (`voice_direction_agent` -> voiceover_caption_agent
+                             -> assembly_agent)
+    The Voice Direction Agent rewrites each beat for spoken delivery +
+    emotion/pacing before the voiceover node synthesizes it, so this fans to
+    `voice_direction_agent` (the head of that sub-branch), not directly to
+    `voiceover_caption_agent`.
 
     LangGraph's `add_conditional_edges` accepts a path function returning a
     *list* of routing keys for exactly this "one edge, multiple parallel
-    next-nodes" case (confirmed against the installed
-    `StateGraph.add_conditional_edges` signature: `path: Callable[...,
-    Hashable | Sequence[Hashable]]`). The "copy_editor"/"meta_critic" retry
-    branches are unaffected -- winning_script isn't final yet on those paths, so
-    neither sub-branch fires.
+    next-nodes" case.
 
-    Checks state["job_failure"] BEFORE calling route_after_merge_validation:
-    merge_validator_node sets it (instead of appending a merge_attempts entry)
-    on its terminal-failure path -- no candidate to validate at all -- and
-    route_after_merge_validation itself raises on an empty merge_attempts, so
-    calling it here first would just crash the routing step instead of the
-    node. Confirmed as the real graceful-failure path via a real run: Concept
-    Agent produced 0 valid variants -> meta_critic_result.outcome ==
-    "all_excluded_failure" -> merge_validator_node had no candidate.
+    Checks state["job_failure"] first: meta_critic_node sets it (instead of
+    winning_script) when zero variants survived never_do disqualification
+    (meta_critic_result.outcome == "all_excluded_failure") -- there is no usable
+    script, so route straight to END rather than into the visual/voice branches.
     """
     if state.get("job_failure"):
         return ["job_failed"]
-    route = route_after_merge_validation(state)
-    if route in ("finalize", "fallback"):
-        return ["visual_direction_agent", "voice_direction_agent"]
-    return [route]
+    return ["visual_direction_agent", "voice_direction_agent"]
 
 
 async def build_graph(exit_stack: Optional[AsyncExitStack] = None):
