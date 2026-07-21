@@ -23,19 +23,10 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 
-from agents._affordance import human_use_suits_product
 from agents._retry import create_completion
 from graph.state import BeatVisualDirection, ProductCutState, ProductTruth, VisualDirection, WinningScript
 
 logger = logging.getLogger("productcut.agents.visual_direction_agent")
-
-_VALID_SHOT_TYPES = frozenset({
-    "hook_hero", "macro_detail", "lifestyle_context", "hero_reframe",
-    "cta_endcard", "product_in_hand", "worn_in_use",
-})
-_VALID_CAMERA_MOVES = frozenset({
-    "push_in", "orbit", "static", "pan", "tilt_up", "pull_back", "rack_focus",
-})
 
 
 def _format_truths(truths: list[ProductTruth]) -> str:
@@ -87,32 +78,24 @@ def _scene_inspiration_block(research_facts: list) -> str:
 def _build_system_prompt(
     beat_count: int,
     truth_ids: list[str],
-    human_affordance: bool,
     research_facts: Optional[list] = None,
 ) -> str:
     last = beat_count - 1
-    human_target_note = (
-        """HUMAN PRESENCE GUIDANCE (this product has real human-contact parts — handle, straps, etc.):
-- Demo/proof beats (beats 1 through {second_last}): PREFER human_presence "yes" when the cited truth
-  names a handle, strap, pocket, or scale fact. The whole reason people buy a carryable product is
-  the moment of use — show it.
-- Target for a {beat_count}-beat ad: 1-2 human shots concentrated in beats 1-{second_last}.
-- The opening hook (beat 0) and the closing CTA (beat {last}) are product-alone by default
-  (see rules below — the CTA rule is non-negotiable; the hook rule can bend only if the VO
-  explicitly opens on a person).
-""".format(beat_count=beat_count, last=last, second_last=max(0, last - 1))
-        if human_affordance else
-        """HUMAN PRESENCE GUIDANCE (this product's truths do not name explicit human-contact parts):
-- IMPERATIVE BEATS: When a non-CTA beat's VO line is an imperative action involving the
-  product ("Toss it in your bag", "Fill it up", "Hold it", "Pour it out", "Press the lid",
-  "Squeeze it", "Drop it in", "Clip it on", "Drink from it", etc.), human_presence MUST be
-  "yes" — show someone performing that exact action. The video must embody what the VO
-  asks the viewer to imagine doing.
-- DESCRIPTIVE BEATS: When the VO describes a product quality without implying physical use
-  (color, form, texture, a material property), human_presence "no" is appropriate.
-- CTA beat: always "no" (non-negotiable, see rule 1).
+    second_last = max(0, last - 1)
+    # feature/open-world-v2: ONE unified HUMAN PRESENCE GUIDANCE. The model reads
+    # the product truths and decides -- no keyword-gated human_affordance branch.
+    human_target_note = f"""HUMAN PRESENCE GUIDANCE:
+- Read the product truths. If the truths name parts a human naturally contacts (handles, straps,
+  grips, pockets, clasps, laces, drawstrings, etc.), or if the product is something people carry,
+  wear, or operate with their hands — prefer human_presence "yes" in demo/proof beats.
+- If the truths describe a purely digital/screen/abstract product with no physical contact, lean
+  toward human_presence "no" unless the VO explicitly shows a person.
+- Target 1-2 human shots for a carryable/wearable product, concentrated in beats 1 through {second_last}.
+- When a non-CTA beat's VO is an imperative describing a physical action ("Toss it in your bag",
+  "Hold it", "Pour it out", "Press the button", "Carry it", "Slip it on"), human_presence MUST
+  be "yes" — show someone doing exactly that action.
+- The opening hook (beat 0) and closing CTA (beat {last}) are product-alone by default.
 """
-    )
     return f"""You are a visual director bridging a voiceover script into concrete shot decisions
 for a short-form product video ad ({beat_count} beats, 0 to {last}).
 
@@ -149,10 +132,10 @@ For each beat output:
   Example: "A hand grips the top handle and lifts the bag off a surface,
   the stitching briefly catching the light."
   When human_presence is "no", DO NOT include human_action in the output at all.
-- suggested_shot_type: one of exactly: hook_hero, macro_detail, lifestyle_context,
-  hero_reframe, cta_endcard, product_in_hand, worn_in_use
-- suggested_camera_move: one of exactly: push_in, orbit, static, pan, tilt_up,
-  pull_back, rack_focus
+- suggested_shot_type: describe the composition in 2-5 words (free-form — see
+  SHOT TYPE GUIDANCE below). Never leave it empty.
+- suggested_camera_move: describe the camera motion in 2-4 words (free-form — see
+  SHOT TYPE GUIDANCE below). Never leave it empty.
 - framing_notes: 10-20 word framing/composition note
 
 ─────────────────────────────────────────────────────
@@ -175,12 +158,14 @@ HARD RULES — non-negotiable
 ─────────────────────────────────────────────────────
 SHOT TYPE GUIDANCE
 ─────────────────────────────────────────────────────
-- hook, product-alone → hook_hero + push_in
-- hook, person present → lifestyle_context + static
-- construction/texture detail → macro_detail + push_in
-- person carrying/wearing (full body/shoulder) → worn_in_use + static
-- person hand-contact with product (grip/lift/press) → product_in_hand + static
-- CTA → cta_endcard + static
+- suggested_shot_type: describe the composition in 2-5 words specific to what this beat needs.
+  Examples: "hook_hero", "macro detail insert", "hand lifts by strap", "worn slung over shoulder",
+  "low hero angle", "cta endcard". Be specific — name the actual composition, not a generic category.
+- suggested_camera_move: describe the camera motion in 2-4 words. Examples: "push_in", "slow orbit",
+  "static", "handheld follow", "tracking pan", "pull_back". Choose what the beat's content
+  motivates — do not default to "static" just because a person is in frame.
+- CTA beat: product alone, still. suggested_shot_type should indicate CTA (e.g. "cta endcard").
+- Never stack two camera moves in one string.
 
 {human_target_note}
 
@@ -251,18 +236,12 @@ def _validate_vda_output(
             )
 
         stype = bvd.get("suggested_shot_type", "")
-        if stype not in _VALID_SHOT_TYPES:
-            problems.append(
-                f"beat {idx}: suggested_shot_type {stype!r} is not valid "
-                f"(valid: {', '.join(sorted(_VALID_SHOT_TYPES))})"
-            )
+        if not stype or not isinstance(stype, str) or not stype.strip():
+            problems.append(f"beat {idx}: suggested_shot_type is missing or empty")
 
         cmove = bvd.get("suggested_camera_move", "")
-        if cmove not in _VALID_CAMERA_MOVES:
-            problems.append(
-                f"beat {idx}: suggested_camera_move {cmove!r} is not valid "
-                f"(valid: {', '.join(sorted(_VALID_CAMERA_MOVES))})"
-            )
+        if not cmove or not isinstance(cmove, str) or not cmove.strip():
+            problems.append(f"beat {idx}: suggested_camera_move is missing or empty")
 
         hp = bvd.get("human_presence", "")
         if hp not in ("yes", "no"):
@@ -319,7 +298,6 @@ async def generate_visual_direction(
     beats = winning_script.get("beats", [])
     beat_count = len(beats)
     truth_ids = [t["truth_id"] for t in product_truths]
-    human_affordance = human_use_suits_product(product_truths)
 
     # Build user content: numbered beats + truths table
     beat_lines = "\n".join(
@@ -331,7 +309,7 @@ async def generate_visual_direction(
         f"Product truths:\n{_format_truths(product_truths)}"
     )
 
-    system_prompt = _build_system_prompt(beat_count, truth_ids, human_affordance, research_facts)
+    system_prompt = _build_system_prompt(beat_count, truth_ids, research_facts)
 
     try:
         messages = [
@@ -364,10 +342,7 @@ async def generate_visual_direction(
                 f"- The last beat (beat_index {beat_count - 1}) MUST have human_presence: \"no\"\n"
                 "- focus_feature_truth_id must be one of: "
                 + ", ".join(truth_ids)
-                + "\n- suggested_shot_type must be one of: "
-                + ", ".join(sorted(_VALID_SHOT_TYPES))
-                + "\n- suggested_camera_move must be one of: "
-                + ", ".join(sorted(_VALID_CAMERA_MOVES))
+                + "\n- suggested_shot_type and suggested_camera_move must both be non-empty strings"
                 + "\n- When human_presence is \"yes\", human_action is required and must name "
                 "the exact contact part from the cited truth."
                 + "\n- When human_presence is \"no\", do NOT include human_action at all."
@@ -414,13 +389,13 @@ async def generate_visual_direction(
             if fid not in truth_ids:
                 logger.info("VDA: beat %d has invalid focus_feature_truth_id %r -- fallback.", i, fid)
                 entry_ok = False
-            stype = entry.get("suggested_shot_type", "")
-            if stype not in _VALID_SHOT_TYPES:
-                logger.info("VDA: beat %d has invalid suggested_shot_type %r -- fallback.", i, stype)
+            stype = (entry.get("suggested_shot_type") or "").strip()
+            if not stype:
+                logger.info("VDA: beat %d has empty suggested_shot_type -- fallback.", i)
                 entry_ok = False
-            cmove = entry.get("suggested_camera_move", "")
-            if cmove not in _VALID_CAMERA_MOVES:
-                logger.info("VDA: beat %d has invalid suggested_camera_move %r -- fallback.", i, cmove)
+            cmove = (entry.get("suggested_camera_move") or "").strip()
+            if not cmove:
+                logger.info("VDA: beat %d has empty suggested_camera_move -- fallback.", i)
                 entry_ok = False
             hp = entry.get("human_presence", "")
             if hp not in ("yes", "no"):

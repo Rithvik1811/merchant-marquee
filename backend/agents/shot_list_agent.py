@@ -81,16 +81,14 @@ from typing import Callable, Optional, get_args
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from agents._affordance import human_use_suits_product
+from agents._affordance import human_use_suits_product, is_cta_shot
 from agents._retry import create_completion
 from agents.justification_validator import (
     validate_justifications as _kr_validate_justifications,
 )
 from graph.shot_schema import (
     BeatRole,
-    CameraMove,
     Framing,
-    ShotType,
     TextOverlayZone,
     validate_shot_list,
 )
@@ -149,15 +147,26 @@ _GENERIC_QUOTE_STOPLIST = frozenset(
     }
 )
 
-# Enum vocabularies pulled straight off graph.shot_schema's Literals via
-# get_args -- so they can never silently drift out of sync with the runtime
-# validator (including the v2 additions rack_focus / product_in_hand). These
-# feed both the Call B prompt menus and the defensive enum-snapping in assembly.
-_SHOT_TYPES: tuple[str, ...] = get_args(ShotType)
-_CAMERA_MOVES: tuple[str, ...] = get_args(CameraMove)
+# Framing / text-overlay-zone / beat-role stay closed Literals, pulled straight
+# off graph.shot_schema via get_args so they can't drift from the runtime
+# validator. shot_type / camera_move are now OPEN-WORLD (graph/shot_schema.py
+# v6: ShotType/CameraMove are plain `str`), so get_args on them returns () --
+# they are replaced by the EXAMPLE lists below, used only to seed the Call B
+# prompt (as examples, never a closed allow-list).
 _FRAMINGS: tuple[str, ...] = get_args(Framing)
 _TEXT_ZONES: tuple[str, ...] = get_args(TextOverlayZone)
 _BEAT_ROLES: tuple[str, ...] = get_args(BeatRole)
+
+# Illustrative (NOT exhaustive) shot_type / camera_move vocabularies -- rendered
+# into the Call B prompt as "for example", never "one of exactly". The model may
+# describe a shot's actual composition/motion in its own words.
+_SHOT_TYPE_EXAMPLES: tuple[str, ...] = (
+    "hook_hero", "macro_detail", "lifestyle_context", "hero_reframe",
+    "cta_endcard", "product_in_hand", "worn_in_use",
+)
+_CAMERA_MOVE_EXAMPLES: tuple[str, ...] = (
+    "push_in", "orbit", "static", "pan", "tilt_up", "pull_back", "rack_focus",
+)
 
 # Expanded, identity-first negative prompt (§5.6). Earlier terms are weighted
 # more heavily by Wan/Kling-family models, so geometry/label/texture-stability
@@ -219,12 +228,9 @@ def _build_negative_prompt(product_truths: list = None, extra: str = "") -> str:
         parts.append(f", {extra}")
     return "".join(parts)
 
-# shot_type values naming the human-interaction composition (C3 v4 addition of
-# "worn_in_use" alongside the existing "product_in_hand"). Hand-kept in sync
-# with agents/video_gen_node.py's own `_HUMAN_INTERACTION_SHOT_TYPES` (same
-# "hand-kept in sync" posture graph/shot_schema.py's docstring already uses for
-# its own enum mirroring) -- if this set changes, update that one too.
-HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
+# feature/open-world-v2: shot_type is now free-form, so a shot is "human" iff the
+# VDA judged its beat human_presence == "yes" (carried as the `is_human_shot`
+# field), NOT via a frozen shot_type set.
 
 # Tighter duration window than the general [MIN_SHOT_DURATION_SEC,
 # MAX_SHOT_DURATION_SEC] range -- occlusion and identity drift accumulate
@@ -234,11 +240,19 @@ HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
 HUMAN_SHOT_MIN_DURATION_SEC = 3.0
 HUMAN_SHOT_MAX_DURATION_SEC = 4.0
 
-# Only one motion source at a time on a human-interaction shot: the human's own
-# motion is already one source, so stacking a second one (orbit/rack_focus/
-# pull_back/tilt_up) compounds drift exactly the way the affordance rubric
-# below already warns against for stacked camera moves generally.
-HUMAN_SHOT_ALLOWED_CAMERA_MOVES = frozenset({"static", "push_in"})
+# Only one motion source at a time on a human shot: the human's own motion is
+# already one source, so stacking a genuinely RISKY second one (an orbit or a
+# rack focus) compounds drift the way the affordance rubric below warns about
+# for stacked moves. feature/open-world-v2: camera_move is now free-form, so we
+# no longer snap human shots to a tiny allow-list -- we only neutralize the
+# specific high-risk moves (keyword match, robust to free-form phrasing like
+# "slow orbit" / "rack focus pull").
+_RISKY_CAMERA_KEYWORDS = frozenset({"orbit", "rack_focus", "rack focus"})
+
+
+def _is_risky_camera_move(camera_move: str) -> bool:
+    cm = (camera_move or "").lower()
+    return any(kw in cm for kw in _RISKY_CAMERA_KEYWORDS)
 
 # Extra negative-prompt terms specific to the human-interaction risk tier,
 # appended (never replacing) NEGATIVE_PROMPT_BOILERPLATE -- deterministic, not
@@ -274,14 +288,11 @@ HUMAN_SHOT_NEGATIVE_EXTRA = (
 # human-interaction shot is faceless (hands/over-shoulder/insert), which
 # sidesteps the cross-shot face problem entirely instead of trying to solve it.
 #
-# HERO IDENTIFICATION MECHANISM. Deliberately NOT a new Shot field -- C1
-# (graph/state.py) stays additive-minimal for this fix (only
-# Treatment.character_anchor was added, see its v10 changelog note); adding a
-# Shot field would also require a graph/shot_schema.py ShotModel change
-# (`extra="forbid"`) for no real gain. Instead: a shot IS the hero iff it is
-# human-interaction-typed (shot_type in HUMAN_INTERACTION_SHOT_TYPES) AND its
+# HERO IDENTIFICATION MECHANISM. A shot IS the hero iff it is a human shot
+# (is_human_shot -- the VDA's human_presence=="yes" judgment carried onto the
+# shot; feature/open-world-v2 replaced the old shot_type-set match) AND its
 # duration_sec exceeds HUMAN_SHOT_MAX_DURATION_SEC (the ceiling every OTHER
-# human-interaction shot is hard-clamped under, below in `_assemble_shots`).
+# human shot is hard-clamped under, below in `_assemble_shots`).
 # No other code path in this module can ever produce a human-interaction shot
 # above that ceiling except the one hero-assembly branch, so the condition is
 # structurally unambiguous -- and it composes for free with every downstream
@@ -389,7 +400,7 @@ def is_hero_shot(shot: dict) -> bool:
     so this follows the same established cross-module dependency direction.
     """
     return (
-        shot.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES
+        shot.get("is_human_shot", False)
         and shot.get("duration_sec", 0.0) > HUMAN_SHOT_MAX_DURATION_SEC
     )
 
@@ -737,6 +748,14 @@ def _coerce_enum(value, allowed: tuple[str, ...], default: str) -> str:
     return value if value in allowed else default
 
 
+def _coerce_freeform(value: object, default: str) -> str:
+    """feature/open-world-v2: shot_type / camera_move are now free-form strings,
+    so there is no closed enum to snap to -- accept any non-empty string as-is,
+    and only fall back to `default` when the model returned nothing usable."""
+    v = (value or "").strip() if isinstance(value, str) else ""
+    return v if v else default
+
+
 def _default_shot_type(beat_role: str, hook_implies_person: bool = False) -> str:
     """Deterministic shot_type default -- used as the enum-snap fallback when
     Call B doesn't return a valid shot_type (`_coerce_enum`), or when
@@ -747,11 +766,10 @@ def _default_shot_type(beat_role: str, hook_implies_person: bool = False) -> str
     computed once from the winning script in `generate_shot_list` and threaded
     through to `_assemble_shots`) -- a person-establishing hook beat defaults
     to the faceless `lifestyle_context` open instead of the product-alone
-    `hook_hero`, matching Call B's own STRUCTURE instruction. Deliberately
-    never `product_in_hand`/`worn_in_use` here: those are
-    HUMAN_INTERACTION_SHOT_TYPES, and the hero-assignment logic in
-    `_assemble_shots` would mistake an opening shot of that type for the
-    mid-ad hero and hijack its duration budget.
+    `hook_hero`, matching Call B's own STRUCTURE instruction. These are just the
+    deterministic string defaults used when the model returns nothing usable;
+    whether a shot is treated as a human shot is decided separately by the VDA's
+    human_presence judgment (is_human_shot), not by this default string.
     """
     if beat_role == "hook":
         return "lifestyle_context" if hook_implies_person else "hook_hero"
@@ -801,7 +819,8 @@ kind of hook."""
         """VISUAL DIRECTION IS GIVEN: each shot's shot_type and camera_move have been
 pre-decided by the Visual Direction Agent and are listed per-shot in the user
 content below. Use them exactly unless a hard structural rule forces a change
-(CTA must always be cta_endcard; human shots must use static/push_in only).
+(the CTA shot must stay product-alone; avoid a risky compound camera move like
+an orbit or rack focus on a human shot).
 For human-interaction shots, use the provided human_action as the core of the
 description's action -- expand it to the full description word count, but keep
 that action as the central motion.
@@ -846,8 +865,12 @@ product fact + the treatment beat it realizes) is FIXED and given to you -- do n
 change it. Your job is only to choose how the camera realizes it.
 
 For every shot produce these fields:
-- shot_type: one of {', '.join(_SHOT_TYPES)}
-- camera_move: one of {', '.join(_CAMERA_MOVES)}. NEVER compound/stacked moves.
+- shot_type: a short 2-5 word phrase naming this shot's actual composition. These
+  are EXAMPLES, not a closed list — describe what the beat needs: {', '.join(_SHOT_TYPE_EXAMPLES)},
+  or your own specific phrase (e.g. "hand lifts by strap", "low hero angle").
+- camera_move: a short 2-4 word phrase naming the camera motion. EXAMPLES (not a
+  closed list): {', '.join(_CAMERA_MOVE_EXAMPLES)}, or your own (e.g. "handheld follow").
+  NEVER compound/stacked moves.
 - framing: one of {', '.join(_FRAMINGS)}
 - text_overlay_zone: one of {', '.join(_TEXT_ZONES)} -- reserved empty space for a
   caption/CTA composited later. On-screen text is NEVER generated; reserve a zone
@@ -954,9 +977,10 @@ phrasing discipline, on top of the description rule above:
   hedged verb ("slowly slings... gently adjusts") combined with i2v models'
   documented bias toward under-motion early in a clip left a 3-4s clip with
   no budget left to render a real action -- default to decisive.
-- camera_move for these shot_types must be "static" or "push_in" ONLY (also
-  hard-enforced downstream) -- one motion source at a time; a moving human
-  plus a moving camera compounds drift.
+- camera_move for a human shot should keep to ONE motion source: prefer a
+  calm move (static or a gentle push_in) and AVOID a risky compound move like an
+  orbit or a rack focus (a moving human plus a moving/refocusing camera compounds
+  drift -- orbit/rack-focus moves are neutralized to static downstream).
 
 {_AFFORDANCE_RUBRIC}
 
@@ -1066,6 +1090,7 @@ def _assemble_shots(
     truths_by_id: dict[str, ProductTruth],
     target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC,
     hook_implies_person: bool = False,
+    vda_human_beats: Optional[dict[int, bool]] = None,
 ) -> list[dict]:
     """Combine each shot's validated justification (Call A) with its camera fields
     (Call B) into a full Shot dict.
@@ -1091,6 +1116,7 @@ def _assemble_shots(
     HUMAN_SHOT_MAX_DURATION_SEC, by construction.
     """
     hero_min, hero_max = _scaled_hero_window(target_duration_sec)
+    _vda_human_beats = vda_human_beats or {}
     shots: list[dict] = []
     cursor = 0.0
     hero_assigned = False
@@ -1098,17 +1124,18 @@ def _assemble_shots(
         b = call_b_by_id.get(j["shot_id"], {})
         beat_role = _coerce_enum(j.get("beat_role"), _BEAT_ROLES, "demo")
 
-        # shot_type and camera_move are resolved BEFORE duration/negative_prompt
-        # below -- the human-interaction risk tier (research point 4: never trust
-        # an LLM instruction alone for a hard constraint, same posture as the
-        # enum-snapping this function already does) clamps duration and
-        # camera_move, and extends the negative prompt, based on shot_type.
+        # shot_type and camera_move are now free-form (feature/open-world-v2):
+        # accept the model's own phrasing, snapping to a deterministic default
+        # only when it returned nothing usable. The human-shot risk tier
+        # (duration clamp + risky-camera neutralization + negative-prompt extra)
+        # keys off the VDA's human_presence judgment, NOT the shot_type string.
         default_shot_type = _default_shot_type(
             beat_role, hook_implies_person if beat_role == "hook" else False
         )
-        shot_type = _coerce_enum(b.get("shot_type"), _SHOT_TYPES, default_shot_type)
-        camera_move = _coerce_enum(b.get("camera_move"), _CAMERA_MOVES, "static")
-        is_human_shot = shot_type in HUMAN_INTERACTION_SHOT_TYPES
+        shot_type = _coerce_freeform(b.get("shot_type"), default_shot_type)
+        camera_move = _coerce_freeform(b.get("camera_move"), "static")
+        vda_human_beat = _vda_human_beats.get(_as_beat_index(j.get("treatment_ref")), False)
+        is_human_shot = bool(vda_human_beat)
         is_hero = False
 
         duration = _clamp_duration(b.get("duration_sec"))
@@ -1119,7 +1146,7 @@ def _assemble_shots(
                 duration = max(hero_min, min(hero_max, duration))
             else:
                 duration = max(HUMAN_SHOT_MIN_DURATION_SEC, min(HUMAN_SHOT_MAX_DURATION_SEC, duration))
-        if is_human_shot and camera_move not in HUMAN_SHOT_ALLOWED_CAMERA_MOVES:
+        if is_human_shot and _is_risky_camera_move(camera_move):
             camera_move = "static"
 
         t_start = cursor
@@ -1159,6 +1186,7 @@ def _assemble_shots(
                 or f"{truths_by_id.get(j['truth_fact_id'], {}).get('fact', 'the product')}",
                 "shot_type": shot_type,
                 "camera_move": camera_move,
+                "is_human_shot": is_human_shot,
                 "framing": _coerce_enum(b.get("framing"), _FRAMINGS, "fills_frame"),
                 "lighting": shared_lighting,
                 "negative_prompt": negative_prompt,
@@ -1339,6 +1367,13 @@ async def _run_call_b(
     triggers share the same single bounded retry; a second miss degrades with
     a logged warning rather than blocking."""
     _, hero_max = _scaled_hero_window(target_duration_sec)
+    # feature/open-world-v2: the VDA's per-beat human_presence judgment, keyed by
+    # beat_index -- the single source of truth for whether an assembled shot is a
+    # human shot (shot_type is now free-form and can no longer carry that signal).
+    vda_human_beats: dict[int, bool] = {
+        bvd["beat_index"]: (bvd.get("human_presence") == "yes")
+        for bvd in (visual_direction.get("beat_visual_directions", []) if visual_direction else [])
+    }
     messages = [
         {
             "role": "system",
@@ -1357,6 +1392,7 @@ async def _run_call_b(
         assembled = _assemble_shots(
             justifications, call_b_by_id, shared_lighting, truths_by_id,
             target_duration_sec, hook_implies_person,
+            vda_human_beats=vda_human_beats,
         )
         try:
             validate_shot_list(assembled)
@@ -1379,9 +1415,10 @@ async def _run_call_b(
             logger.error("Shot-List Agent: Call B still structurally invalid after retry: %s", exc)
             raise
 
-        has_human_shot = any(
-            s.get("shot_type") in HUMAN_INTERACTION_SHOT_TYPES for s in assembled
-        )
+        # feature/open-world-v2: a shot is "human" iff the VDA judged its beat
+        # human_presence == "yes" (carried as the is_human_shot field), not via a
+        # frozen shot_type set.
+        human_shot_count = sum(1 for s in assembled if s.get("is_human_shot"))
         # If VDA is present and explicitly assigned human_presence="no" to every
         # beat, respect that deliberate decision -- don't second-guess it with a
         # human-affordance re-prompt that would contradict the VDA's intent.
@@ -1389,18 +1426,19 @@ async def _run_call_b(
             b.get("human_presence") == "yes"
             for b in visual_direction.get("beat_visual_directions", [])
         )
-        if human_affordance and not has_human_shot and not vda_suppresses_humans:
+        if human_shot_count < 2 and not vda_suppresses_humans:
             if attempt == 0:
                 logger.info(
-                    "Shot-List Agent: product truths establish a human-use affordance "
-                    "but Call B returned zero human-interaction shots -- re-prompting "
-                    "Call B once (human-contact affordance rubric)."
+                    "Shot-List Agent: fewer than 2 human-interaction shots "
+                    "(%d) and the VDA did not suppress humans -- re-prompting "
+                    "Call B once (human-contact affordance rubric).",
+                    human_shot_count,
                 )
                 messages.append({"role": "assistant", "content": raw_b})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your shot list contains ZERO human-interaction shots, but this "
+                        "Your shot list contains fewer than 2 human-interaction shots, but this "
                         "product is worn/held/operated by a person -- its features are "
                         "demonstrated through use, not admired from a distance. "
                         "Revise the shot list so that at least 3 of the non-bookend shots "
@@ -1414,8 +1452,8 @@ async def _run_call_b(
                 })
                 continue
             logger.warning(
-                "Shot-List Agent: still zero human-interaction shots after the "
-                "re-prompt for a human-suited product -- proceeding degraded, "
+                "Shot-List Agent: still fewer than 2 human-interaction shots after "
+                "the re-prompt for a human-suited product -- proceeding degraded, "
                 "not blocking."
             )
         return assembled  # type: ignore[return-value]

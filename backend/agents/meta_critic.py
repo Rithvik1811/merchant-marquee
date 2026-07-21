@@ -1210,6 +1210,30 @@ def _source_variant_ids(result: MetaCriticResult) -> list[str]:
     return sorted({mc.hook_source_variant_id, mc.body_source_variant_id, mc.cta_source_variant_id})
 
 
+def _winning_script_from_variant(variant: ScriptVariant) -> dict:
+    """Build a WinningScript.model_dump()-shaped dict from ONE ScriptVariant's own
+    beats/text -- unmerged, unstitched (feature/open-world-v2: pick the single
+    best script, no cross-pollination).
+
+    Always joins the beat lines rather than preferring `variant["text"]`: the
+    Concept Agent writes `text` and `beats[].line` in the same call but nothing
+    guarantees they're byte-identical (contractions, dropped connective words),
+    and downstream (Treatment / Shot-List / Justification Validator) quote a
+    BEAT'S OWN LINE against winning_script["text"] -- any divergence there makes
+    a correctly-instructed model response fail validation for no real reason.
+    This mirrors the invariant the removed merge path already held.
+    """
+    beats = [
+        {"t_start": b["t_start"], "t_end": b["t_end"], "line": b["line"]}
+        for b in variant.get("beats") or []
+    ]
+    return {
+        "text": " ".join(b["line"] for b in beats),
+        "beats": beats,
+        "source_variant_ids": [variant["variant_id"]],
+    }
+
+
 async def meta_critic_node(state: ProductCutState, config: RunnableConfig) -> dict:
     """LangGraph node wrapper: the fan-in join after the 5 parallel checkers.
 
@@ -1283,14 +1307,51 @@ async def meta_critic_node(state: ProductCutState, config: RunnableConfig) -> di
         config=config,
     )
 
+    # feature/open-world-v2: NO cross-pollination merge. Pick the single BEST
+    # surviving variant (highest aggregate/composite score from the critics) and
+    # write it straight to `winning_script`. `meta_critic()` already names that
+    # variant deterministically as `fallback_variant_id` (the highest-composite
+    # survivor after never_do disqualification, ties broken composite->tone->hook
+    # ->variant_id); reuse it rather than recomputing the same ranking. When zero
+    # variants survived (all_excluded_failure -> fallback_variant_id is None),
+    # there is no usable script: surface a job_failure so build.py routes to END
+    # instead of proceeding with no winning_script.
+    winner_id = result.fallback_variant_id
+    winner = idx.get(winner_id) if winner_id else None
+
     trace_note = (
         f"\n[meta_critic] outcome={result.outcome}; "
         f"disqualified={[d.variant_id for d in result.disqualified]}; "
         f"composites={composites}."
     )
+
+    if winner is None:
+        reason = (
+            "We couldn't generate a usable ad script for this product -- every "
+            "draft was rejected by our quality checks. " + (result.notes or "")
+        ).strip()
+        await adispatch_custom_event(
+            "job_failed", {"reason": reason, "stage": "meta_critic"}, config=config
+        )
+        return {
+            "critic_scores": critic_scores,
+            "meta_critic_result": result_dict,
+            "job_failure": {"reason": reason, "stage": "meta_critic"},
+            "reasoning_trace": state.get("reasoning_trace", "")
+            + trace_note
+            + f"\n[meta_critic] no surviving variant -- job_failed: {reason}",
+        }
+
+    winning_script = _winning_script_from_variant(winner)
+    trace_note += (
+        f"\n[meta_critic] selected best variant {winner_id} "
+        f"(composite {composites.get(winner_id)}) as winning_script -- "
+        "no cross-pollination."
+    )
     return {
         "critic_scores": critic_scores,
         "meta_critic_result": result_dict,
+        "winning_script": winning_script,
         "reasoning_trace": state.get("reasoning_trace", "") + trace_note,
     }
 

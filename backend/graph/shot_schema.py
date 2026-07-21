@@ -29,7 +29,19 @@ refactoring state.py, which is out of scope here -- state.py is C1's frozen
 contract). If C1's Shot literals change, update these to match and bump the
 version below.
 
-version: 5
+version: 6
+  - v6: Open-world shot types (feature/open-world-v2). `ShotType` and
+        `CameraMove` are no longer closed `Literal` enums -- they are now plain
+        `str`, so the Visual Direction Agent / Shot-List Agent can describe a
+        shot's composition and camera motion in free-form 2-5 word phrases
+        ("hand lifts by strap", "slow orbit") instead of snapping to a fixed
+        vocabulary. `extra="forbid"` on ShotModel is UNCHANGED -- it forbids
+        undeclared FIELDS (the product_category anti-genericness rule), which is
+        orthogonal to enum-value freezing. Adds one declared field:
+        `ShotModel.is_human_shot: bool = False` -- the LLM (VDA) human_presence
+        judgment carried through to the assembled shot, so downstream nodes
+        (video_gen, budget_gate, assembly) read `shot["is_human_shot"]` instead
+        of re-detecting human shots from the (now free-form) shot_type string.
   - v5: Novel-scene-generation branch adds an optional `scene_environment: str`
         field (default "") -- a short static setting description written by the
         Shot-List Agent (Call B) and consumed by the Video-Gen Node's T2I scene
@@ -79,14 +91,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 BeatRole = Literal["hook", "problem", "demo", "proof", "cta"]
 
-ShotType = Literal[
-    "hook_hero", "macro_detail", "lifestyle_context",
-    "hero_reframe", "cta_endcard", "product_in_hand", "worn_in_use",
-]
+# v6 (open-world): free-form strings, not closed enums -- see module docstring.
+ShotType = str
 
-CameraMove = Literal[
-    "push_in", "orbit", "static", "pan", "tilt_up", "pull_back", "rack_focus",
-]
+CameraMove = str
 
 Framing = Literal[
     "fills_frame", "rule_of_thirds_left", "rule_of_thirds_right", "context_wide",
@@ -155,6 +163,11 @@ class ShotModel(BaseModel):
     status: ShotStatus
     retry_count: int = Field(..., ge=0)
     failure_reason: Optional[FailureReasonModel] = None
+    # v6 (open-world): the VDA human_presence judgment carried through as a
+    # boolean, so downstream nodes read this instead of re-detecting a human
+    # shot from the (now free-form) shot_type string. Defaulted False + declared
+    # so `extra="forbid"` still accepts an assembled shot that carries it.
+    is_human_shot: bool = False
 
 
 def validate_shot(raw: dict) -> ShotModel:

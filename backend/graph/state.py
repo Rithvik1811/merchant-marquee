@@ -4,7 +4,27 @@ Extend additively only: add new keys, never rename/remove an existing one
 without a sync between KR and RR and a version bump in this docstring.
 Spec of record: docs/TECHNICAL_DOCUMENTATION.md section 6.
 
-version: 13
+version: 14
+  - v14: Two architectural changes (feature/open-world-v2).
+        PART 1 -- Cross-pollination merge REMOVED. The pipeline no longer
+        stitches a hook from variant A + body from B + CTA from C. Instead the
+        Meta-Critic (meta_critic_node) now picks the single highest-composite
+        surviving ScriptVariant and writes it straight to `winning_script`
+        (unchanged in shape). The Merge Coherence Validator and Copy Editor are
+        unwired from the graph (graph/build.py). Four cross-pollination-only
+        scratch keys are now LEGACY (no longer written/read on the live path):
+        `merge_attempts`, `pending_merge_candidate`, `coherence_validation_result`,
+        `last_copy_edit` -- kept in the schema (marked legacy below) rather than
+        deleted so the now-unwired merge_validator/copy_editor modules and their
+        unit tests still type-check.
+        PART 2 -- Open-world shot types. `Shot.shot_type` and `Shot.camera_move`
+        are now plain `str` (were closed `Literal` enums), mirroring
+        graph/shot_schema.py v6, so the VDA/Shot-List Agent can name a shot's
+        actual composition/motion in free-form phrases. Adds
+        `Shot.is_human_shot: NotRequired[bool]` (default-False semantics): the
+        VDA human_presence judgment carried through so downstream nodes
+        (video_gen, budget_gate, assembly) read this field instead of matching
+        the free-form shot_type against a frozen human-shot set.
   - v13: Product Web Research (feature/product-web-research). Adds a new
         LangGraph node (agents/product_research_node.py) that runs between
         product_truth_extractor and concept_agent and, ONLY for tech/software-
@@ -314,13 +334,11 @@ class Shot(TypedDict):
     t_end: float
     beat_role: Literal["hook", "problem", "demo", "proof", "cta"]
     description: str
-    shot_type: Literal[
-        "hook_hero", "macro_detail", "lifestyle_context",
-        "hero_reframe", "cta_endcard", "product_in_hand", "worn_in_use",
-    ]
-    camera_move: Literal[
-        "push_in", "orbit", "static", "pan", "tilt_up", "pull_back", "rack_focus",
-    ]
+    # v14 (open-world): free-form strings, not closed enums -- the VDA/Shot-List
+    # Agent describe the actual composition/motion (e.g. "hand lifts by strap",
+    # "slow orbit"), see graph/shot_schema.py v6.
+    shot_type: str
+    camera_move: str
     framing: Literal[
         "fills_frame", "rule_of_thirds_left", "rule_of_thirds_right", "context_wide",
     ]
@@ -342,6 +360,11 @@ class Shot(TypedDict):
     ]
     retry_count: int
     failure_reason: NotRequired[FailureReason]
+    # v14 (open-world): the VDA human_presence judgment carried through as a
+    # boolean. Default-False semantics (read via shot.get("is_human_shot",
+    # False)). Downstream nodes use this instead of matching the now-free-form
+    # shot_type against a frozen human-shot set.
+    is_human_shot: NotRequired[bool]
     # NOTE: no `product_category` field — omission is deliberate, see TECHNICAL_DOCUMENTATION.md §5.6
 
 
@@ -446,10 +469,16 @@ class ProductCutState(TypedDict, total=False):
     tone_scores: NotRequired[dict[str, dict]]     # raw Tone-Checker output
     meta_critic_result: NotRequired[dict]         # full MetaCriticResult.model_dump(); merge_validator_node (agents/merge_validator.py) consumes this. NOT winning_script — that is only set once an independent validator passes.
     critic_scores: dict[str, CriticScore]
-    merge_attempts: NotRequired[list[dict]]
-    pending_merge_candidate: NotRequired[dict]
-    coherence_validation_result: NotRequired[dict]
-    last_copy_edit: NotRequired[dict]
+    # v14 LEGACY (feature/open-world-v2): the four keys below drove the removed
+    # cross-pollination merge / Copy Editor loop (merge_validator + copy_editor,
+    # now unwired from graph/build.py). They are no longer written or read on the
+    # live path -- meta_critic_node now writes winning_script directly from the
+    # single best-scoring variant. Kept (not deleted) only so the unwired
+    # modules and their unit tests still type-check.
+    merge_attempts: NotRequired[list[dict]]            # LEGACY
+    pending_merge_candidate: NotRequired[dict]         # LEGACY
+    coherence_validation_result: NotRequired[dict]     # LEGACY
+    last_copy_edit: NotRequired[dict]                  # LEGACY
     # Set by merge_validator_node when there is genuinely no merge candidate to
     # validate (e.g. meta_critic_result.outcome == "all_excluded_failure" --
     # every script variant was rejected by the critic chain). Its presence is

@@ -49,7 +49,7 @@ from graph.state import ProductTruth
 _HUMAN_CONTACT_PART_WORDS = frozenset({
     "handle", "strap", "grip", "clasp", "drawstring", "buckle", "lanyard",
     "sling", "harness", "lace", "toggle", "wristband", "armband", "headband",
-    "earcup", "earbud", "nosepad", "waistband", "shoulder",
+    "earcup", "earbud", "nosepad", "waistband", "shoulder", "zipper", "zip",
     # Direct hand-use goods (pans, kitchen tools, cutting boards, etc.) — no
     # "carry" part needed; these objects are inherently hand-operated.
     "pan", "pot", "lid", "knob", "spatula", "utensil", "blade", "knife",
@@ -94,3 +94,9 @@ def human_use_suits_product(product_truths: list[ProductTruth]) -> bool:
         if truth.get("category") in _SCALE_CATEGORIES and words & _BODY_SCALE_WORDS:
             return True
     return False
+
+
+def is_cta_shot(shot_type: str) -> bool:
+    """Return True when shot_type string describes a CTA/endcard shot."""
+    st = (shot_type or "").lower()
+    return "cta" in st or "endcard" in st or "end_card" in st

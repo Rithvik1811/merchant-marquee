@@ -249,6 +249,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from agents._affordance import is_cta_shot
 from agents._oss import SIGNED_URL_TTL_SEC, persist_remote_video_to_oss
 from agents.budget_gate import RATE_720P, RATE_1080P
 from agents.shot_list_agent import MIN_SHOT_DURATION_SEC
@@ -472,11 +473,9 @@ FORCE_GENERATE_ON_BUDGET_EXCEEDED = os.getenv(
 # re-validated after shot_list_agent.py's assembly step).
 INFRA_RETRY_COUNT_KEY = "infra_retry_count"
 
-# shot_type values naming the human-interaction composition (C3 v2 addition of
-# "product_in_hand", C3 v4 addition of "worn_in_use" -- the wider, person-in-
-# motion composition). Hand-kept in sync with agents/shot_list_agent.py's own
-# `HUMAN_INTERACTION_SHOT_TYPES` (that module's docstring notes the same).
-_HUMAN_INTERACTION_SHOT_TYPES = frozenset({"product_in_hand", "worn_in_use"})
+# feature/open-world-v2: shot_type is free-form; whether a shot is a human shot
+# is the VDA's judgment, carried on the shot as `is_human_shot` (read below via
+# shot.get("is_human_shot", False)). CTA detection uses agents._affordance.is_cta_shot.
 
 
 def _use_intl_video() -> bool:
@@ -598,7 +597,7 @@ def _resolve_reference_image_url(reference_image_id: str, product_photos: list[s
 def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Optional[Treatment]) -> str:
     truths_by_id = {t["truth_id"]: t for t in product_truths}
     truth = truths_by_id.get(shot["justification"]["truth_fact_id"])
-    is_human_shot = shot["shot_type"] in _HUMAN_INTERACTION_SHOT_TYPES
+    is_human_shot = shot.get("is_human_shot", False)
 
     # v8 fix (Meta Quest -> "phone on a stand" wrong-object bug): lead the
     # Subject line with the holistic whole-object form_factor anchor fact
@@ -667,12 +666,12 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
         # Counters both the i2v static-start bias and a clip that's still
         # mid-motion when it cuts off (see _ACTION_URGENCY_CLAUSE's own comment).
         _action_suffix += _ACTION_URGENCY_CLAUSE
-    elif shot["shot_type"] != "cta_endcard" and shot["camera_move"] != "static":
+    elif not is_cta_shot(shot["shot_type"]) and shot["camera_move"] != "static":
         # Same static-start bias affects product-alone shots: Wan defaults to a
         # barely-perceptible zoom when the camera move instruction is vague.
         # Append the product urgency clause for every moving, non-human shot.
         _action_suffix += _PRODUCT_MOTION_URGENCY_CLAUSE
-    if shot["shot_type"] == "cta_endcard":
+    if is_cta_shot(shot["shot_type"]):
         # Opposite problem, same mechanism -- here the clip should visibly
         # SETTLE by the end rather than just stop (see _CTA_STILLNESS_CLAUSE).
         _action_suffix += _CTA_STILLNESS_CLAUSE
@@ -722,6 +721,12 @@ def _build_prompt(shot: Shot, product_truths: list[ProductTruth], treatment: Opt
         # product anchor (product identity is the harder, already-solved
         # constraint and must keep the leading position).
         sections.append(["Cast", cast_line])
+    # Setting (feature/open-world-v2): the Shot-List Agent's short static
+    # scene_environment, placed after Cast so the action is grounded in a real
+    # space. Omitted entirely when the shot carries no scene_environment.
+    env = (shot.get("scene_environment") or "").strip()
+    if env:
+        sections.append(["Setting", env])
     sections += [
         ["Action/Motion", action],
         ["Camera", camera],
