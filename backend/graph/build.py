@@ -107,7 +107,6 @@ from agents.treatment_agent import treatment_agent_node
 from agents.visual_direction_agent import visual_direction_agent_node
 from agents.voice_direction_agent import voice_direction_agent_node
 from agents.video_gen_node import video_gen_node
-from agents.brand_research_node import brand_research_node
 from agents.format_export_node import format_export_node
 from agents.voiceover_caption_agent import voiceover_caption_agent_node
 from graph.state import ProductCutState
@@ -118,7 +117,6 @@ logger = logging.getLogger("productcut.graph")
 def _build_uncompiled() -> StateGraph:
     """Construct the (uncompiled) graph."""
     builder = StateGraph(ProductCutState)
-    builder.add_node("brand_research_node", brand_research_node)
     builder.add_node("product_truth_extractor", product_truth_extractor_node)
     builder.add_node("product_research_node", product_research_node)
     builder.add_node("concept_agent", concept_agent_node)
@@ -129,8 +127,7 @@ def _build_uncompiled() -> StateGraph:
     builder.add_node("tone_checker", tone_checker_node)
     builder.add_node("meta_critic", meta_critic_node)
 
-    builder.add_edge(START, "brand_research_node")
-    builder.add_edge("brand_research_node", "product_truth_extractor")
+    builder.add_edge(START, "product_truth_extractor")
     # product_research_node (feature/product-web-research) runs between the truth
     # extractor and the concept agent: it web-researches spec_driven products so
     # the concept agent can cite real, verified specs/features in copy/VO. It is

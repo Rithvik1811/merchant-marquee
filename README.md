@@ -25,9 +25,8 @@ Small Etsy and Shopify sellers can't afford professional video ads ($300–$1,50
 
 ```mermaid
 flowchart TD
-    IN([Seller · Photos + Brief]) --> BR[Brand Research\nTavily · optional]
-    BR --> PTE[Product Truth Extractor\nQwen-VL]
-    PTE --> PRN[Product Research\nTavily + Qwen · spec products]
+    IN([Seller · Photos + Brief]) --> PTE[Product Truth Extractor\nQwen-VL]
+    PTE --> PRN["Product Research\nTavily + Qwen · brand context + specs"]
     PRN --> CA[Concept Agent\nQwen-Max · 4 scripts]
 
     CA --> HC[Hook-Checker\nQwen]
@@ -72,7 +71,7 @@ flowchart TD
     classDef io fill:#fef9c3,stroke:#ca8a04,color:#713f12
 
     class PTE,PRN,CA,HC,BC,CC,TC,MC,VDA,TA,SLA,CTY,VOX,VG,VDE llm
-    class BR,PAC,BG,KB,CTG,ASM,FMT det
+    class PAC,BG,KB,CTG,ASM,FMT det
     class IN,OUT io
 ```
 
@@ -85,20 +84,19 @@ flowchart TD
 | Stage | Node(s) | What happens |
 |---|---|---|
 | **1 — Ingest** | `Ingest Node` | Validates photos (2–3), stores to OSS, captures optional seller direction (mood words, never-do constraints, freeform notes) |
-| **2 — Brand Research** | `Brand Research` (Tavily) | **Optional.** Fetches and summarises brand identity from the seller's URL. No-op if no URL is provided — the node is always in the graph but skips immediately |
-| **3 — Product Truths** | `Product Truth Extractor` (Qwen-VL) | Extracts 6–10 specific facts from uploaded photos — colors, materials, textures, scale cues, form factor. Every fact gets a `truth_id` that flows through all downstream nodes |
-| **4 — Product Research** | `Product Research Node` (Tavily + Qwen) | For spec-driven products only: autonomously web-searches for public specs/features and distills up to 10 checkable facts for copy and VO. No-op for appearance-driven products |
-| **5 — Scripts** | `Concept Agent` (Qwen-Max) | Generates 4 structurally distinct ad scripts, each using a different copywriting framework (PAS, AIDA, BAB, Hook-Problem-Solution), with every claim grounded to a truth ID |
-| **6 — Critic Chain** | Hook / Pacing / Body / CTA / Tone checkers → `Meta-Critic` | Five specialist checkers score all four scripts in parallel. Meta-Critic picks the single highest composite-scoring variant (hook 25%, pacing 20%, completion 20%, CTA 20%, tone 15%) and writes it to `winning_script` |
-| **7 — Visual Direction** | `Visual Direction Agent` (Qwen-Max) | Maps each script beat to a shot type, camera move, human-presence judgment, and framing notes — open-world free-form descriptions, not closed enums |
-| **8 — Treatment** | `Treatment Agent` (Qwen-Max) | Director's treatment: persona, color story, pacing philosophy, per-beat visual justifications citing verbatim script quotes and truth IDs |
-| **9 — Shot List** | `Shot-List Agent` (Qwen-Max, 2 calls) | Call A: beat-to-truth justifications only → deterministically validated. Call B: camera/composition fields conditioned on validated justifications |
-| **10 — Budget Gate** | `Budget Gate` (deterministic) | Grounding-weighted allocation. If over cap: priority-ordered reduce — downgrade resolution, cut lowest-weight shots, redistribute via waterfill. No LLM re-invocation |
-| **11 — Video Gen** | `Video-Gen Node` (Wan 2.7 i2v) + `Ken-Burns Fallback` | Shots fan out in parallel via LangGraph `Send()`. Every shot is image-to-video with the seller's reference photo. Hard failures degrade to Ken-Burns pan/zoom |
-| **12 — Continuity** | `Continuity Agent` (Qwen-VL) + `Continuity Gate` | Early-frame identity check + drift score per shot. Up to 2 auto-retries; exhausted retries raise a real `interrupt()` for seller approval |
-| **13 — Voiceover** | `Voice Direction Agent` + `Voiceover + Caption Agent` (Qwen TTS) | Parallel branch from script finalization. Voice Direction rewrites beats for natural spoken delivery with per-beat emotion and pacing. TTS synthesises audio; captions are aligned to beat timestamps |
-| **14 — Assembly** | `Assembly Agent` (ffmpeg) | Fan-in join of the video and voiceover branches (deferred until both settle). Stitches approved shots, overlays voiceover, burns captions and CTA into each shot's reserved zone |
-| **15 — Export** | `Format Export Node` (ffmpeg) | Recomposes master cut into 9:16, 1:1, and 16:9. Zero additional video-gen cost |
+| **2 — Product Truths** | `Product Truth Extractor` (Qwen-VL) | Extracts 6–10 specific facts from uploaded photos — colors, materials, textures, scale cues, form factor. Every fact gets a `truth_id` that flows through all downstream nodes |
+| **3 — Research** | `Product Research Node` (Tavily + Qwen) | Two tasks run in parallel: **(a) brand research** — if the seller provided a brand URL, fetches and summarises brand identity into `brand_context` for on-brand copy; **(b) product research** — classifies the product and web-searches for specs/features/use-cases, distilling up to 10 checkable facts for VO. Either task is a graceful no-op when its input is absent |
+| **4 — Scripts** | `Concept Agent` (Qwen-Max) | Generates 4 structurally distinct ad scripts, each using a different copywriting framework (PAS, AIDA, BAB, Hook-Problem-Solution), with every claim grounded to a truth ID |
+| **5 — Critic Chain** | Hook / Pacing / Body / CTA / Tone checkers → `Meta-Critic` | Five specialist checkers score all four scripts in parallel. Meta-Critic picks the single highest composite-scoring variant (hook 25%, pacing 20%, completion 20%, CTA 20%, tone 15%) and writes it to `winning_script` |
+| **6 — Visual Direction** | `Visual Direction Agent` (Qwen-Max) | Maps each script beat to a shot type, camera move, human-presence judgment, and framing notes — open-world free-form descriptions, not closed enums |
+| **7 — Treatment** | `Treatment Agent` (Qwen-Max) | Director's treatment: persona, color story, pacing philosophy, per-beat visual justifications citing verbatim script quotes and truth IDs |
+| **8 — Shot List** | `Shot-List Agent` (Qwen-Max, 2 calls) | Call A: beat-to-truth justifications only → deterministically validated. Call B: camera/composition fields conditioned on validated justifications |
+| **9 — Budget Gate** | `Budget Gate` (deterministic) | Grounding-weighted allocation. If over cap: priority-ordered reduce — downgrade resolution, cut lowest-weight shots, redistribute via waterfill. No LLM re-invocation |
+| **10 — Video Gen** | `Video-Gen Node` (Wan 2.7 i2v) + `Ken-Burns Fallback` | Shots fan out in parallel via LangGraph `Send()`. Every shot is image-to-video with the seller's reference photo. Hard failures degrade to Ken-Burns pan/zoom |
+| **11 — Continuity** | `Continuity Agent` (Qwen-VL) + `Continuity Gate` | Early-frame identity check + drift score per shot. Up to 2 auto-retries; exhausted retries raise a real `interrupt()` for seller approval |
+| **12 — Voiceover** | `Voice Direction Agent` + `Voiceover + Caption Agent` (Qwen TTS) | Parallel branch from script finalization. Voice Direction rewrites beats for natural spoken delivery with per-beat emotion and pacing. TTS synthesises audio; captions are aligned to beat timestamps |
+| **13 — Assembly** | `Assembly Agent` (ffmpeg) | Fan-in join of the video and voiceover branches (deferred until both settle). Stitches approved shots, overlays voiceover, burns captions and CTA into each shot's reserved zone |
+| **14 — Export** | `Format Export Node` (ffmpeg) | Recomposes master cut into 9:16, 1:1, and 16:9. Zero additional video-gen cost |
 
 ---
 
@@ -106,9 +104,8 @@ flowchart TD
 
 | Agent | Model | Role |
 |---|---|---|
-| Brand Research | Tavily | Fetches and summarises brand identity from seller URL — skips if no URL provided |
 | Product Truth Extractor | Qwen-VL | Photo → specific facts with truth IDs |
-| Product Research Node | Tavily + Qwen | Web-sourced specs/features for spec-driven products (copy/VO only) |
+| Product Research Node | Tavily + Qwen | Brand context (optional, from seller URL) + web-sourced specs/features for spec-driven products — both tasks run in parallel |
 | Concept Agent | Qwen-Max | 4 distinct ad scripts, framework/hook/trigger forced diverse |
 | Hook-Checker | Qwen | Score hook specificity and strength, 1–5 |
 | Pacing-Checker | Deterministic | Validate timing math: beat sums, word rate, windows |

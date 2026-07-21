@@ -10,6 +10,11 @@ decides whether research would add value; most commercially-sold products pass
 (a lighter → "produces windproof flame" → campfire shot; a VR headset → specs +
 games; even a candle → burn time, scent profile).
 
+Also absorbs Brand Research (previously a separate graph node): if `brand_url`
+is in state, fetches and summarises the brand page in parallel with the product
+classification call, writing `brand_context` to state so the Concept Agent can
+write on-brand copy. No-op when brand_url is absent.
+
 SKIP cases: the product is so visually self-describing that no web search could
 add intelligence (e.g. an unlabelled artisan ceramic with no brand, a raw
 material swatch). The skip bar is intentionally high — default to researching.
@@ -29,6 +34,8 @@ try/except and can NEVER raise — on any problem it returns performed=False and
 the concept agent behaves byte-identically to before this feature existed.
 
 Pipeline:
+  0. Brand research (optional, parallel with step 1): if brand_url present,
+     fetch via Tavily Extract (or httpx fallback) and summarise into brand_context.
   1. LLM classify (temperature=0): research_needed vs skip + product name +
      candidate search queries (broader than just specs — include use cases).
   2. Deterministic query sanitization (strip control chars, cap length, force
@@ -50,6 +57,7 @@ import os
 import re
 from typing import Optional
 
+import httpx
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.runnables import RunnableConfig
 from openai import AsyncOpenAI
@@ -58,6 +66,70 @@ from agents._retry import create_completion
 from graph.state import ProductCutState, ResearchFact
 
 logger = logging.getLogger("productcut.agents.product_research_node")
+
+# ---------------------------------------------------------------------------
+# Brand research helpers (absorbed from the removed brand_research_node)
+# ---------------------------------------------------------------------------
+_MAX_BRAND_PAGE_CHARS = 8_000
+
+_BRAND_SUMMARY_SYSTEM = (
+    "You are a brand strategist. Given a webpage's visible text content, write a "
+    "concise brand identity summary in 120 words or fewer. Cover: what the brand sells, "
+    "their tone of voice (formal/casual/playful/premium/etc.), their key differentiators, "
+    "their target customer, and any notable taglines or positioning claims. "
+    "Output only the summary, no headers, no bullet points."
+)
+
+
+def _fetch_brand_page_httpx(url: str) -> str:
+    resp = httpx.get(
+        url, timeout=20.0, follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; ProductCut/1.0)"},
+    )
+    resp.raise_for_status()
+    html = resp.text
+    html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", "", html,
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:_MAX_BRAND_PAGE_CHARS]
+
+
+async def _get_brand_page_text(url: str) -> str:
+    if os.environ.get("TAVILY_API_KEY"):
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+        response = await client.extract(urls=[url])
+        results = response.get("results", [])
+        if not results:
+            raise ValueError(f"Tavily returned no results for {url}")
+        return results[0].get("raw_content", "")[:_MAX_BRAND_PAGE_CHARS]
+    return await asyncio.to_thread(_fetch_brand_page_httpx, url)
+
+
+async def _brand_research(client: AsyncOpenAI, model: str, brand_url: str, brand_name: str) -> str:
+    """Fetch brand page and return a 120-word identity summary. Returns '' on any failure."""
+    try:
+        page_text = await _get_brand_page_text(brand_url)
+        if not page_text.strip():
+            return ""
+        brand_label = f'brand "{brand_name}"' if brand_name else "this brand"
+        user = (
+            f"Webpage for {brand_label} ({brand_url}):\n\n"
+            f"{page_text}\n\n"
+            "Brand identity summary:"
+        )
+        summary = await create_completion(
+            client, model=model,
+            messages=[{"role": "system", "content": _BRAND_SUMMARY_SYSTEM}, {"role": "user", "content": user}],
+            temperature=0.2,
+        )
+        logger.info("product_research_node: brand context summarized for %s (%d chars)", brand_url, len(summary))
+        return summary
+    except Exception as exc:
+        logger.warning("product_research_node: brand research failed for %s: %s", brand_url, exc)
+        return ""
+
 
 _MAX_QUERIES = 3
 _MAX_QUERY_CHARS = 120
@@ -414,28 +486,46 @@ def _build_facts(raw_facts: list[dict], raw_snippets: str) -> list[ResearchFact]
 async def product_research_node(
     state: ProductCutState, config: Optional[RunnableConfig] = None
 ) -> dict:
-    """LangGraph node: web-research spec_driven products, no-op otherwise.
+    """LangGraph node: brand research (optional) + web-research spec_driven products.
 
     NEVER raises — every failure path returns performed=False so the concept
     agent behaves exactly as it did before this feature existed.
     """
     try:
-        if not os.environ.get("TAVILY_API_KEY"):
-            logger.info("product_research_node: no TAVILY_API_KEY — skipping")
-            return _skipped()
-
-        brief = state.get("brief", "") or ""
+        brand_url = state.get("brand_url", "") or ""
         brand_name = state.get("brand_name", "") or ""
+        brief = state.get("brief", "") or ""
         truth_facts = [t.get("fact", "") for t in state.get("product_truths", []) or []]
         model = os.environ["MODEL_TEXT"]
+        has_tavily = bool(os.environ.get("TAVILY_API_KEY"))
 
         client = _make_client()
         try:
-            classification_result = await _classify(
-                client, model, brief, brand_name, truth_facts
-            )
+            if brand_url and has_tavily:
+                # Run brand research and product classification in parallel.
+                brand_context, classification_result = await asyncio.gather(
+                    _brand_research(client, model, brand_url, brand_name),
+                    _classify(client, model, brief, brand_name, truth_facts),
+                )
+            elif brand_url:
+                # No Tavily for product search, but brand page has an httpx fallback.
+                brand_context = await _brand_research(client, model, brand_url, brand_name)
+                classification_result = None
+            elif has_tavily:
+                brand_context = ""
+                classification_result = await _classify(client, model, brief, brand_name, truth_facts)
+            else:
+                logger.info("product_research_node: no brand_url and no TAVILY_API_KEY — skipping")
+                return _skipped()
         finally:
             await client.close()
+
+        extras = {"brand_context": brand_context} if brand_context else {}
+
+        if not has_tavily or classification_result is None:
+            result = _skipped()
+            result.update(extras)
+            return result
 
         classification = classification_result.get("classification")
         product_name = (classification_result.get("product_name") or "").strip()
@@ -445,28 +535,33 @@ async def product_research_node(
                 "product_research_node: classified '%s' — skipping web research",
                 classification,
             )
-            return _skipped()
+            result = _skipped()
+            result.update(extras)
+            return result
+
         if not product_name:
-            logger.info(
-                "product_research_node: no product_name resolved — skipping"
-            )
-            return _skipped()
+            logger.info("product_research_node: no product_name resolved — skipping")
+            result = _skipped()
+            result.update(extras)
+            return result
 
         queries = _sanitize_queries(
             classification_result.get("search_queries", []), product_name
         )
         if not queries:
             logger.info("product_research_node: no usable queries — skipping")
-            return _skipped()
+            result = _skipped()
+            result.update(extras)
+            return result
 
-        raw_snippets, results = await _search(queries)
+        raw_snippets, search_results = await _search(queries)
 
-        if not results or not raw_snippets.strip():
+        if not search_results or not raw_snippets.strip():
             logger.warning(
                 "product_research_node: all searches failed / empty for %s", product_name
             )
             await _emit(config, 0, product_name, queries)
-            return {
+            result = {
                 "product_research": {
                     "performed": True,
                     "classification": "research_needed",
@@ -475,6 +570,8 @@ async def product_research_node(
                     "queries_used": queries,
                 }
             }
+            result.update(extras)
+            return result
 
         client = _make_client()
         try:
@@ -483,14 +580,13 @@ async def product_research_node(
             await client.close()
 
         facts = _build_facts(raw_facts, raw_snippets)
-
         await _emit(config, len(facts), product_name, queries)
 
         logger.info(
             "product_research_node: %d fact(s) for %s from %d queries",
             len(facts), product_name, len(queries),
         )
-        return {
+        result = {
             "product_research": {
                 "performed": True,
                 "classification": "research_needed",
@@ -499,6 +595,9 @@ async def product_research_node(
                 "queries_used": queries,
             }
         }
+        result.update(extras)
+        return result
+
     except Exception as exc:  # noqa: BLE001 — the node must NEVER fail the job
         logger.warning("product_research_node: degrading to no-op after error: %s", exc)
         result = _skipped()
