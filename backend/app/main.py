@@ -205,6 +205,7 @@ async def create_job_endpoint(
     mood_words: str = Form(default=""),    # JSON array string, e.g. '["bold","warm"]'
     reference_ad: str = Form(default=""),
     never_do: str = Form(default=""),
+    props: str = Form(default=""),    # JSON array string, e.g. '["water bottle","journal"]'
     notes: str = Form(default=""),
     target_length_sec: int = Form(default=30),
     photos: list[UploadFile] = File(default=[]),
@@ -230,6 +231,11 @@ async def create_job_endpoint(
         sd["reference_ad"] = {"url_or_text": reference_ad, "why": ""}
     if never_do:
         sd["never_do"] = never_do
+    if props:
+        try:
+            sd["approved_props"] = json.loads(props)
+        except json.JSONDecodeError:
+            pass
     if notes:
         sd["freeform"] = notes
     # Always thread the requested duration through so the graph can size the
@@ -278,13 +284,8 @@ async def _save_photos(photos: list[UploadFile], job_id: str) -> list[str]:
         local_path.write_bytes(content)
         suffix = Path(safe).suffix.lower()
         content_type = _CONTENT_TYPES.get(suffix, "image/jpeg")
-        try:
-            oss_url = upload_photo_to_oss(str(local_path), job_id, safe, content_type=content_type)
-            refs.append(oss_url)
-        except Exception as exc:
-            # Fallback to localhost URL if OSS is unavailable (dev without OSS creds)
-            logger.warning("OSS photo upload failed for %s — falling back to localhost URL: %s", safe, exc)
-            refs.append(f"{BACKEND_BASE_URL}/uploads/{job_id}/{safe}")
+        oss_url = upload_photo_to_oss(str(local_path), job_id, safe, content_type=content_type)
+        refs.append(oss_url)
     return refs
 
 

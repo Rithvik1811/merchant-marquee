@@ -7,6 +7,7 @@ interface SummaryStepProps {
   brief: string;
   moodWords: string[];
   neverList: string[];
+  propsList: string[];
   notes: string;
   onEditPhotos: () => void;
   onEditBrief: () => void;
@@ -18,6 +19,7 @@ export default function SummaryStep({
   brief,
   moodWords,
   neverList,
+  propsList,
   notes,
   onEditPhotos,
   onEditBrief,
@@ -26,8 +28,9 @@ export default function SummaryStep({
   const photoCountLabel = photos.length ? `${photos.length} / 3 added` : "up to 3";
   const hasMood = moodWords.length > 0;
   const hasNever = neverList.length > 0;
+  const hasProps = propsList.length > 0;
   const hasNotes = !!notes.trim();
-  const hasDirection = hasMood || hasNever || hasNotes;
+  const hasDirection = hasMood || hasNever || hasProps || hasNotes;
 
   const sectionHeadStyle = { display: "flex", alignItems: "center", justifyContent: "space-between" };
   const labelStyle = {
@@ -113,6 +116,18 @@ export default function SummaryStep({
                   <span style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     {neverList.map((tag, i) => (
                       <span key={i} style={{ padding: "2px 9px", border: "1px solid var(--accent)", color: "var(--ink)", fontSize: 12 }}>
+                        {tag}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              )}
+              {hasProps && (
+                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                  <span style={rowLabelStyle}>Props</span>
+                  <span style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {propsList.map((tag, i) => (
+                      <span key={i} style={{ padding: "2px 9px", border: "1px solid var(--ink)", color: "var(--ink)", fontSize: 12 }}>
                         {tag}
                       </span>
                     ))}

@@ -14,6 +14,11 @@ interface DirectionStepProps {
   onNeverInput: (value: string) => void;
   onNeverKey: (e: KeyboardEvent<HTMLInputElement>) => void;
   onRemoveNever: (i: number) => void;
+  propsList: string[];
+  propsInput: string;
+  onPropsInput: (value: string) => void;
+  onPropsKey: (e: KeyboardEvent<HTMLInputElement>) => void;
+  onRemoveProps: (i: number) => void;
   notes: string;
   onNotesInput: (e: ChangeEvent<HTMLTextAreaElement>) => void;
 }
@@ -29,6 +34,11 @@ export default function DirectionStep({
   onNeverInput,
   onNeverKey,
   onRemoveNever,
+  propsList,
+  propsInput,
+  onPropsInput,
+  onPropsKey,
+  onRemoveProps,
   notes,
   onNotesInput,
 }: DirectionStepProps) {
@@ -77,6 +87,18 @@ export default function DirectionStep({
             onInputChange={onNeverInput}
             onKeyDown={onNeverKey}
             onRemove={onRemoveNever}
+          />
+        </div>
+        <div>
+          <label style={labelStyle}>Props &amp; context objects</label>
+          <TagField
+            tags={propsList}
+            variant="solid"
+            inputValue={propsInput}
+            placeholder="e.g. water bottle, leather journal…"
+            onInputChange={onPropsInput}
+            onKeyDown={onPropsKey}
+            onRemove={onRemoveProps}
           />
         </div>
         <div>

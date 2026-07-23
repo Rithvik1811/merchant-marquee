@@ -798,6 +798,7 @@ def _build_call_b_system_prompt(
     hook_implies_person: bool = False,
     has_visual_direction: bool = False,
     human_affordance: bool = False,
+    approved_props: list[str] | None = None,
 ) -> str:
     hook_structure_note = (
         """This script's hook beat establishes a person in a specific moment (the
@@ -859,7 +860,13 @@ Concentrate any human-interaction shots in the demo/proof beats. Cap
 human-interaction shots at 1-3 per ad -- never zero when the human-contact
 affordance rubric below supports one, never every shot."""
     )
-    return f"""{vda_note}You are a cinematographer turning already-justified shots into concrete
+    props_constraint = (
+        f"\nAPPROVED CONTEXT OBJECTS: when demonstrating product interactions or "
+        f"showing in-scene props, use ONLY these objects: {', '.join(approved_props)}. "
+        f"Do not introduce other props or objects not on this list.\n"
+        if approved_props else ""
+    )
+    return f"""{vda_note}{props_constraint}You are a cinematographer turning already-justified shots into concrete
 video-generation briefs. Each shot's grounding (its exact script quote + the real
 product fact + the treatment beat it realizes) is FIXED and given to you -- do not
 change it. Your job is only to choose how the camera realizes it.
@@ -1222,6 +1229,7 @@ async def generate_shot_list(
     validate_justifications: Callable[..., list[dict]] = _kr_validate_justifications,
     visual_direction: Optional[VisualDirection] = None,
     client: Optional[AsyncOpenAI] = None,
+    approved_props: list[str] | None = None,
 ) -> list[Shot]:
     """Run the Shot-List Agent: Call A -> validate (-> one bounded Call A re-prompt
     -> per-shot treatment fallback) -> Call B -> assemble -> structural validate.
@@ -1339,6 +1347,7 @@ async def generate_shot_list(
             target_duration_sec, hook_implies_person,
             human_affordance=human_use_suits_product(product_truths),
             visual_direction=visual_direction,
+            approved_props=approved_props,
         )
         return shots
     finally:
@@ -1356,6 +1365,7 @@ async def _run_call_b(
     hook_implies_person: bool = False,
     human_affordance: bool = False,
     visual_direction: Optional[VisualDirection] = None,
+    approved_props: list[str] | None = None,
 ) -> list[Shot]:
     """Call B + assembly + structural validation, with one bounded Call B retry
     if the assembled list fails structural validation (§5.6 repair posture) OR
@@ -1377,7 +1387,7 @@ async def _run_call_b(
     messages = [
         {
             "role": "system",
-            "content": _build_call_b_system_prompt(hero_max, hook_implies_person, has_visual_direction=visual_direction is not None, human_affordance=human_affordance),
+            "content": _build_call_b_system_prompt(hero_max, hook_implies_person, has_visual_direction=visual_direction is not None, human_affordance=human_affordance, approved_props=approved_props),
         },
         {"role": "user", "content": _build_call_b_user_content(justifications, truths_by_id, treatment, visual_direction)},
     ]
@@ -1467,11 +1477,13 @@ async def shot_list_agent_node(state: ProductCutState) -> dict:
     (`treatment_agent -> shot_list_agent -> budget_gate`). Was standalone and
     independently testable before that; that follow-up wiring has since landed.
     """
+    approved_props = (state.get("seller_direction") or {}).get("approved_props")
     shots = await generate_shot_list(
         winning_script=state["winning_script"],
         treatment=state["treatment"],
         product_truths=state.get("product_truths", []),
         visual_direction=state.get("visual_direction"),
+        approved_props=approved_props,
     )
     trace_note = f"\n[shot_list_agent] produced {len(shots)} shot(s) via two-call justify->realize flow."
     if len(shots) < MIN_SHOTS:

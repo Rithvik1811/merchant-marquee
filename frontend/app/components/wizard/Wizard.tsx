@@ -40,6 +40,11 @@ export interface WizardProps {
   onNeverInput: (value: string) => void;
   onNeverKey: (e: KeyboardEvent<HTMLInputElement>) => void;
   onRemoveNever: (i: number) => void;
+  propsList: string[];
+  propsInput: string;
+  onPropsInput: (value: string) => void;
+  onPropsKey: (e: KeyboardEvent<HTMLInputElement>) => void;
+  onRemoveProps: (i: number) => void;
   notes: string;
   onNotesInput: (e: ChangeEvent<HTMLTextAreaElement>) => void;
 
@@ -169,6 +174,11 @@ export default function Wizard(props: WizardProps) {
               onNeverInput={props.onNeverInput}
               onNeverKey={props.onNeverKey}
               onRemoveNever={props.onRemoveNever}
+              propsList={props.propsList}
+              propsInput={props.propsInput}
+              onPropsInput={props.onPropsInput}
+              onPropsKey={props.onPropsKey}
+              onRemoveProps={props.onRemoveProps}
               notes={props.notes}
               onNotesInput={props.onNotesInput}
             />
@@ -179,6 +189,7 @@ export default function Wizard(props: WizardProps) {
               brief={brief}
               moodWords={props.moodWords}
               neverList={props.neverList}
+              propsList={props.propsList}
               notes={props.notes}
               onEditPhotos={() => goStep(1)}
               onEditBrief={() => goStep(2)}

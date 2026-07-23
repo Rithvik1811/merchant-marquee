@@ -165,6 +165,8 @@ interface State {
   moodInput: string;
   neverList: string[];
   neverInput: string;
+  propsList: string[];
+  propsInput: string;
   notes: string;
   dragOver: boolean;
 
@@ -216,6 +218,8 @@ function initialState(): State {
     moodInput: "",
     neverList: [],
     neverInput: "",
+    propsList: [],
+    propsInput: "",
     notes: "",
     dragOver: false,
 
@@ -450,9 +454,10 @@ export default function StudioPage() {
   );
   const onMoodInput = useCallback((value: string) => setState({ moodInput: value }), [setState]);
   const onNeverInput = useCallback((value: string) => setState({ neverInput: value }), [setState]);
+  const onPropsInput = useCallback((value: string) => setState({ propsInput: value }), [setState]);
 
   const addTag = useCallback(
-    (listKey: "moodWords" | "neverList", inputKey: "moodInput" | "neverInput") => {
+    (listKey: "moodWords" | "neverList" | "propsList", inputKey: "moodInput" | "neverInput" | "propsInput") => {
       setState((s) => {
         const val = s[inputKey].trim();
         if (!val) return {};
@@ -470,8 +475,12 @@ export default function StudioPage() {
     (e: KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") { e.preventDefault(); addTag("neverList", "neverInput"); } },
     [addTag],
   );
+  const onPropsKey = useCallback(
+    (e: KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") { e.preventDefault(); addTag("propsList", "propsInput"); } },
+    [addTag],
+  );
   const removeTag = useCallback(
-    (listKey: "moodWords" | "neverList", i: number) => {
+    (listKey: "moodWords" | "neverList" | "propsList", i: number) => {
       setState((s) => ({ [listKey]: s[listKey].filter((_, idx) => idx !== i) }) as Partial<State>);
     },
     [setState],
@@ -896,6 +905,7 @@ export default function StudioPage() {
     formData.append("brief", state.brief);
     if (state.moodWords.length) formData.append("mood_words", JSON.stringify(state.moodWords));
     if (state.neverList.length) formData.append("never_do", state.neverList.join(", "));
+    if (state.propsList.length) formData.append("props", JSON.stringify(state.propsList));
     if (state.notes) formData.append("notes", state.notes);
     state.photos.forEach((photo) => {
       if (photo.file) formData.append("photos", photo.file, photo.name);
@@ -1176,6 +1186,11 @@ export default function StudioPage() {
           onNeverInput={onNeverInput}
           onNeverKey={onNeverKey}
           onRemoveNever={(i) => removeTag("neverList", i)}
+          propsList={state.propsList}
+          propsInput={state.propsInput}
+          onPropsInput={onPropsInput}
+          onPropsKey={onPropsKey}
+          onRemoveProps={(i) => removeTag("propsList", i)}
           notes={state.notes}
           onNotesInput={onNotesInput}
           goNext={goNext}
