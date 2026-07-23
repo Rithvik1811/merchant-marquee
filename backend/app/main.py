@@ -438,6 +438,61 @@ async def refresh_export_urls(job_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /jobs/{job_id}/shot-videos  — re-sign shot video URLs for a completed job
+# ---------------------------------------------------------------------------
+
+
+@app.get("/jobs/{job_id}/shot-videos")
+async def refresh_shot_video_urls(job_id: str) -> dict:
+    """Return fresh signed OSS URLs for each shot's video clip.
+
+    Clips are stored at:
+      - passed shots:   jobs/{job_id}/shots/{shot_id}/shot.mp4
+      - fallback shots: jobs/{job_id}/shots/{shot_id}/fallback_kenburns.mp4
+
+    Re-signed on demand so the Library can play shot thumbnails from sessions
+    older than the 24-hour signed-URL TTL. Returns {shot_id: signed_url}.
+    Shots whose OSS object cannot be found are silently omitted.
+    """
+    import os as _os
+    if not _os.environ.get("OSS_ACCESS_KEY_ID"):
+        raise HTTPException(status_code=503, detail="OSS not configured")
+
+    from agents._oss import oss_object_key, sign_existing_key
+
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": job_id}}
+    try:
+        snapshot = await graph.aget_state(config)
+        if snapshot is None or not snapshot.values:
+            raise HTTPException(status_code=404, detail="No checkpoint found for this job")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("aget_state failed for shot-videos %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail=f"Checkpoint read failed: {exc}")
+
+    st = _jsonable(dict(snapshot.values))
+    shot_list = st.get("shot_list") or []
+
+    result: dict = {}
+    for shot in shot_list:
+        shot_id = shot.get("shot_id")
+        if not shot_id:
+            continue
+        filename = "fallback_kenburns.mp4" if shot.get("status") == "fallback" else "shot.mp4"
+        key = oss_object_key(job_id, shot_id, filename)
+        try:
+            url = await asyncio.to_thread(sign_existing_key, key)
+            result[shot_id] = url
+        except Exception as exc:
+            logger.debug(
+                "refresh_shot_video_urls: could not sign %s for shot %s: %s", key, shot_id, exc
+            )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # GET /jobs/{job_id}/download/{ratio_id}  — proxy OSS video as attachment
 # ---------------------------------------------------------------------------
 # Direct browser fetches to signed OSS URLs are blocked by CORS, so the

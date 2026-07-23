@@ -1070,6 +1070,25 @@ export default function StudioPage() {
           // OSS not configured or network error — show with stale URLs
         }
       }
+      // Refresh shot video URLs — signed OSS URLs expire after 24 h, so reopening
+      // a previous ad shows blank thumbnails without this re-sign pass.
+      if (entry.jobId && hydrated) {
+        try {
+          const res = await fetch(`${getApiBase()}/jobs/${entry.jobId}/shot-videos`);
+          if (res.ok) {
+            const freshUris: Record<string, string> = await res.json();
+            hydrated = {
+              ...hydrated,
+              shots: hydrated.shots.map((s) => ({
+                ...s,
+                ...(freshUris[s.id] ? { videoUri: freshUris[s.id] } : {}),
+              })),
+            };
+          }
+        } catch {
+          // best-effort — show with stale/missing URIs
+        }
+      }
       setState({
         status: "dashboard",
         jobDone: true,
