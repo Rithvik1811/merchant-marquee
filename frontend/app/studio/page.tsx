@@ -1037,15 +1037,15 @@ export default function StudioPage() {
 
             const masterCutUri = st["master_cut_uri"] as string | undefined;
             const ex = st["exports"] as { aspect_9x16?: string; aspect_1x1?: string; aspect_16x9?: string } | undefined;
-            if (ex) {
+            if (masterCutUri || ex) {
               final = {
                 duration: "30s",
                 masterCutUri,
-                ratios: [
+                ratios: ex ? [
                   { ...FINAL_RATIOS[0], url: ex.aspect_9x16 },
                   { ...FINAL_RATIOS[1], url: ex.aspect_1x1 },
                   { ...FINAL_RATIOS[2], url: ex.aspect_16x9 },
-                ],
+                ] : [...FINAL_RATIOS],
               };
             }
           }
@@ -1054,7 +1054,7 @@ export default function StudioPage() {
 
       if (entry.jobId && final) {
         try {
-          const res = await fetch(`/api/jobs/${entry.jobId}/exports`);
+          const res = await fetch(`${getApiBase()}/jobs/${entry.jobId}/exports`);
           if (res.ok) {
             const fresh: Record<string, string> = await res.json();
             final = {
