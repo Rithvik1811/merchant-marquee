@@ -16,7 +16,7 @@ jobs:
           key: ${{ secrets.ECS_SSH_KEY }}
           command_timeout: 20m
           script: |
-            cd ~/merchant-marquee
+            cd /opt/productcut
             git pull origin master
             docker compose -f docker-compose.prod.yml up --build -d --remove-orphans
             docker image prune -f
