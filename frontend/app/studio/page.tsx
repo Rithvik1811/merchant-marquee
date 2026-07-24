@@ -304,9 +304,13 @@ export default function StudioPage() {
     } catch { /* ignore */ }
 
     // Check ?view=library URL param
+    let wantsLibrary = false;
     try {
       const params = new URLSearchParams(window.location.search);
-      if (params.get("view") === "library") setState({ status: "library" });
+      if (params.get("view") === "library") {
+        wantsLibrary = true;
+        setState({ status: "library" });
+      }
     } catch { /* ignore */ }
 
     // Bug 11: auto-reconnect + seed Library history from DB on startup
@@ -330,6 +334,11 @@ export default function StudioPage() {
           return { history: merged };
         });
         if (jobIdRef.current) return;  // onGenerate already fired this session
+        // Bug: explicit ?view=library must win over the auto-reconnect below —
+        // this fetch resolves asynchronously, after the sync view=library check
+        // above already set status to "library", so without this guard a
+        // running job would silently clobber that back to "dashboard".
+        if (wantsLibrary) return;
         // N6: only reconnect to "running" — "ingested" means the WS was never opened
         const running = jobs.find((j) => j.status === "running");
         if (running) {
