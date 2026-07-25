@@ -37,6 +37,11 @@ MIN_VARIANTS_AFTER_DEGRADE = 2
 MIN_GROUNDING_TRUTH_IDS = 2
 MAX_HOOK_WORDS = 10
 
+# Minimum word counts per beat position (130 wpm ≈ 2.2 words/sec, conservative floor).
+# A line under its floor is an incomplete sentence, not a punchy one.
+# Index: 0=hook, 1=transformation, 2=proof, 3=depth, 4=cta
+BEAT_MIN_WORDS_BY_INDEX = [9, 14, 11, 11, 9]
+
 # The graph.state.ProductTruth categories that are near-impossible to guess
 # without actually looking at the photos -- a real anti-genericness lever, not
 # just "cite 2 facts, any 2 facts." See module docstring.
@@ -105,6 +110,18 @@ MIN_DISTINCT_TRUTH_CATEGORIES = 2
 # a script that spends essentially its whole runtime on one micro-detail
 # trips this, which is exactly the observed live failure.
 FIXATION_MIN_BEAT_MENTIONS = 3
+
+# A script that sums to ~target_length_sec but uses too few beats is sparse —
+# each beat is an overlong pause rather than a distinct copy point. Enforce a
+# floor so the model must actually fill the runtime with content. Derived as
+# target_length_sec // 6 (one beat per ~6 seconds), matching the 5-beat narrative
+# arc (Hook 4-5s / Transformation 6-8s / Proof 5-6s / Depth 5-6s / CTA 4-5s).
+# Clamped to a minimum of 4 so even a 15s script requires meaningful density.
+# A smaller divisor (e.g. 4) would force 7+ beats for a 30s ad, making every
+# shot only ~4s long and the ad feel rushed — the clip buffer handles freeze
+# prevention independently, so we don't need extra beats for that.
+MIN_BEATS_PER_SEC_DIVISOR = 6
+MIN_BEATS_FLOOR = 4
 
 # VO FOCUS MANDATE (2026-07-12): the VO must describe the PRODUCT to the
 # viewer -- humans appear in the VIDEO, not as third-person subjects narrating
@@ -256,8 +273,14 @@ def _brand_identity_block(brand_name: str, brand_context: str) -> str:
         lines.append(
             f"- Brand name: {brand_name}. The CTA beat MUST naturally name the brand. "
             f"NEVER write a generic CTA like \"Get yours\" or \"Order now\" when the brand is known. "
-            f"Instead use something like: \"Get your {brand_name}.\" / \"Shop {brand_name} today.\" / "
-            f"\"That's what {brand_name} is built for.\" — any natural phrasing that lands the name."
+            f"Instead use something like: \"Shop {brand_name} today.\" / "
+            f"\"That's what {brand_name} is built for.\" / \"Find yours at {brand_name}.\" "
+            f"CRITICAL: the brand name is never the direct grammatical object of the CTA verb. "
+            f"The brand names a maker or studio, not the physical thing the viewer uses. "
+            f"Always place the product noun between the possessive and the brand name, or "
+            f"use a construction where the brand name is the subject: "
+            f"\"That's what {brand_name} is built for.\" / \"Find yours at {brand_name}.\" "
+            f"If no product noun fits naturally: \"That's what {brand_name} is for.\""
         )
     if brand_context:
         lines.append(f"- Brand context (match tone, positioning, and vocabulary to this):\n  {brand_context}")
@@ -287,7 +310,26 @@ Use this to write for a specific person, not a generic consumer. The hook should
 """
 
 
-def _build_system_prompt(target_length_sec: int, human_use_suits: bool = False, brand_name: str = "", brand_context: str = "", research_facts: Optional[list] = None, product_type: str = "", audience_context: str = "", buyer_lens_hypothesis: str = "") -> str:
+def _colorway_block(colorway_context: str) -> str:
+    if not colorway_context:
+        return ""
+    return f"""
+MULTI-COLORWAY / VARIANT INTELLIGENCE:
+This product is offered in multiple colorways or finishes: {colorway_context}
+
+This is a real creative opportunity — not just a fact to mention, but a hook.
+At least ONE of your 4 script variants MUST leverage the variant range:
+- Frame it as buyer choice, not a product listing: "Find the one that's yours." / "Three ways to wear it."
+- Do NOT read out every color name as a list — that is a product description, not an ad. Instead name
+  the range naturally ("comes in three finishes", "every colorway", "the one that matches yours") or
+  mention just one color as an evocative example, then point to the others.
+- The CTA for this variant should invite the viewer to choose: "Find yours." / "Pick your color." / "See them all."
+- The other 3 variants may focus on a single colorway (the one most prominent in the photos), but this
+  one variant MUST acknowledge the full range and make the choice itself feel desirable.
+"""
+
+
+def _build_system_prompt(target_length_sec: int, human_use_suits: bool = False, brand_name: str = "", brand_context: str = "", research_facts: Optional[list] = None, product_type: str = "", audience_context: str = "", buyer_lens_hypothesis: str = "", colorway_context: str = "") -> str:
     # human_use_suits is preserved as a parameter for future callers/analytics
     # (e.g. the Visual Direction Agent uses the same affordance signal), but no
     # longer changes the VO prompt itself -- the VO FOCUS MANDATE below applies
@@ -415,18 +457,100 @@ these vocabularies (you may pick something else if it genuinely fits better,
 but it must still be distinct across variants):
 - Hook types: {', '.join(HOOK_TYPES)}
 - Emotional triggers: {', '.join(EMOTIONAL_TRIGGERS)}
+
+4-VARIANT CREATIVE ANGLE MANDATE — the most important diversity rule:
+Framework, hook type, and emotional trigger enforce structure and surface labels.
+They do NOT guarantee real creative variation. Two variants sharing the same product
+angle but different framework labels are still functionally identical. Before writing
+a single line, assign each variant a genuinely distinct CREATIVE ANGLE — the
+protagonist, scenario, and felt payoff must all differ:
+
+  ANGLE A — DAILY USE / RITUAL: the viewer in one specific ordinary moment with this
+  product (morning, commute, desk, evening). Name the RESULT of that moment — what
+  it changes, relieves, or makes possible. The product is part of a habit, not a
+  purchase. Sensory present-tense language; second-person address.
+
+  ANGLE B — QUALITY PROOF: lead with one specific, observable physical detail that
+  serves as EVIDENCE that this product is better than the generic alternative. Apply
+  the So What chain (see VOICE section) to translate the detail into the outcome the
+  buyer gets. The script earns its claims; it doesn't assert them.
+
+  ANGLE C — OCCASION / GIFT: write for a specific person or moment — a gift, a
+  milestone, an upgrade the viewer has been putting off. Name the specific reason
+  THIS product is the right answer for that moment. Not "it makes a great gift" —
+  name who, for what occasion, and why THIS one specifically.
+
+  ANGLE D — BEFORE / CHANGE: open on a concrete frustration, wrong assumption, or
+  common alternative the viewer has settled for. Land on what this product resolves
+  — specifically, not generically. The contrast must be falsifiable: what exactly
+  stops being a problem.
+
+These angles must be reflected in "asset_strategy" per variant. Test: if you swapped
+the variant_ids of any two variants, would they feel interchangeable in content?
+If yes, the angles are not distinct enough — rewrite until swapping would be obvious.
+
+TRUTH-TO-ANGLE SYNTHESIS (silent reasoning — do not output this step):
+Before writing any beat line, convert each product truth into a CREATIVE ANGLE
+for a script writer. A creative angle is not a rewording of the visual observation
+— it is the CLAIM or STORY SEED that flows from the evidence.
+
+Work through every truth like this:
+  Raw truth: "handle is thick and flares at the base — wide enough to wrap a
+    full hand around rather than pinch between fingertips"
+  → Creative angle: "This mug was designed for the grip, not the glance —
+    the handle says 'hold me properly' before you've taken a sip."
+
+  Raw truth: "arched walnut bar supports two sweeping U-shaped layers of cord
+    that meet and cross at the center"
+  → Creative angle: "The shape does the work before anyone explains it — two
+    slow arcs intersecting, the kind of gesture a room builds itself around."
+
+Use these synthesized angles (not the raw visual descriptions) as your
+actual script content. The truth_ids still go in cited_truth_ids — the
+angle is HOW you use the truth, not a replacement for it.
+
+If research facts are available, weave their buyer-context intelligence
+(gifting occasions, emotional motivations, lifestyle identity signals) into
+the angles — a visual detail becomes more powerful when it connects to why
+someone is buying.
+
+CROSS-VARIANT TRUTH ASSIGNMENT (do this before writing any beat lines):
+Step 1 — count how many product truths are available (N).
+Step 2 — assign one truth_id as the PRIMARY PROOF TRUTH for each variant.
+  If N ≥ 4: no two variants may share the same primary truth.
+  If N < 4: assign truths round-robin — it is acceptable for two variants
+    to share a truth_id, BUT each variant must approach it from a completely
+    different angle: different buyer moment (gifting vs. daily ritual vs.
+    new home), different emotional lens (craft pride vs. calm belonging vs.
+    quiet status), or different life context. Reusing a truth with a fresh
+    angle is valid; restating the same argument in new words is not.
+Step 3 — write each variant's beats so its primary truth does the heavy lifting.
+  A truth that is another variant's primary truth should appear in at most one other
+  variant, and only in a supporting role (one beat, not the central proof).
+
+PRODUCT NAME CONSTRUCTION VARIETY (mandatory):
+Across all four variants, the construction used to name the product on first reference
+must differ. If variant A says "This deep ceramic mug," variants B/C/D must not also
+open with "This [adjective] ceramic mug [verb]." Use at least three distinct approaches:
+  * Named by category alone: "this mug", "the mug"
+  * Named by a material detail: "the raw clay", "the wheel-thrown clay"
+  * Named by action: "the cup you actually reach for"
+  * Named by the person's relationship to it: "your morning mug"
+  * Delayed naming: describe the experience first, name the product only in beat 3+
+Never repeat the same adjective-noun-verb construction for the product intro across
+more than one variant.
 {_selling_char_block}
 Grounding (mandatory):
 - Every claim or visual detail in the script must trace back to a specific
   truth_id from the list you were given. Do not invent details not present
   in the provided truths.
 - Each variant must cite AT LEAST 2 different truth_ids in "grounding_truth_ids".
-- Each variant must cite AT LEAST ONE truth whose category is
-  "material_character" or "construction_detail" -- these are the specific,
-  idiosyncratic details a generic description of this kind of product could
-  never predict (a distinctive grain pattern, an odd cutout, a specific hinge mechanism).
-  Do not build a variant only from generic material/color/dimension facts;
-  those are true of many similar products and produce generic-sounding copy.
+  If fewer than 2 truths are available, cite all available truths.
+- At least one cited truth should be a specific, idiosyncratic detail that
+  a generic description of this product category could never predict — a
+  distinctive construction choice, material behaviour, or design decision.
+  Avoid building a variant entirely from generic color/size/shape facts that
+  would be true of any product in this category.
 
 FEATURE SPREAD (mandatory -- sell the WHOLE product, not one detail):
 - Each variant's cited truth_ids must span AT LEAST {MIN_DISTINCT_TRUTH_CATEGORIES}
@@ -535,6 +659,25 @@ citing a truth means a viewer could verify your line against the photo -- it
 does not mean reusing the truth's words. Truths are raw material; every line
 you write must sound like one person talking to another on camera.
 
+THE SO WHAT CHAIN (apply to every truth before writing from it):
+Before writing any line from a product truth or research fact, work through
+this chain silently — the final step is the ONLY step that belongs in the script:
+  Step 1: State the raw fact exactly as given. (analysis only, never script output)
+  Step 2: Ask "So what?" → write the functional consequence the viewer gets.
+  Step 3: Ask "So what?" again → write the felt experience: what the viewer
+          notices, stops worrying about, or starts being able to do.
+Script output = Step 3 only.
+
+The chain works for any product type. For a physical attribute (a material,
+a texture, a construction detail), the chain moves:
+  SPEC → WHAT IT DOES → WHAT THAT FEELS LIKE / WHAT CHANGES
+
+For a performance claim (a capacity, a range, a duration):
+  NUMBER → WHAT THAT ENABLES → THE SPECIFIC MOMENT WHERE IT MATTERS
+
+Step 3 answers always name a moment, a relief, or an action — never restate
+the spec. If your step 3 answer still sounds like a spec, go one more round.
+
 Hard rules:
 1. Never reuse 4 or more consecutive words from any truth's text. Translate
    the observation into what a person would SAY or FEEL about it.
@@ -550,6 +693,12 @@ Hard rules:
    signals, or feels like. When possible, drop the material/hardware noun
    entirely and let the consequence stand alone: "It just opens." beats
    "The chrome latch releases cleanly." Same information for the viewer, no jargon.
+   The clearest sign that the SO WHAT CHAIN was skipped: the physical part or
+   attribute is named as the grammatical subject, and the sentence ends there
+   with no consequence for the viewer. Pattern: "[part] [does its basic job]."
+   — so what? That tells the viewer nothing they couldn't read off the box.
+   Every physical detail must answer "so what does that mean for me?" before
+   it belongs in the script.
 4. Never coin abstract compound nouns no one says out loud ("first-mark
    anxiety"). Say the human version ("that pit in your stomach when you
    scratch something new").
@@ -596,6 +745,59 @@ Hard rules:
       ("you barely notice it after an hour") rather than stacking two adjectives.
     * Verb-adjective shortcuts with odd grammar: "opens easy", "wears nice", "fits great".
       Use plain grammar: "just opens", "still looks new", "fits everything".
+
+11. BEAT CONTINUITY — beats must pull forward, not close off:
+    Each beat must feel like a consequence of, or continuation from, the previous
+    beat. A script where every sentence is a self-contained observation reads as a
+    list of image captions, not a piece of copy — it stops abruptly after each line
+    instead of building.
+    SHUFFLE TEST: if you could reorder the middle beats and the script still made
+    sense, the beats are not connected enough. Each beat should only make full sense
+    AFTER the beat that preceded it.
+    How to create forward pull:
+    * Cause → effect: "The handle has no seam. Your thumb finds it without looking."
+      (Beat 2 is the consequence of Beat 1's physical fact.)
+    * Specific → meaning: "The clay is raw at the base. That's what warm feels like
+      before you've poured anything." (Beat 2 explains why Beat 1 matters.)
+    * Setup → reveal: "You run your thumb along the handle. No bump. No ridge."
+      (Beat 2 lands the discovery Beat 1 set up.)
+    * Open → close: "It feels heavier than you expect —" / "— and that's the point."
+    Beats may use conjunctions, em-dashes, or cause-effect verbs ("so", "because",
+    "that's why", "which means") to stitch beats together. A hard full stop that
+    closes a thought is fine ONLY when the next beat opens a new direction on purpose.
+    NEVER write five consecutive beats that each introduce an independent standalone
+    observation with no thread between them.
+
+BANNED WORDS — never let any of these appear in any beat line. They are the
+statistical fingerprints of generated marketing copy; a human writer at a good
+agency would delete them on the first pass:
+
+  Verbs: elevate, elevates, elevated, unlock, unlocks, unleash, unleashes,
+    harness, harnessing, leverage, leveraging, empower, empowers, discover
+    (as marketing verb), indulge, boast(s), embark, foster, streamline,
+    optimize, amplify, supercharge, revolutionize, redefine, transform
+    (as abstract marketing verb — "transform your life")
+  Nouns: journey (as metaphor — "begin your journey"), tapestry, realm, synergy,
+    testament (to), gateway, powerhouse, potential (as freestanding noun),
+    solution (as product descriptor), experience (as freestanding noun —
+    "elevate your experience")
+  Adjectives / adverbs: seamless, seamlessly, effortlessly (as abstract
+    claim — "effortlessly stylish"), cutting-edge, bespoke (without specific
+    evidence of customization), game-changing, groundbreaking, next-gen,
+    unparalleled, premium (without a concrete reason why), luxury (without
+    a concrete reason why), vibrant (as empty color intensifier), intricate
+    (as catch-all complexity word), meticulously (before any verb)
+  Phrases (banned in full):
+    "in today's world" / "in today's fast-paced world" / "now more than ever"
+    "not just [noun], but [noun]" / "more than just a [product]"
+    "whether you're X or Y" / "perfect for everyone" / "designed with you in mind"
+    "take your X to the next level" / "crafted with care/love/passion"
+    "made to last" / "built to last" (unless immediately followed by a
+    specific, checkable reason why)
+
+Replace any banned word with the concrete consequence, moment, or action it
+was trying to gesture at. If you cannot find a concrete replacement, delete
+the claim entirely — it was doing no work anyway.
 
 CALIBRATION — the same product truths, two different voices. The grounding_truth_ids
 are identical in each pair; only the phrasing changes. No specific product is named
@@ -661,11 +863,13 @@ Per-variant requirements:
   never the product's own flaw.
 - A hook line of {MAX_HOOK_WORDS} words or fewer.
 - Exactly one CTA verb -- never two competing calls to action.
-- Beat-level timestamps: break the script into small beats (NOT 3 coarse
-  hook/body/cta buckets) -- a new beat roughly every 2-3 seconds for the first
-  2-3 beats, then every 3-5 seconds after that. Beats must be contiguous and
-  sum to exactly {target_length_sec} seconds. Each beat's "line" is the actual
-  script text spoken/shown during that beat.
+- Beat-level timestamps: the script maps to exactly 5 beats for a {target_length_sec}s ad,
+  matching the NARRATIVE ARC above (Hook → Transformation → Proof → Depth → CTA).
+  Each beat gets its own shot — a viewer sees a different clip for each beat.
+  Target durations: Hook 4-5s, Transformation 6-8s, Proof 5-6s, Depth 5-6s, CTA 4-5s.
+  Beats must be contiguous and sum to exactly {target_length_sec} seconds. Do NOT
+  create more than 6 beats — each extra beat shortens every shot and the ad feels rushed.
+  Each beat's "line" is the actual script text spoken/shown during that beat.
 
 {_asset_strategy_block}
 NARRATIVE ARC — the beat sequence is MANDATORY for every variant:
@@ -688,6 +892,15 @@ Beat 1 -- HOOK (4-5s): Stop the scroll. Open a desire, a curiosity gap, or a "wh
   pain point that could be swapped onto any competing product without changing a word.
   PLAIN-LANGUAGE WARNING: concrete means the OUTCOME the person EXPERIENCES, never a
   component name, material grade, or manufacturing detail.
+  PRODUCT-FIRST RULE (mandatory): the hook must put THIS product — or a direct,
+  specific experience of using it — at the centre of the opening line. Never open
+  on an unrelated object (a bag, a box, a competitor's item, generic packaging) that
+  is not the product being sold. A viewer who only hears beat 1 must know what product
+  the ad is for, or be in a moment that is unambiguously about the act of using it.
+  Opening on "you're holding a plain bag" when the product is a candle is wrong —
+  the bag is not the product, the box is not the product; the candle is. If the hook
+  is a contrast or "but" construction, BOTH clauses must connect to the actual product
+  or the viewer's experience of it.
 
 Beat 2 -- TRANSFORMATION (6-8s): The viewer's world WITH this product. This is the emotional core.
   Describe the after-state — what life FEELS like now that they have it. This is not a
@@ -696,6 +909,13 @@ Beat 2 -- TRANSFORMATION (6-8s): The viewer's world WITH this product. This is t
   Then write that. Not the mechanism. The NOTICE.
   If you have research facts (use_case, visual_moment, feature), the most emotionally vivid
   one belongs here — translated into the viewer's lived experience, not quoted as a fact.
+  SPECIFICITY FLOOR (mandatory): this beat must include at least ONE concrete sensory anchor
+  drawn from the product truths or research — a specific smell, sound, texture, temperature,
+  weight, or visual quality. A mood statement or simile with nothing specific beneath it fails
+  this floor; it only earns its place when the same beat also names what creates that feeling.
+  Test: if you swapped the product for any other in the same category, would this beat still
+  read identically? If yes, it is too generic — add the one specific detail that grounds the
+  feeling in THIS product.
 
 Beat 3 -- PROOF (5-6s): The single hero capability that makes Beat 2 real. ONE fact, maximum.
   Frame it as viewer action + result: "[Action]. [What happens]."
@@ -703,16 +923,30 @@ Beat 3 -- PROOF (5-6s): The single hero capability that makes Beat 2 real. ONE f
   If you have research facts (spec, feature, differentiator), this is where the most impressive
   one goes — phrased as what the viewer does and what they get, not as a spec-sheet entry.
   The spoken line names the CONSEQUENCE, not the component or mechanism behind it.
-  WRONG: "The acoustic piezo sensor counts dust particles 15,000 times a second."
-  RIGHT: "It sees the dust you can't. And adjusts to catch every bit of it."
+  WRONG: "The [component] performs its function." — grammatical subject is the part,
+    predicate is a mechanical description, no viewer consequence.
+  RIGHT: "You [action]. [What that makes possible for you]." — viewer is the subject,
+    the component's job shows up only as the reason the result happens.
+  GROUNDING FLOOR ≠ FULL BEAT: citing a form_factor or construction truth to satisfy
+  the grounding rule does NOT mean giving that physical detail its own standalone beat.
+  Fold it into a sentence whose subject is the viewer or the experienced effect. Never
+  devote an entire beat to describing a shape, container, or component with no consequence.
 
 Beat 4 -- DEPTH (5-6s): A contrasting angle — "and it does this too."
   Introduce a DIFFERENT benefit from Beat 3. Not a rephrasing of the same fact; a genuinely
   new thing. The viewer should learn something they didn't know after Beat 3.
   If "audience_insight" or "trend" research facts exist, THIS IS THEIR BEAT. Who actually
   buys this product, for what occasion, for whom as a gift, in what ritual or moment of their
-  day? Write for that specific person. This beat should make a real candle buyer / skincare
-  customer / tote bag owner feel SEEN — not like they're reading a product description.
+  day? Write for that specific person. This beat should make a real buyer feel SEEN —
+  not like they're reading a product description.
+  SO WHAT CHAIN IS MANDATORY HERE (not optional): every fact introduced in this beat MUST
+  clear the chain to Step 3 (a specific felt moment, relief, or social occasion). "A new fact"
+  is NOT license to skip the chain. If you have a leftover construction detail or color fact
+  to satisfy FEATURE SPREAD but cannot find its Step 3 consequence, do NOT give it its own
+  standalone beat — fold it as a supporting clause inside a beat that already has a consequence,
+  or drop it. A beat whose only content is a count, a color name, or a component fact FAILS
+  this beat's job even if it is technically "new information." The physical detail is the
+  evidence; the occasion, relief, or feeling it enables is the beat.
 
 Beat 5 -- PAYOFF + CTA (4-6s): Land the big idea, then invite. Never command.
   (a) PAYOFF: echo the ONE big idea from your arc in its punchiest form (6 words or fewer).
@@ -741,17 +975,19 @@ logo/brand mark as the star of the script either -- it is a minor supporting
 detail, never the headline truth a variant is built around.
 
 CTA BRIDGE (mandatory): the CTA must land as an earned close, not a
-disconnected command. The beat immediately before the CTA must set up the ask
--- name the specific feeling, benefit, or moment just established -- and the
-CTA line itself should pick up that thread (a connective like "so"/"that's
-why"/"now", or a direct reference back to what was just said) rather than
-jump-cutting straight into a bare imperative with no bridge.
-  WEAK (abrupt, do NOT do this): "...It still looks new a year later.
-  Order now." -- the CTA shares no thread with the line before it; it just
-  starts a new, unrelated imperative.
-  STRONG (same idea, bridged): "...It still looks new a year later --
-  that's what you're actually paying for. So get yours." -- the CTA
-  explicitly picks up the benefit just proven before asking.
+disconnected command. The payoff phrase (the words before the experience verb)
+must reuse or directly paraphrase a CONCRETE NOUN or IMAGE from the preceding
+beat — not just a demonstrative pronoun ("that", "this") standing in for a
+vague summary.
+  WEAK — demonstrative pronoun with nothing concrete behind it: a vague "that"
+  or "this" standing in for no specific noun is not a real bridge, even if a
+  connective is present. The viewer can't feel the connection.
+  STRONG — the bridge phrase reuses or directly paraphrases a concrete noun or
+  image from the preceding beat, then the experience verb closes it. The viewer
+  recognises what "that" refers to because the beat just named it.
+  TEST: remove the bridge phrase and read the CTA verb alone. If it still makes
+  complete sense with no context, the bridge is doing no work — rewrite until
+  the bridge phrase is load-bearing and the CTA verb needs it to land.
 
 EARNED CLOSE — the CTA beat must earn its ask. It must reference something specific from
 earlier in the script: the feeling, material quality, or moment just established. A CTA
@@ -763,6 +999,29 @@ WRONG: [script building toward a specific product benefit] → "So grab yours."
 RIGHT: [same script] → "That's the thing you'll notice a year from now — get yours."
 The RIGHT version ties back to whatever specific benefit was just established in the script.
 
+COMPLETION RULE (mandatory for every beat):
+Every beat's VO line must contain at least one clause with a finite verb that resolves into
+a feeling, outcome, or consequence for the viewer. Never end a beat on a bare descriptor or
+noun phrase: "Made by hand." / "Count the ridges." / "One page at a time." all FAIL because
+they name an attribute without landing its consequence. The structure must be:
+  [subject] + [attribute or action] + [consequence for the viewer]
+Fragments (2-4 words) may appear as a rhythmic trailing clause AFTER a complete clause —
+they must NEVER be the entire beat.
+
+SO-WHAT TEST (run before finalizing each line): after writing a beat's line, ask "so what?"
+If the answer is not already inside the line, add a consequence clause before finalizing.
+"Embossed floral leather." → so what? → "Each ridge pressed by hand — no two covers feel alike."
+"Count the ridges." → so what? → "Run your thumb across them. That's not a pattern; that's craft."
+
+WORD FLOORS (hard minimums — under the floor = incomplete, not punchy):
+  Hook: 9 words minimum
+  Transformation: 14 words minimum
+  Proof: 11 words minimum
+  Depth: 11 words minimum
+  CTA: 9 words minimum
+At 130 wpm spoken pace, a 5-second beat carries ~11 words. A line well under the floor
+is silence — the shot plays but nothing is said. Fill the time with the consequence.
+
 {vo_focus_block}
 VIEWER IMAGINATION (a narrative choice, not a factual claim):
 At least 2 of the 4 variants should make the viewer IMAGINE owning or using the product --
@@ -773,7 +1032,7 @@ This replaces any third-person pronoun story: the viewer is the protagonist, not
 If seller_direction includes "never_do" constraints, do not violate them in
 any variant. If mood words are present, let them bias framework/tone choice.
 
-{_product_identity_block(product_type)}{_audience_context_block(audience_context)}{_research_facts_block(research_facts or [])}{_brand_identity_block(brand_name, brand_context)}Return ONLY valid JSON in this exact shape, no preamble or commentary:
+{_product_identity_block(product_type)}{_audience_context_block(audience_context)}{_colorway_block(colorway_context)}{_brand_identity_block(brand_name, brand_context)}Return ONLY valid JSON in this exact shape, no preamble or commentary:
 
 {{
   "selling_characterization": "2-4 sentence characterization written once (STEP 0), shared across all variants",
@@ -802,11 +1061,15 @@ def _build_user_content(
     seller_direction: Optional[dict],
     brand_name: str = "",
     brand_context: str = "",
+    research_facts: Optional[list] = None,
 ) -> str:
     parts = []
     if brand_name:
         parts.append(f"Brand: {brand_name}")
     parts += [f"Seller's one-line brief: {brief}", "", "Product truths:", _format_truths(product_truths)]
+    research_block = _research_facts_block(research_facts or [])
+    if research_block:
+        parts += ["", research_block]
     if brand_context:
         parts += ["", "Brand context:", brand_context]
     if seller_direction:
@@ -1359,6 +1622,7 @@ def _product_type_missing_problem(beats: list, product_type: str) -> Optional[st
     return None
 
 
+
 def _validate_variant(
     variant: dict,
     truth_categories: dict[str, str],
@@ -1369,6 +1633,7 @@ def _validate_variant(
     product_type: str = "",
     research_facts_by_id: Optional[dict] = None,
     enforce_research_min: bool = True,
+    skip_style_checks: bool = False,
 ) -> list[str]:
     """Return a list of violation strings (empty = structurally valid).
 
@@ -1479,12 +1744,38 @@ def _validate_variant(
         problems.append("no beats")
     else:
         total = beats[-1].get("t_end", 0) - beats[0].get("t_start", 0)
-        if abs(total - target_length_sec) > 1:
+        timing_tolerance = 2 if skip_style_checks else 1
+        if abs(total - target_length_sec) > timing_tolerance:
             problems.append(f"beats span {total}s, expected ~{target_length_sec}s")
+        min_beats = max(MIN_BEATS_FLOOR, target_length_sec // MIN_BEATS_PER_SEC_DIVISOR)
+        if len(beats) < min_beats:
+            problems.append(
+                f"only {len(beats)} beat(s) for a {target_length_sec}s script — "
+                f"need at least {min_beats} beats to cover the full narrative arc "
+                "(Hook / Transformation / Proof / Depth / CTA); add missing beats"
+            )
         hook_line = _hook_line(variant)
         hook_words = len(hook_line.split())
         if hook_words > MAX_HOOK_WORDS:
             problems.append(f"hook line is {hook_words} words, expected <= {MAX_HOOK_WORDS}")
+
+        # Word-floor backstop: a line under its floor is an incomplete sentence, not a
+        # punchy one. At 130 wpm spoken pace a 5s beat ≈ 11 words — a fragment that trails
+        # off ("Made by hand." / "One page at a time.") starves the shot of narration.
+        beat_names = ["hook", "transformation", "proof", "depth", "cta"]
+        for beat_idx, beat in enumerate(beats):
+            line = beat.get("line", "").strip()
+            if not line:
+                continue
+            min_words = BEAT_MIN_WORDS_BY_INDEX[beat_idx] if beat_idx < len(BEAT_MIN_WORDS_BY_INDEX) else BEAT_MIN_WORDS_BY_INDEX[-1]
+            word_count = len(line.split())
+            beat_name = beat_names[beat_idx] if beat_idx < len(beat_names) else f"beat {beat_idx + 1}"
+            if word_count < min_words:
+                problems.append(
+                    f"{beat_name} line has only {word_count} word(s) (minimum {min_words}): "
+                    f'"{line}" — add a consequence clause so the line completes a thought '
+                    f"(subject + attribute + consequence for the viewer)"
+                )
 
         cited_truths = [
             (tid, truth_facts[tid]) for tid in gti if truth_facts and tid in truth_facts
@@ -1521,7 +1812,8 @@ def _validate_variant(
 
         problems.extend(_reintroduction_problems(beats))
         problems.extend(_person_narration_problems(beats))
-        problems.extend(_rhyme_problems(beats))
+        if not skip_style_checks:
+            problems.extend(_rhyme_problems(beats))
         truths_by_id = {tid: {"category": cat} for tid, cat in truth_categories.items()}
         problems.extend(_missing_required_tiers(
             variant, truths_by_id, cited_research_cats, cited_research_high_conf_cats,
@@ -1529,9 +1821,10 @@ def _validate_variant(
         if truth_facts:
             problems.extend(_single_truth_fixation_problems(beats, truth_facts))
 
-        abrupt_cta_problem = _abrupt_cta_problem(beats)
-        if abrupt_cta_problem:
-            problems.append(abrupt_cta_problem)
+        if not skip_style_checks:
+            abrupt_cta_problem = _abrupt_cta_problem(beats)
+            if abrupt_cta_problem:
+                problems.append(abrupt_cta_problem)
 
         product_type_problem = _product_type_missing_problem(beats, product_type)
         if product_type_problem:
@@ -1550,6 +1843,7 @@ def _split_valid_invalid(
     product_type: str = "",
     research_facts_by_id: Optional[dict] = None,
     enforce_research_min: bool = True,
+    skip_style_checks: bool = False,
 ) -> tuple[list[ScriptVariant], list[tuple[dict, list[str]]]]:
     """Per-variant structural check, THEN cross-variant dedup, in one pass.
 
@@ -1566,6 +1860,7 @@ def _split_valid_invalid(
         problems = _validate_variant(
             v, truth_categories, target_length_sec, truth_facts, wants_imperfection,
             research_ids, product_type, research_facts_by_id, enforce_research_min,
+            skip_style_checks=skip_style_checks,
         )
         if problems:
             invalid.append((v, problems))
@@ -1653,6 +1948,14 @@ def _reprompt_message(
     return "\n\n".join(parts)
 
 
+def _detect_colorway_context(product_truths: list[ProductTruth]) -> str:
+    """Return the colorway variant fact if the extractor found multiple finishes, else ''."""
+    for t in product_truths:
+        if t.get("category") == "color" and "available in" in t.get("fact", "").lower():
+            return t["fact"]
+    return ""
+
+
 async def generate_script_variants(
     brief: str,
     product_truths: list[ProductTruth],
@@ -1665,6 +1968,7 @@ async def generate_script_variants(
     product_type: str = "",
     audience_context: str = "",
     buyer_lens_hypothesis: str = "",
+    colorway_context: str = "",
     extras_out: Optional[dict] = None,
 ) -> list[ScriptVariant]:
     """Run the Concept Agent: one Qwen-Max call, one bounded re-prompt on failure.
@@ -1710,8 +2014,8 @@ async def generate_script_variants(
 
     try:
         messages = [
-            {"role": "system", "content": _build_system_prompt(target_length_sec, human_bias, brand_name, brand_context, research_facts, product_type, audience_context, buyer_lens_hypothesis)},
-            {"role": "user", "content": _build_user_content(brief, product_truths, seller_direction, brand_name, brand_context)},
+            {"role": "system", "content": _build_system_prompt(target_length_sec, human_bias, brand_name, brand_context, research_facts, product_type, audience_context, buyer_lens_hypothesis, colorway_context)},
+            {"role": "user", "content": _build_user_content(brief, product_truths, seller_direction, brand_name, brand_context, research_facts)},
         ]
 
         response_text = await create_completion(client, model=model, messages=messages, enable_thinking=True)
@@ -1724,34 +2028,50 @@ async def generate_script_variants(
             research_ids, product_type, research_facts_by_id, enforce_research_min=True,
         )
 
-        # Per spec: fewer than 4 variants is its own re-prompt trigger, even
-        # when nothing else was individually wrong (the model just under-delivered).
-        if len(valid) < REQUIRED_VARIANT_COUNT:
-            valid_frameworks = {v.get("framework") for v in valid}
+        # Per spec: fewer than 4 variants is its own re-prompt trigger. We loop
+        # up to MAX_REPROMPTS times, each time asking only for the still-missing
+        # frameworks. The second pass relaxes style checks (rhyme, CTA abruptness,
+        # beat timing ±1→±2s) that have the highest false-positive rates, while
+        # keeping all structural/grounding checks that matter for quality.
+        MAX_REPROMPTS = 2
+        last_response = response_text
+        for reprompt_attempt in range(MAX_REPROMPTS):
+            if len(valid) >= REQUIRED_VARIANT_COUNT:
+                break
+            valid_frameworks = {v["framework"] for v in valid}
             missing_frameworks = [f for f in FRAMEWORKS if f not in valid_frameworks]
             logger.info(
-                "Concept Agent: %d/%d variants valid, targeted re-prompt for missing frameworks: %s (%d problems)",
-                len(valid), REQUIRED_VARIANT_COUNT, missing_frameworks, len(invalid),
+                "Concept Agent: %d/%d valid, reprompt %d/%d for frameworks: %s (%d invalid)",
+                len(valid), REQUIRED_VARIANT_COUNT, reprompt_attempt + 1, MAX_REPROMPTS,
+                missing_frameworks, len(invalid),
             )
-            messages.append({"role": "assistant", "content": response_text})
+            messages.append({"role": "assistant", "content": last_response})
             messages.append({
                 "role": "user",
                 "content": _reprompt_message(invalid, len(valid), missing_frameworks),
             })
-            retry_text = await create_completion(client, model=model, messages=messages, enable_thinking=True)
-            retry_parsed = _parse_json_response(retry_text)
-            retry_valid, _ = _split_valid_invalid(
+            last_response = await create_completion(client, model=model, messages=messages, enable_thinking=True)
+            retry_parsed = _parse_json_response(last_response)
+            # Second reprompt: relax style checks to avoid false positives
+            # blocking an otherwise-valid script from completing the set of 4.
+            skip_style = (reprompt_attempt >= 1)
+            retry_valid, invalid = _split_valid_invalid(
                 retry_parsed.get("script_variants", []),
                 truth_categories, target_length_sec, truth_facts, wants_imperfection,
-                research_ids, product_type, research_facts_by_id, enforce_research_min=False,
+                research_ids, product_type, research_facts_by_id,
+                enforce_research_min=False,
+                skip_style_checks=skip_style,
             )
-            # Merge: keep the already-valid variants, slot in new ones only for
+            # Merge: keep already-valid variants, slot in new ones only for
             # the missing frameworks so we never discard good work.
-            retry_by_framework = {v.get("framework"): v for v in retry_valid}
+            recovered = {v["framework"]: v for v in retry_valid}
             for fw in missing_frameworks:
-                if fw in retry_by_framework:
-                    valid.append(retry_by_framework[fw])
-                    logger.info("Concept Agent: recovered missing framework '%s' from targeted re-prompt", fw)
+                if fw in recovered:
+                    valid.append(recovered[fw])
+                    logger.info(
+                        "Concept Agent: recovered missing framework '%s' on reprompt %d",
+                        fw, reprompt_attempt + 1,
+                    )
 
         if len(valid) < MIN_VARIANTS_AFTER_DEGRADE:
             logger.warning(
@@ -1783,10 +2103,14 @@ async def concept_agent_node(state: ProductCutState) -> dict:
     product_type = state.get("product_type", "")
     sd = state.get("seller_direction") or {}
     target_length_sec = int(sd.get("target_length_sec") or DEFAULT_TARGET_LENGTH_SEC)
+    product_truths = state.get("product_truths", [])
+    colorway_context = _detect_colorway_context(product_truths)
+    if colorway_context:
+        logger.info("[concept_agent] multi-colorway detected: %s", colorway_context[:80])
     extras: dict = {}
     variants = await generate_script_variants(
         brief=state["brief"],
-        product_truths=state.get("product_truths", []),
+        product_truths=product_truths,
         seller_direction=state.get("seller_direction"),
         target_length_sec=target_length_sec,
         brand_name=state.get("brand_name", ""),
@@ -1795,6 +2119,7 @@ async def concept_agent_node(state: ProductCutState) -> dict:
         product_type=product_type,
         audience_context=audience_context,
         buyer_lens_hypothesis=buyer_lens_hypothesis,
+        colorway_context=colorway_context,
         extras_out=extras,
     )
     # Job-level selling characterization (STEP 0). Deterministic fallback when the
