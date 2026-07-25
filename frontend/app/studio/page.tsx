@@ -312,6 +312,8 @@ export default function StudioPage() {
   const noReconnectRef = useRef(false);               // bug 2: suppress onclose reconnect when intentionally closed
   const startedAtRef = useRef(0);
   const elapsedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const submitInFlightRef = useRef(false);            // prevent double-submit on rapid clicks
+  const jobCompleteHandledRef = useRef(false);        // prevent job_complete firing twice from initial-fetch + run.completed
 
   const pushTimer = (t: ReturnType<typeof setTimeout>) => {
     timersRef.current.push(t);
@@ -355,20 +357,26 @@ export default function StudioPage() {
     fetch(`${getApiBase()}/jobs`, { headers: { "X-Session-ID": getSessionId() } })
       .then((r) => r.ok ? r.json() : Promise.reject(r.status))
       .then((jobs: Array<{ job_id: string; status: string; brief?: string; created_at: string }>) => {
-        // Merge DB jobs into history so badge count and Library are correct immediately
+        // Merge DB jobs into history so badge count and Library are correct immediately.
+        // Keep local-only entries (no backend match) rather than silently dropping them —
+        // a local entry with final/truths populated would lose its video link otherwise.
         setState((s) => {
           const localById = new Map(s.history.map((h) => [h.jobId, h]));
-          const merged: HistoryEntry[] = jobs.map((j) => {
-            const local = localById.get(j.job_id);
-            if (local) return local;
-            return {
-              productName: j.brief ? j.brief.slice(0, 60) : j.job_id.slice(0, 8),
-              date: new Date(j.created_at).getTime(),
-              truths: [],
-              final: null,
-              jobId: j.job_id,
-            };
-          });
+          const backendIds = new Set(jobs.map((j) => j.job_id));
+          const merged: HistoryEntry[] = [
+            ...jobs.map((j) => {
+              const local = localById.get(j.job_id);
+              if (local) return local;
+              return {
+                productName: j.brief ? j.brief.slice(0, 60) : j.job_id.slice(0, 8),
+                date: new Date(j.created_at).getTime(),
+                truths: [],
+                final: null,
+                jobId: j.job_id,
+              };
+            }),
+            ...s.history.filter((h) => h.jobId && !backendIds.has(h.jobId)),
+          ];
           return { history: merged };
         });
         if (jobIdRef.current) return;  // onGenerate already fired this session
@@ -568,12 +576,16 @@ export default function StudioPage() {
 
         case "truth_extracted": {
           // C2: {truths: [{truth_id, fact, category, source}], count}
-          const truths: Truth[] = payload.truths.map((t) => ({
+          const incoming: Truth[] = payload.truths.map((t) => ({
             id: t.truth_id,
             category: t.category,
             fact_text: t.fact,
           }));
-          setState((s) => ({ truths: [...s.truths, ...truths] }));
+          setState((s) => {
+            const existing = new Set(s.truths.map((t) => t.id));
+            const fresh = incoming.filter((t) => !existing.has(t.id));
+            return fresh.length ? { truths: [...s.truths, ...fresh] } : {};
+          });
           bumpPhase(PHASES.indexOf("Truths"));
           break;
         }
@@ -829,6 +841,8 @@ export default function StudioPage() {
   // ---- WebSocket connection ----
   const openWebSocket = useCallback(
     (jobId: string, resolution?: string) => {
+      // Reset job_complete dedup flag for each new WS session.
+      jobCompleteHandledRef.current = false;
       // Bug 2: null ALL handlers before intentional close so the ghost onclose
       // does not fire and schedule an unwanted reconnect with the old jobId.
       if (jobRef.current) {
@@ -851,20 +865,25 @@ export default function StudioPage() {
           if (!data?.state) return;
           const st = data.state;
           // If the job already completed (e.g. fast run or page-reload), synthesise job_complete.
+          // Only fire if jobDone is still false — run.completed handler will fire its own fetch,
+          // and we must not call handleEvent twice (wrong timestamp, double localStorage write).
           const masterCutUri = st["master_cut_uri"] as string | undefined;
           const ex = st["exports"] as { aspect_9x16?: string; aspect_1x1?: string; aspect_16x9?: string } | undefined;
           if (masterCutUri && ex) {
-            handleEvent({
-              type: "job_complete",
-              payload: {
-                master_cut_uri: masterCutUri,
-                exports: {
-                  aspect_9x16: ex.aspect_9x16 ?? "",
-                  aspect_1x1: ex.aspect_1x1 ?? "",
-                  aspect_16x9: ex.aspect_16x9 ?? "",
+            if (!jobCompleteHandledRef.current) {
+              jobCompleteHandledRef.current = true;
+              handleEvent({
+                type: "job_complete",
+                payload: {
+                  master_cut_uri: masterCutUri,
+                  exports: {
+                    aspect_9x16: ex.aspect_9x16 ?? "",
+                    aspect_1x1: ex.aspect_1x1 ?? "",
+                    aspect_16x9: ex.aspect_16x9 ?? "",
+                  },
                 },
-              },
-            });
+              });
+            }
             return;
           }
           // Full panel rehydration from checkpoint — all dashboard panels, not just truths.
@@ -921,17 +940,20 @@ export default function StudioPage() {
                 const masterCutUri = st?.["master_cut_uri"] as string | undefined;
                 const ex = st?.["exports"] as { aspect_9x16?: string; aspect_1x1?: string; aspect_16x9?: string } | undefined;
                 if (masterCutUri && ex) {
-                  handleEvent({
-                    type: "job_complete",
-                    payload: {
-                      master_cut_uri: masterCutUri,
-                      exports: {
-                        aspect_9x16: ex.aspect_9x16 ?? "",
-                        aspect_1x1: ex.aspect_1x1 ?? "",
-                        aspect_16x9: ex.aspect_16x9 ?? "",
+                  if (!jobCompleteHandledRef.current) {
+                    jobCompleteHandledRef.current = true;
+                    handleEvent({
+                      type: "job_complete",
+                      payload: {
+                        master_cut_uri: masterCutUri,
+                        exports: {
+                          aspect_9x16: ex.aspect_9x16 ?? "",
+                          aspect_1x1: ex.aspect_1x1 ?? "",
+                          aspect_16x9: ex.aspect_16x9 ?? "",
+                        },
                       },
-                    },
-                  });
+                    });
+                  }
                 } else {
                   // N3: graph completed but no exports in checkpoint (format_export_node
                   // skipped, or aget_state threw and we fell back). Stop the spinner so
@@ -998,7 +1020,8 @@ export default function StudioPage() {
 
   // ---- generate -> live dashboard ----
   const onGenerate = useCallback(async () => {
-    if (state.transitioning) return;
+    if (state.transitioning || submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
 
     const apiBase = getApiBase();
 
@@ -1023,9 +1046,11 @@ export default function StudioPage() {
       // Bug 13: show error in UI instead of silent console.error
       const msg = err instanceof Error ? err.message : "Failed to start job";
       setState({ error: msg });
+      submitInFlightRef.current = false;
       return;
     }
 
+    submitInFlightRef.current = false;
     jobIdRef.current = jobId;
     try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch { /* ignore */ }
     setState({ transitioning: true, jobId });
@@ -1088,17 +1113,21 @@ export default function StudioPage() {
       .then((jobs: Array<{ job_id: string; brief?: string; status: string; created_at: string }>) => {
         setState((s) => {
           const localById = new Map(s.history.map((h) => [h.jobId, h]));
-          const merged: HistoryEntry[] = jobs.map((j) => {
-            const local = localById.get(j.job_id);
-            if (local) return local;
-            return {
-              productName: j.brief ? j.brief.slice(0, 60) : j.job_id.slice(0, 8),
-              date: new Date(j.created_at).getTime(),
-              truths: [],
-              final: null,
-              jobId: j.job_id,
-            };
-          });
+          const backendIds = new Set(jobs.map((j) => j.job_id));
+          const merged: HistoryEntry[] = [
+            ...jobs.map((j) => {
+              const local = localById.get(j.job_id);
+              if (local) return local;
+              return {
+                productName: j.brief ? j.brief.slice(0, 60) : j.job_id.slice(0, 8),
+                date: new Date(j.created_at).getTime(),
+                truths: [],
+                final: null,
+                jobId: j.job_id,
+              };
+            }),
+            ...s.history.filter((h) => h.jobId && !backendIds.has(h.jobId)),
+          ];
           return { history: merged };
         });
       })
