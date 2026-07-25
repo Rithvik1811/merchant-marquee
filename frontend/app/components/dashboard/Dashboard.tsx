@@ -8,6 +8,7 @@ import type {
   Interrupt,
   InterruptResolution,
   MergeValidation,
+  Research,
   Script,
   Shot,
   Treatment,
@@ -15,6 +16,7 @@ import type {
 } from "@/lib/types";
 import { PHASES, PHASE_RUNNING_LABEL, estimateDuration } from "@/lib/phases";
 import TruthsPanel from "./panels/TruthsPanel";
+import ResearchPanel from "./panels/ResearchPanel";
 import ScriptsPanel from "./panels/ScriptsPanel";
 import TreatmentPanel from "./panels/TreatmentPanel";
 import BudgetPanel from "./panels/BudgetPanel";
@@ -34,6 +36,8 @@ export interface DashboardProps {
   truths: Truth[];
   hoveredTruthId: string | null;
   onHoverTruth: (id: string | null) => void;
+
+  research: Research | null;
 
   scripts: Script[];
   activeScriptId: string | null;
@@ -62,6 +66,7 @@ export interface DashboardProps {
 
   final: Final | null;
   jobId?: string | null;
+  submittedPhotos?: { name: string; url: string }[];
 }
 
 function formatElapsed(ms: number): string {
@@ -82,6 +87,7 @@ export default function Dashboard(props: DashboardProps) {
     truths,
     hoveredTruthId,
     onHoverTruth,
+    research,
     scripts,
     activeScriptId,
     winnerId,
@@ -104,6 +110,7 @@ export default function Dashboard(props: DashboardProps) {
     onFallback,
     final,
     jobId,
+    submittedPhotos,
   } = props;
 
   // -1 (nothing received yet) reads as "Ingest in progress", the real starting state.
@@ -130,7 +137,7 @@ export default function Dashboard(props: DashboardProps) {
     stageFraction = Math.min(doneShots / shotCount, 1);
   }
   const progress = jobDone ? 1 : (curPhaseIdx + stageFraction) / PHASES.length;
-  const estimateLabel = estimateDuration(shotCount);
+  const estimateLabel = estimateDuration(shotCount, elapsed);
 
   return (
     <div>
@@ -177,13 +184,13 @@ export default function Dashboard(props: DashboardProps) {
             <div style={{ display: "flex", flexDirection: "column", gap: 5, minWidth: jobDone ? undefined : 150 }}>
               <div style={{ display: "flex", alignItems: "baseline", gap: 6, fontFamily: "var(--font-mono)", fontSize: "12.5px", color: "var(--ink-soft)", whiteSpace: "nowrap" }}>
                 <span>{formatElapsed(elapsed)}</span>
-                {!jobDone && <span style={{ color: "var(--faint)", fontSize: 11 }}>/ {estimateLabel}</span>}
+                {!jobDone && <span style={{ color: "var(--faint)", fontSize: 11 }}>{estimateLabel} left</span>}
               </div>
               {!jobDone && (
                 <div data-rid="progress-bar-track" style={{ width: "100%", height: 3, background: "var(--hair)", overflow: "hidden" }}>
                   <div
                     data-rid="progress-bar-fill"
-                    style={{ height: "100%", width: `${Math.round(progress * 100)}%`, background: "var(--accent)", transition: "width .5s var(--ease)" }}
+                    style={{ height: "100%", width: "100%", background: "var(--accent)", transform: `scaleX(${progress})`, transformOrigin: "left", transition: "transform .5s var(--ease)" }}
                   />
                 </div>
               )}
@@ -213,7 +220,51 @@ export default function Dashboard(props: DashboardProps) {
         </div>
       </div>
 
+      {submittedPhotos && submittedPhotos.length > 0 && (
+        <div
+          data-rid="submitted-photos"
+          style={{
+            borderBottom: "1px solid var(--hair)",
+            padding: "14px 48px",
+            display: "flex",
+            alignItems: "center",
+            gap: 16,
+          }}
+        >
+          <span
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: 10,
+              letterSpacing: "1.5px",
+              textTransform: "uppercase",
+              color: "var(--faint)",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {submittedPhotos.length === 1 ? "Photo" : "Photos"} submitted
+          </span>
+          <div style={{ display: "flex", gap: 8 }}>
+            {submittedPhotos.map((p, i) => (
+              <img
+                key={i}
+                src={p.url}
+                alt={p.name}
+                style={{
+                  width: 52,
+                  height: 52,
+                  objectFit: "cover",
+                  borderRadius: 4,
+                  border: "1px solid var(--hair-strong)",
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       {hasTruths && <TruthsPanel truths={truths} hoveredTruthId={hoveredTruthId} onHoverTruth={onHoverTruth} />}
+
+      {research && <ResearchPanel research={research} />}
 
       {hasScripts && (
         <ScriptsPanel

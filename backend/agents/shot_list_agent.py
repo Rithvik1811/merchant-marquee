@@ -238,7 +238,7 @@ def _build_negative_prompt(product_truths: list = None, extra: str = "") -> str:
 # the safe-length ceiling is lower (research point 4: "duration_sec hard-
 # clamped to [3, 4]").
 HUMAN_SHOT_MIN_DURATION_SEC = 3.0
-HUMAN_SHOT_MAX_DURATION_SEC = 4.0
+HUMAN_SHOT_MAX_DURATION_SEC = 5.0
 
 HUMAN_INTERACTION_SHOT_TYPES: frozenset[str] = frozenset({"product_in_hand", "worn_in_use"})
 
@@ -347,17 +347,14 @@ def _target_duration_sec(winning_script: WinningScript) -> float:
 
 
 def _scaled_hero_window(target_duration_sec: float) -> tuple[float, float]:
-    """The [min, max] hero-shot duration window, scaled to `target_duration_sec`
-    (see the ratio constants' comment above). Never lets the window invert
-    (min > max), and never scales the floor below what `is_hero_shot` itself
-    needs to keep recognizing this shot as the hero (duration_sec strictly
-    greater than HUMAN_SHOT_MAX_DURATION_SEC) even for a very short target ad.
+    """The [min, max] hero-shot duration window, scaled to `target_duration_sec`.
+    Only the min (floor) is enforced at assembly time -- there is no hard
+    ceiling on human-shot duration; the agent sets what it needs. The max is
+    returned for informational/logging purposes only.
     """
     scaled_max = min(HERO_SHOT_MAX_DURATION_SEC, target_duration_sec * HERO_SHOT_MAX_DURATION_RATIO)
     scaled_min = min(HERO_SHOT_MIN_DURATION_SEC, target_duration_sec * HERO_SHOT_MIN_DURATION_RATIO)
     scaled_min = min(scaled_min, scaled_max)
-    floor = min(HUMAN_SHOT_MAX_DURATION_SEC + 0.5, scaled_max)
-    scaled_min = max(scaled_min, floor)
     return scaled_min, scaled_max
 
 
@@ -397,14 +394,12 @@ def is_hero_shot(shot: dict) -> bool:
     """True iff `shot` is THE hero shot (see the mechanism note above).
 
     Imported by agents/budget_gate.py (per-shot allocation floor/ceiling) and
-    agents/video_gen_node.py (Cast-section face-visible gate) -- both already
-    import other constants from this module (MIN_SHOTS, MIN_SHOT_DURATION_SEC),
-    so this follows the same established cross-module dependency direction.
+    agents/video_gen_node.py (Cast-section face-visible gate). Reads the
+    explicit `is_hero` flag written by `_assemble_shots` rather than inferring
+    hero status from a duration threshold (which was fragile once max-duration
+    restrictions were removed).
     """
-    return (
-        shot.get("is_human_shot", False)
-        and shot.get("duration_sec", 0.0) > HUMAN_SHOT_MAX_DURATION_SEC
-    )
+    return bool(shot.get("is_hero", False))
 
 
 # Structural facelessness reinforcement for every human-interaction shot
@@ -503,6 +498,7 @@ def _default_validate_justifications(
     script_text_norm = _norm_for_match(winning_script.get("text", ""))
     truth_ids = {t["truth_id"] for t in product_truths}
     beat_indices = {bt["beat_index"] for bt in treatment.get("beat_treatments", [])}
+    seen_treatment_refs: set[int] = set()
 
     results: list[dict] = []
     for j in justifications:
@@ -522,12 +518,24 @@ def _default_validate_justifications(
         # 3. treatment_ref exists (accept an int or an int-like string).
         elif _as_beat_index(treatment_ref) not in beat_indices:
             violation = f"treatment_ref '{treatment_ref}' does not exist in treatment.beat_treatments"
+        # 3b. treatment_ref must be unique across the shot list.
+        elif _as_beat_index(treatment_ref) in seen_treatment_refs:
+            available = sorted(beat_indices - seen_treatment_refs)
+            hint = f" (available: {', '.join(str(i) for i in available)})" if available else ""
+            violation = (
+                f"treatment_ref '{treatment_ref}' is already used by a previous shot -- "
+                f"each beat_index must appear at most once{hint}"
+            )
         # 4. not too short, not a category-generic phrase.
         elif len(quote.split()) < MIN_QUOTE_WORDS:
             violation = f"script_quote is under {MIN_QUOTE_WORDS} words -- cite a longer specific span"
         elif any(phrase in quote_core for phrase in _GENERIC_QUOTE_STOPLIST):
             violation = "script_quote matches a banned category-generic phrase"
 
+        if violation is None:
+            ref_int = _as_beat_index(treatment_ref)
+            if ref_int is not None:
+                seen_treatment_refs.add(ref_int)
         results.append({"shot_id": shot_id, "passed": violation is None, "violation": violation})
     return results
 
@@ -567,20 +575,30 @@ def _treatment_menu(treatment: Treatment) -> str:
     )
 
 
-def _target_shot_count(target_duration_sec: float) -> int:
+def _target_shot_count(target_duration_sec: float, num_beats: int = 0) -> int:
     """How many shots to target for an ad of `target_duration_sec` seconds.
 
-    Sizes the shot count to the duration at ~one shot per MAX_SHOT_DURATION_SEC
-    (a 15s ad -> 3 shots, a 30s ad -> 6 shots), clamped into the hard
-    [MIN_SHOTS, MAX_SHOTS] range. This only GUIDES the count -- the model still
-    uses its judgment for beat assignment.
+    When `num_beats` is provided (> 0) we use it directly — one shot per beat
+    is the correct target so the assembler never has to freeze-hold an orphaned
+    beat. Clamped to [MIN_SHOTS, MAX_SHOTS] as a safety bound.
+
+    Falls back to the duration-based heuristic when beat count is unknown.
     """
+    if num_beats > 0:
+        return max(MIN_SHOTS, min(MAX_SHOTS, num_beats))
     return max(MIN_SHOTS, min(MAX_SHOTS, round(target_duration_sec / MAX_SHOT_DURATION_SEC)))
 
 
-def _build_call_a_system_prompt(target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC) -> str:
-    target_shots = _target_shot_count(target_duration_sec)
+def _build_call_a_system_prompt(target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC, num_beats: int = 0) -> str:
+    target_shots = _target_shot_count(target_duration_sec, num_beats)
     return f"""You are a shot-list producer breaking a finished ad script into exactly {target_shots} shots for this {target_duration_sec:.0f}s ad.
+
+ONE SHOT PER BEAT (mandatory): the numbered script lines you receive are the
+voiceover beats — each beat is spoken aloud over exactly one shot. You must
+produce exactly {target_shots} shots, one per numbered line. A viewer watching
+the final ad hears each voiceover line while a DIFFERENT shot plays. Never
+assign two beats to one shot or leave any beat without a corresponding shot —
+doing so causes the video to freeze while the voiceover continues.
 
 In THIS step you only justify each shot -- you decide nothing about camera,
 composition, or wording yet. For every shot output exactly these five fields:
@@ -597,6 +615,12 @@ Every shot must cite a real quote, a real truth id, and a real treatment beat
 index -- these are how the shot is grounded in the actual product and script, not
 in a template. Never justify a shot by the KIND of product it is.
 
+TREATMENT_REF UNIQUENESS (mandatory): each treatment_ref value must appear AT
+MOST ONCE across the whole shot list. No two shots may share the same beat_index.
+If you have more shots than treatment beats, assign the extra shots to
+beat_indices that best match their beat_role and script_quote -- do NOT reuse a
+beat_index that is already taken.
+
 TRUTH DIVERSITY (mandatory): across the WHOLE shot list, cite at least
 {MIN_DISTINCT_TRUTHS_ACROSS_SHOTS} DIFFERENT truth_fact_id values -- prefer 3
 when the truth table offers them. A shot list where every shot cites the same
@@ -604,6 +628,13 @@ single truth is a demo reel of one feature, not an ad for the product: the
 shots must collectively show the product's different real aspects (its overall
 form, its material/texture, its specific details), not the same detail from
 three angles.
+
+COLOR VARIANT RULE: if any truth in the truth table states that the product is
+"available in" multiple colorways or finishes (a color-variant truth), you MUST
+plan shots that show MORE THAN ONE of those color variants across the shot list.
+Do not show only one color when the product comes in several — the viewer should
+see the range. Distribute variant appearances across different shots; do not
+group all color shots together.
 
 Return ONLY valid JSON in this exact shape, no preamble or commentary:
 
@@ -625,8 +656,9 @@ def _build_call_a_user_content(
     product_truths: list[ProductTruth],
     treatment: Treatment,
     target_duration_sec: float = DEFAULT_TARGET_LENGTH_SEC,
+    num_beats: int = 0,
 ) -> str:
-    target_shots = _target_shot_count(target_duration_sec)
+    target_shots = _target_shot_count(target_duration_sec, num_beats)
     return (
         "Numbered script lines (quote one of these verbatim per shot):\n"
         f"{_beat_menu(winning_script)}\n\n"
@@ -1008,16 +1040,28 @@ MUST be faceless framing: hands, over-the-shoulder, from-behind, waist-down,
 or an insert on the contact point -- never a visible face, eyes, or
 expression. This sidesteps the cross-shot face-consistency problem entirely
 (no face in one shot to contradict a different-looking face in another).
-- The hero shot gets the extended duration (up to {hero_max_duration_sec}s,
-  see duration_sec above) so a real arc can complete -- e.g. lift, travel,
-  turn, settle -- not a truncated snippet. Its description should scale up to
-  roughly 120-180 words to give that whole arc real content (still Action/
-  Motion only, same rule as above -- do not spend the extra words on
-  appearance; a separate Cast section is added downstream for that).
+
+IMPORTANT -- hero assignment is ORDER-BASED, not model-chosen. The downstream
+pipeline automatically promotes the FIRST human-interaction shot you list here
+to the hero slot (extended duration up to {hero_max_duration_sec}s); all
+subsequent human-interaction shots receive the tighter non-hero window
+regardless of what duration_sec you write. Write your hero shot FIRST so the
+pipeline's order-based rule picks it correctly.
+
+- The hero shot (the FIRST human-interaction shot you list) gets the extended
+  duration so a real arc can complete -- e.g. lift, travel, turn, settle --
+  not a truncated snippet. Its description should scale up to roughly 120-180
+  words to give that whole arc real content (still Action/Motion only -- do
+  not spend the extra words on appearance; a separate Cast section is added
+  downstream for that).
 - Every OTHER (non-hero) human-interaction shot stays faceless, keeps
   duration_sec inside the ordinary tight human window (hard-clamped downstream
-  regardless of what you write here), and keeps description to 40-55 words --
-  there is less to show without a face in frame, so there is less to write.
+  regardless of what you write here), and keeps description to 40-55 words.
+  CRITICAL FOR NON-HERO SHOTS: describe exactly ONE completable gesture that
+  finishes cleanly within 3-4 seconds -- e.g. "A hand lifts the bag off the
+  shelf and sets it down." NEVER describe a multi-stage sequence (pick up,
+  carry, set down, open) for a non-hero shot; the clip ends mid-gesture and
+  looks broken. One decisive beat, fully resolved.
 
 HUMAN-INTERACTION SHOTS (shot_type product_in_hand / worn_in_use) -- extra
 phrasing discipline, on top of the description rule above:
@@ -1210,9 +1254,9 @@ def _assemble_shots(
             if not hero_assigned:
                 is_hero = True
                 hero_assigned = True
-                duration = max(hero_min, min(hero_max, duration))
+                duration = max(hero_min, duration)
             else:
-                duration = max(HUMAN_SHOT_MIN_DURATION_SEC, min(HUMAN_SHOT_MAX_DURATION_SEC, duration))
+                duration = max(HUMAN_SHOT_MIN_DURATION_SEC, duration)
         if is_human_shot and _is_risky_camera_move(camera_move):
             camera_move = "static"
 
@@ -1254,6 +1298,7 @@ def _assemble_shots(
                 "shot_type": shot_type,
                 "camera_move": camera_move,
                 "is_human_shot": is_human_shot,
+                "is_hero": is_hero,
                 "framing": _coerce_enum(b.get("framing"), _FRAMINGS, "fills_frame"),
                 "lighting": shared_lighting,
                 "negative_prompt": negative_prompt,
@@ -1317,13 +1362,14 @@ async def generate_shot_list(
         )
     truths_by_id = {t["truth_id"]: t for t in product_truths}
     target_duration_sec = _target_duration_sec(winning_script)
+    num_beats = len(winning_script.get("beats") or [])
     hook_implies_person = _hook_beat_implies_person(winning_script, visual_direction)
 
     try:
         # --- Call A: Justify -------------------------------------------------
         messages = [
-            {"role": "system", "content": _build_call_a_system_prompt(target_duration_sec)},
-            {"role": "user", "content": _build_call_a_user_content(winning_script, product_truths, treatment, target_duration_sec)},
+            {"role": "system", "content": _build_call_a_system_prompt(target_duration_sec, num_beats)},
+            {"role": "user", "content": _build_call_a_user_content(winning_script, product_truths, treatment, target_duration_sec, num_beats)},
         ]
         raw_a = await create_completion(client, model=model, messages=messages, temperature=CALL_A_TEMPERATURE)
         justifications = _parse_json_response(raw_a).get("shots", [])[:MAX_SHOTS]

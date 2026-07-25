@@ -172,48 +172,38 @@ photos. Use the images directly to identify brand markings, model names, colorwa
 logos, or any detail that would sharpen the search queries — the photos often reveal
 more than the text facts alone.
 
-Your job: decide whether a web search would uncover intelligence about this
-product that is NOT visible in its photos and would make an ad more compelling.
+Your job: generate the best possible search queries to uncover intelligence about
+this product that is NOT visible in its photos — buyer context, usage moments,
+who buys it, why they buy it, how they use it. Research ALWAYS runs; your job
+is to make the queries as sharp as possible, not to decide whether to search.
 
-Classify as "research_needed" if ANY of the following is true:
-- The product has features, specs, or capabilities a buyer researches (tech,
-  electronics, appliances, vehicles, software, smart devices).
-- The product's PRIMARY VALUE comes from what it DOES rather than how it looks
-  (a lighter → produces fire; headphones → noise-cancellation; running shoes →
-  cushioning and performance; a power bank → capacity and fast-charge).
-- Web search would reveal typical usage SCENES or KEY MOMENTS that would make
-  great ad shots (a lighter being clicked at a campfire, headphones on a subway,
-  shoes on a trail).
-- The product has a brand identity, endorsements, or social proof findable online.
+For ANY product — including unlabelled artisan goods, handmade ceramics, candles,
+raw-material products — web search surfaces: who buys this category and why,
+what occasions drive purchase, what buyers say they love or hate, usage rituals,
+gifting context, price positioning signals. All of this makes ad scripts better.
 
-Classify as "skip" ONLY if the product is so visually self-describing that no
-search could add useful intelligence — e.g. an unlabelled artisan ceramic swatch,
-a raw fabric sample, an unidentified natural stone. The "skip" bar is HIGH;
-default to "research_needed" when uncertain.
-
-Also return:
+Return:
+- classification: always "research_needed"
 - product_name: the single most searchable name for this product (brand + model
   if identifiable from the images or brief, e.g. "BIC Classic Lighter",
   "Meta Quest 3S"; generic category if no brand is visible, e.g. "windproof
-  lighter", "ceramic mug"). Never null. Use what you can see in the photos.
-- search_queries: up to 3 concise queries that together cover (a) what the product
-  DOES / its key features, (b) typical USE CASES and moments people use it in,
-  and (c) specs or reviews if applicable. Every query must include the product name.
+  lighter", "handmade ceramic mug"). Never null. Use what you can see in the photos.
+- search_queries: up to 3 concise queries that together cover (a) who buys this
+  and what occasions/moments drive purchase, (b) what buyers say they love about
+  this type of product (reviews, gift guides, community posts), and (c) how people
+  actually use it day-to-day. Every query must include the product name.
 - buyer_lens_hypothesis: ONE sentence — your best guess at what this product is
   primarily bought FOR. Not a category label ("gift item", "self-care product").
   A plain-English, specific hypothesis of the dominant buying motivation, e.g.
-  "Likely bought as a self-care ritual item for evening wind-down" or "Likely
-  bought to solve a specific cable-clutter problem on a home desk." Keep it
-  genuinely falsifiable by a search result, not a vague truism.
+  "Likely bought as a slow-morning ritual object by people who want their daily
+  coffee to feel intentional" or "Likely bought to solve a specific cable-clutter
+  problem on a home desk." Keep it genuinely specific, not a vague truism.
 
-  Let this hypothesis GUIDE your search_queries: if it points to an
-  experience/mood/occasion-driven purchase, weight queries toward surfacing
-  scent/ritual/occasion/audience detail over raw specs. If it points to a
-  function/outcome-driven purchase, weight toward capability/spec/differentiator
-  detail. If genuinely unsure, split queries across both.
+  Let this hypothesis GUIDE your search_queries — weight queries toward surfacing
+  the moments, occasions, and emotional motivations that match it.
 
 Return ONLY valid JSON in this exact shape, no preamble:
-{"classification": "research_needed" | "skip",
+{"classification": "research_needed",
  "product_name": "Brand Model or generic category",
  "search_queries": ["query one", "query two", "query three"],
  "buyer_lens_hypothesis": "one-sentence hypothesis of the dominant buying motivation"}"""
@@ -652,15 +642,13 @@ async def product_research_node(
 
         if classification != "research_needed":
             logger.info(
-                "product_research_node: classified '%s' — skipping web research",
+                "product_research_node: classifier returned '%s' — proceeding with research anyway (research always runs)",
                 classification,
             )
-            result = _skipped()
-            result.update(extras)
-            return result
 
         if not product_name:
             logger.info("product_research_node: no product_name resolved — skipping")
+            await _emit(config, 0, product_name or "", [])
             result = _skipped()
             result.update(extras)
             return result
@@ -670,6 +658,7 @@ async def product_research_node(
         )
         if not queries:
             logger.info("product_research_node: no usable queries — skipping")
+            await _emit(config, 0, product_name, [])
             result = _skipped()
             result.update(extras)
             return result
@@ -711,7 +700,12 @@ async def product_research_node(
             await client.close()
 
         facts = _build_facts(raw_facts, raw_snippets)
-        await _emit(config, len(facts), product_name, queries)
+        serialized_facts = [
+            {"fact_id": f.get("fact_id", ""), "claim": f.get("claim", ""),
+             "category": f.get("category", ""), "confidence": f.get("confidence", "")}
+            for f in facts
+        ]
+        await _emit(config, len(facts), product_name, queries, facts=serialized_facts)
 
         # Distill the audience_insight facts into a short 2-4 sentence summary of
         # who buys this and why, for the concept agent's audience-context block.
@@ -745,13 +739,19 @@ async def product_research_node(
 
 
 async def _emit(
-    config: Optional[RunnableConfig], fact_count: int, product_name: str, queries: list[str]
+    config: Optional[RunnableConfig], fact_count: int, product_name: str, queries: list[str],
+    facts: list[dict] | None = None,
 ) -> None:
     """Emit the `research_complete` C2 event, swallowing dispatch failures."""
     try:
         await adispatch_custom_event(
             "research_complete",
-            {"fact_count": fact_count, "product_name": product_name, "queries": queries},
+            {
+                "fact_count": fact_count,
+                "product_name": product_name,
+                "queries": queries,
+                "facts": facts or [],
+            },
             config=config,
         )
     except Exception as exc:  # noqa: BLE001 — event dispatch must never fail the node

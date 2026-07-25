@@ -233,10 +233,7 @@ class SellerDirection(TypedDict, total=False):
 class ProductTruth(TypedDict):
     truth_id: str
     fact: str
-    category: Literal[
-        "color", "material", "texture", "construction_detail",
-        "material_character", "scale_cue", "brief_or_intake_fact", "form_factor",
-    ]
+    category: str  # free-form label; only "form_factor" is load-bearing downstream
     source: str
 
 
@@ -431,6 +428,10 @@ class Shot(TypedDict):
     # False)). Downstream nodes use this instead of matching the now-free-form
     # shot_type against a frozen human-shot set.
     is_human_shot: NotRequired[bool]
+    # True on the first human-interaction shot (order-based hero assignment).
+    # Default-False semantics. Downstream nodes use this flag rather than
+    # inferring hero status from duration_sec thresholds.
+    is_hero: NotRequired[bool]
     # NOTE: no `product_category` field — omission is deliberate, see TECHNICAL_DOCUMENTATION.md §5.6
 
 

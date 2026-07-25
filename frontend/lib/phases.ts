@@ -6,6 +6,7 @@
 export const PHASES = [
   "Ingest",
   "Truths",
+  "Research",
   "Scripts",
   "Treatment",
   "Budget",
@@ -21,6 +22,7 @@ export type Phase = (typeof PHASES)[number];
 export const PHASE_RUNNING_LABEL: Record<Phase, string> = {
   Ingest: "Reading your photos & brief…",
   Truths: "Extracting product truths…",
+  Research: "Researching product specs & audience…",
   Scripts: "Writing & scoring scripts…",
   Treatment: "Directing visual treatment…",
   Budget: "Allocating shot budget…",
@@ -58,6 +60,7 @@ export const PHASE_RUNNING_LABEL: Record<Phase, string> = {
 export const NODE_TO_PHASE: Record<string, Phase> = {
   brand_research_node: "Ingest",
   product_truth_extractor: "Truths",
+  product_research_node: "Research",
   concept_agent: "Scripts",
   hook_checker: "Scripts",
   pacing_checker: "Scripts",
@@ -91,9 +94,24 @@ const FIXED_OVERHEAD_MIN = 6;
 const CLIP_MIN_SEC = 42;
 const CLIP_MAX_SEC = 99;
 
-export function estimateDuration(shotCount: number): string {
-  if (!shotCount) return "~15–30 min";
-  const lowMin = Math.round((shotCount * CLIP_MIN_SEC) / 60 + FIXED_OVERHEAD_MIN);
-  const highMin = Math.round((shotCount * CLIP_MAX_SEC) / 60 + FIXED_OVERHEAD_MIN);
-  return `~${lowMin}–${highMin} min`;
+// Pre-budget generic bounds (minutes). When shot count is unknown these are
+// the total-run ceilings; elapsed is subtracted to get a live "remaining" figure.
+const PRE_BUDGET_LOW_MIN = 15;
+const PRE_BUDGET_HIGH_MIN = 30;
+
+export function estimateDuration(shotCount: number, elapsedMs = 0): string {
+  const elapsedMin = elapsedMs / 60_000;
+
+  const totalLow = shotCount
+    ? Math.round((shotCount * CLIP_MIN_SEC) / 60 + FIXED_OVERHEAD_MIN)
+    : PRE_BUDGET_LOW_MIN;
+  const totalHigh = shotCount
+    ? Math.round((shotCount * CLIP_MAX_SEC) / 60 + FIXED_OVERHEAD_MIN)
+    : PRE_BUDGET_HIGH_MIN;
+
+  const remainLow = Math.max(1, Math.round(totalLow - elapsedMin));
+  const remainHigh = Math.max(remainLow, Math.round(totalHigh - elapsedMin));
+
+  if (remainHigh <= 1) return "< 1 min";
+  return `~${remainLow}–${remainHigh} min`;
 }

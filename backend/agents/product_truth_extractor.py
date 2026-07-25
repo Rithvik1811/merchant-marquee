@@ -42,6 +42,8 @@ _CATEGORIES = (
     "construction_detail", "material_character", "scale_cue", "brief_or_intake_fact",
     "form_factor",
 )
+# NOTE: _CATEGORIES is kept for legacy validation only. The prompt no longer
+# mandates these labels — the model chooses categories per product type.
 
 # Cheap heuristic for "generic enough to apply to any product" -- catches
 # facts like "the mug is ceramic" without needing a second model call.
@@ -76,13 +78,29 @@ FORM-FACTOR ANCHOR below and do not relax its no-category-words rule.
   text is legible, use an empty string "".
 
 STEP 1 -- MANDATORY, before anything else: decide whether all photos show the
-SAME physical product (same item, different angles/distances is fine; a
-different item or different brand is NOT). You must answer this explicitly --
+SAME physical product. Use this decision rule:
+
+  same_product = TRUE when all photos show the same design/model — this
+  includes the same product in different COLORWAYS or FINISHES. Color variants
+  (same shape, same construction, different glaze/dye/finish) are NOT mismatches;
+  they are the same product sold in multiple options. Set same_product = true and
+  extract facts from all photos, noting which colors appear.
+
+  same_product = FALSE only when photos show genuinely different items (different
+  shape, different brand, different product category, or different design with
+  no shared construction). If false, fill "mismatch_reason" and limit
+  "product_truths" to photo_1's product ONLY.
+
+COLOR VARIANT DETECTION (only when same_product = true and multiple distinct
+colors/finishes appear across photos): add exactly ONE extra truth with category
+"color" whose fact names ALL the color variants visible across all photos as a
+single "available in X, Y, Z" statement — e.g. "available in three colorways:
+cobalt blue (photo_1), desert sand (photo_2), and sage green (photo_3)".
+This is the ONLY multi-photo blended fact permitted; all other facts must
+cite a single source photo.
+
 "same_product" is a REQUIRED boolean field in your response, always present,
-never omitted, whether the answer is true or false. If false, you must also
-fill "mismatch_reason" explaining what differs, and "product_truths" must
-contain facts about photo_1's product ONLY -- do not silently pick a subset
-of photos or blend facts from more than one item.
+never omitted, whether the answer is true or false.
 
 STEP 2 -- only if same_product is true: extract {MIN_FACTS}-{MAX_FACTS} specific,
 non-generic facts about this exact product. Focus on: COLOR, STYLE/SILHOUETTE,
@@ -133,6 +151,29 @@ Rules for each fact:
   before settling for fewer. Do not resort to hunting for wear/damage to hit the count.
 - Every fact must cite which photo it came from.
 
+FRAME FOR BUYER SIGNIFICANCE (applies to every fact, every category):
+Every fact must do two things: (1) state the checkable visual observation, then
+(2) immediately follow with what a buyer would notice, feel, or value from it.
+The second part must be strictly grounded — any reasonable viewer would agree
+with it from the photo alone. Never invent invisible use-cases or performance claims.
+
+Write the combined fact as ONE sentence or two short clauses joined by a dash:
+  WEAK: "drip glaze with small pooled drips near the base"
+  STRONG: "glaze pools near the base where drips settled — the kind of variation
+    that only happens when a piece is hand-dipped, not machine-cast"
+
+  WEAK: "thick handle with slight outward flare"
+  STRONG: "handle is thick and flares at the base — wide enough to wrap a full
+    hand around rather than pinch between fingertips"
+
+  WEAK: "matte clay exterior below a glossy glazed band"
+  STRONG: "exterior clay is left unglazed and matte — tactile contrast that makes
+    the glazed interior feel intentionally revealed, not accidental"
+
+The buyer-significance clause answers: what would the buyer notice when they
+first pick this up, and why would they care? If you cannot answer that question
+from what is visible in the photo, omit the clause rather than invent one.
+
 FORM-FACTOR ANCHOR -- exactly ONE of your facts must use category "form_factor".
 This is a single sentence describing the ENTIRE product's physical gestalt,
 synthesized across ALL the photos, written so that a stranger could pick this
@@ -161,14 +202,36 @@ field, which is the copy layer's job, not this anchor's); set its "source" to th
 and filling the frame most completely (prefer that photo over one with props/
 context, if you must choose).
 
-CATEGORY DEFINITIONS (special-case categories that need explicit framing):
-"material_character" — a natural variation in the product's material that signals
-authenticity or quality of the underlying material. Examples: grain variation in genuine
-leather (proof it is not synthetic), glaze drips on hand-thrown ceramics (proof of kiln
-firing), hammer marks on hand-forged metal (proof of artisan process), knots or color
-variation in solid wood (proof it is not MDF or veneer), slub texture in natural-fiber
-textiles (proof of natural fiber content). ALWAYS describe these as the buyer would value
-them — as proof of quality and authenticity — never as flaws or damage.
+STEP 0.5 — THINK BEFORE YOU EXTRACT (silent reasoning, do not output):
+Before writing a single truth, decide:
+  1. What type of product is this? (craft/handmade, tech/functional, fashion/wearable,
+     consumable/sensory, home goods, etc.)
+  2. What does a buyer of THIS product primarily care about — what would they notice
+     first when they pick it up?
+  3. Which aspects are worth extracting for THIS product?
+     Handmade ceramic mug → shape, colorways, glaze character, tactile contrast,
+       handcraft evidence. NOT forced texture counts or minor seam details.
+     VR headset → form factor, lens/display indicators, strap/comfort design,
+       build precision. NOT glaze or clay texture.
+     Candle → vessel shape, wax colour, wick, label design. Scent is invisible — don't guess.
+  4. What gaps would web research fill? (buyer occasions, gifting context, how people
+     use it, what differentiates it from generic alternatives.) These gaps will drive
+     the research queries — you don't need to answer them here, just note they exist.
+
+Extract ONLY facts that matter for THIS product's buying decision. Do not force
+every category. 5 highly relevant, buyer-significant truths beat 10 mechanical
+observations across forced labels.
+
+CATEGORY LABEL — use a short descriptive label that names what the fact is about.
+You are NOT constrained to a fixed list. Use whatever fits: "colorway",
+"glaze_character", "handcraft_evidence", "ergonomic_design", "lens_type",
+"build_precision", "vessel_shape", "tactile_contrast", "functional_affordance", etc.
+ONE required exception: use exactly "form_factor" for the whole-object shape anchor
+(see FORM-FACTOR ANCHOR above) — this label feeds video generation and must not change.
+
+Natural material variation (glaze drips, leather grain, wood knots, hammer marks,
+textile slub): describe as proof of authenticity and handcraft — what the variation
+proves about how it was made — never as flaws, irregularities, or imperfections.
 
 Return ONLY valid JSON in this exact shape, no preamble or commentary. The
 first four keys are REQUIRED in every response, even when there is no mismatch
@@ -182,8 +245,8 @@ first four keys are REQUIRED in every response, even when there is no mismatch
   "product_truths": [
     {{
       "truth_id": "t1",
-      "category": "{' | '.join(_CATEGORIES)}",
-      "fact": "the specific fact",
+      "category": "descriptive_label (free-form except form_factor which is fixed)",
+      "fact": "visual observation + what a buyer would notice or value from it",
       "source": "photo_1"
     }}
   ]
@@ -262,7 +325,7 @@ def _validate_and_filter(raw_truths: list[dict]) -> tuple[list[ProductTruth], li
     for entry in raw_truths:
         fact = entry.get("fact", "")
         category = entry.get("category")
-        if category not in _CATEGORIES or not fact or _is_generic(fact, category) or _is_hallucination(fact):
+        if not category or not fact or _is_generic(fact, category) or _is_hallucination(fact):
             rejected.append(entry)
             continue
         valid.append(

@@ -168,6 +168,7 @@ class ShotModel(BaseModel):
     # shot from the (now free-form) shot_type string. Defaulted False + declared
     # so `extra="forbid"` still accepts an assembled shot that carries it.
     is_human_shot: bool = False
+    is_hero: bool = False
 
 
 def validate_shot(raw: dict) -> ShotModel:

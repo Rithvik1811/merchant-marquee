@@ -233,6 +233,25 @@ TAIL_SILENCE_SEC = 1.0
 # feature/open-world-v2: shot_type is now free-form. Human-shot detection uses
 # the is_human_shot boolean field (VDA judgment) instead of a frozen set.
 
+# Universal i2v conditional-image-leakage trim (NeurIPS 2024, arXiv:2406.15735).
+# Every Wan I2V clip opens on the static reference photo before motion "wakes
+# up" -- this is an architecture property, not shot-type-specific. Slicing off
+# the first LEAKAGE_TRIM_SEC of EVERY clip (before the conform decision runs)
+# ensures every segment enters the final cut already in motion.
+# 0.4 s comfortably covers the low end of the observed 0.5-1 s leakage window
+# while staying well inside even the tightest (3 s) clip's usable footage.
+# Env-overridable per this codebase's "flag, don't hardcode forever" pattern.
+LEAKAGE_TRIM_SEC = float(os.getenv("ASSEMBLY_LEAKAGE_TRIM_SEC", "0.4"))
+
+# Crossfade dissolve duration between consecutive shots (TRANSITION_SEC seconds).
+# ffmpeg xfade=fade overlaps adjacent Stage-1 segments so the cut is invisible.
+# Caption timestamps are shifted left by (segment_index × TRANSITION_SEC) to
+# stay synced with the compressed video timeline — see _adjust_captions_for_transitions.
+# 0.15 s ≈ 4-5 frames at 30 fps: long enough to read as a dissolve, short
+# enough to never eat into a beat's meaningful content.
+# Set to 0.0 to restore hard cuts (useful for debugging).
+TRANSITION_SEC = 0.15
+
 # Stage-1 intermediate segments favor speed (re-encoded again in Stage 2);
 # Stage 2 is the mezzanine deliverable and favors quality.
 STAGE1_CRF = 16
@@ -413,6 +432,55 @@ def _plan_segments(
     ]
 
 
+def _beat_to_segment_index(beat_count: int, segments: list[_SegmentPlan]) -> list[int]:
+    """For each beat 0..N-1, return the index (0-based) of the segment that covers it.
+
+    Used to compute how many xfade transitions precede each beat so caption
+    timestamps can be shifted to stay in sync with the compressed video timeline.
+    Orphaned beats that are folded into a neighboring segment's pad are assigned
+    to the segment whose primary beat_index is closest (≤ beat), defaulting to 0
+    for any leading orphaned beats covered by segment 0's pad_before.
+    """
+    if not segments:
+        return [0] * beat_count
+    seg_beats = [seg.beat_index for seg in segments]
+    result = []
+    for beat in range(beat_count):
+        seg_idx = 0
+        for j, sb in enumerate(seg_beats):
+            if sb <= beat:
+                seg_idx = j
+        result.append(seg_idx)
+    return result
+
+
+def _adjust_captions_for_transitions(
+    captions: list[dict],
+    segments: list[_SegmentPlan],
+) -> list[dict]:
+    """Shift each caption's timestamps left by (segment_index × TRANSITION_SEC).
+
+    xfade dissolves between N consecutive Stage-1 segments compress the video
+    timeline by (N-1) × TRANSITION_SEC.  A caption whose beat is in segment j
+    has j transitions before it, so its video-clock timestamp = audio-clock
+    timestamp − j × TRANSITION_SEC.  Keeping captions synced to the video track
+    is required because drawtext's `enable=gte(t,…)` fires against the VIDEO
+    clock, while the VO audio clock is unchanged.
+    """
+    if TRANSITION_SEC <= 0 or len(segments) <= 1:
+        return captions
+    seg_idx_per_beat = _beat_to_segment_index(len(captions), segments)
+    adjusted = []
+    for i, cap in enumerate(captions):
+        shift = seg_idx_per_beat[i] * TRANSITION_SEC
+        adjusted.append({
+            **cap,
+            "start_ts": max(0.0, cap["start_ts"] - shift),
+            "end_ts": max(0.0, cap["end_ts"] - shift),
+        })
+    return adjusted
+
+
 def _resolve_duration_conform(target: float, actual: float, *, is_last_segment: bool = False) -> _ConformPlan:
     """Trim / imperceptible-stretch / freeze-pad decision (module docstring,
     DURATION CONFORMING), including the 15% stretch-ceiling boundary.
@@ -567,9 +635,20 @@ def _render_stage1_segment(
     since a "keep"-mode last segment's effective length is `actual_duration`,
     not `target`.
     """
-    conform = _resolve_duration_conform(target, actual_duration, is_last_segment=is_last_segment)
+    # Universal leakage trim: i2v conditional-image leakage (NeurIPS 2024,
+    # arXiv:2406.15735) makes every Wan I2V clip open on the static reference
+    # photo before motion departs. This is a model-architecture property that
+    # applies to ALL shots regardless of type, so we trim it universally here
+    # rather than only on prefer_start_trim human shots. We cap at 50 % of
+    # clip duration so we never discard more than half a very-short clip.
+    leak_trim = min(LEAKAGE_TRIM_SEC, max(0.0, actual_duration * 0.5))
+    usable_duration = actual_duration - leak_trim
+
+    conform = _resolve_duration_conform(target, usable_duration, is_last_segment=is_last_segment)
 
     stream = ffmpeg.input(local_clip_path).video
+    if leak_trim > 1e-6:
+        stream = stream.filter("trim", start=leak_trim).filter("setpts", "PTS-STARTPTS")
     stream = stream.filter(
         "scale", w=canvas_w, h=canvas_h, force_original_aspect_ratio="decrease",
         force_divisible_by=2, flags="lanczos",
@@ -579,15 +658,15 @@ def _render_stage1_segment(
 
     if conform.mode == "trim":
         if prefer_start_trim:
-            # Cut the clip's own weakest, least-in-motion frames (its
-            # opening, per the i2v conditional-image-leakage bias) rather
-            # than its end -- "enter late" (module docstring, PHASE 3 point 3).
-            start = max(0.0, actual_duration - target)
+            # Cut from the usable portion's START so we enter as late as
+            # possible into the gesture -- "enter late" (module docstring,
+            # PHASE 3 point 3). The leakage frames are already gone above.
+            start = max(0.0, usable_duration - target)
             stream = stream.filter("trim", start=start, duration=target).filter("setpts", "PTS-STARTPTS")
         else:
             stream = stream.filter("trim", duration=target).filter("setpts", "PTS-STARTPTS")
     elif conform.mode == "stretch":
-        ratio = target / actual_duration
+        ratio = target / usable_duration
         stream = stream.filter("setpts", f"{ratio}*PTS")
     # "freeze"/"keep": no trim/stretch filter here -- "freeze"'s pad amount is
     # folded into the tpad stop_duration below; "keep" plays the clip's own
@@ -614,7 +693,7 @@ def _render_stage1_segment(
 
     # "keep" mode's effective length is the clip's own actual duration, never
     # `target` -- that's the whole point of PHASE 3 point 1 (module docstring).
-    effective_target = actual_duration if conform.mode == "keep" else target
+    effective_target = usable_duration if conform.mode == "keep" else target
     total_duration = pad_before + effective_target + pad_after + tail_pad_sec
     out = ffmpeg.output(
         stream, out_path,
@@ -661,26 +740,57 @@ def _render_master_cut(
     font_path: str = DEFAULT_CAPTION_FONT_PATH,
     *,
     total_duration_hint: Optional[float] = None,
+    segment_durations: Optional[list[float]] = None,
 ) -> list[str]:
-    """Stage 2: concat-demux the Stage-1 segments, burn every caption, map the
-    VO audio as the sole audio track, encode the mezzanine (module docstring).
-    Returns the list of temp caption textfile paths it wrote (caller cleans
-    them up -- ffmpeg reads them at run time, so they must outlive the call).
+    """Stage 2: stitch Stage-1 segments, burn every caption, map the VO audio,
+    encode the mezzanine (module docstring).
 
-    `total_duration_hint` (PHASE 3 point 2): the REAL summed duration of the
-    Stage-1 segments (caller computes it from each segment's own render
-    return value, never `target`, since a "keep"-mode last segment can be
-    longer than planned). Used to place the end-of-cut fade at the correct
-    absolute timestamp; if omitted or too short to fit a fade, no fade is
-    applied (defensive -- e.g. the placeholder-only path doesn't pass this).
+    When `segment_durations` is provided and `TRANSITION_SEC > 0` and there are
+    ≥2 segments, uses an ffmpeg xfade dissolve chain instead of the concat
+    demuxer so shot boundaries become smooth crossfades rather than hard cuts.
+    Caption timestamps in `captions` must already be adjusted for the compressed
+    video timeline (see `_adjust_captions_for_transitions`).
+
+    `total_duration_hint` (PHASE 3 point 2): REAL summed duration of Stage-1
+    segments (already adjusted for transitions by the caller). Used to place the
+    end-of-cut fade; if omitted or too short to fit, no fade is applied.
     """
-    list_path = _write_concat_list(segment_paths)
+    n = len(segment_paths)
+    use_xfade = (
+        n > 1
+        and TRANSITION_SEC > 0
+        and segment_durations is not None
+        and len(segment_durations) == n
+    )
+
+    list_path: Optional[str] = None
     text_paths: list[str] = []
     try:
-        video_in = ffmpeg.input(list_path, format="concat", safe=0)
-        audio_in = ffmpeg.input(audio_local_path)
+        if use_xfade:
+            # Chain xfade dissolve filters: each pair of consecutive segments is
+            # fused with a TRANSITION_SEC cross-fade. cumulative_offset is the
+            # point in the OUTPUT timeline where the next transition begins;
+            # each previous segment contributes (its_duration − TRANSITION_SEC)
+            # to that offset because the xfade overlap already consumed
+            # TRANSITION_SEC from the preceding segment's tail.
+            inputs = [ffmpeg.input(p) for p in segment_paths]
+            vstream = inputs[0].video
+            cumulative_offset = 0.0
+            for i in range(1, n):
+                cumulative_offset += segment_durations[i - 1] - TRANSITION_SEC
+                vstream = ffmpeg.filter(
+                    [vstream, inputs[i].video],
+                    "xfade",
+                    transition="fade",
+                    duration=TRANSITION_SEC,
+                    offset=max(0.0, cumulative_offset),
+                )
+        else:
+            list_path = _write_concat_list(segment_paths)
+            video_in = ffmpeg.input(list_path, format="concat", safe=0)
+            vstream = video_in.video
 
-        vstream = video_in.video
+        audio_in = ffmpeg.input(audio_local_path)
         for i, cap in enumerate(captions):
             wrapped = _wrap_caption_text(cap["text"], cap["zone"])
             lines = wrapped.split("\n")
@@ -840,6 +950,7 @@ async def _assemble_master_cut_impl(
         segments = _plan_segments(beats, captions, usable_shots_by_beat)
 
         total_planned_duration = 0.0
+        segment_durations: list[float] = []
         if not segments:
             total = max((c.get("end_ts", 0.0) for c in captions), default=0.0)
             logger.warning(
@@ -872,13 +983,28 @@ async def _assemble_master_cut_impl(
                     prefer_start_trim=prefer_start_trim,
                 )
                 segment_paths.append(seg_out)
+                segment_durations.append(seg_duration)
                 total_planned_duration += seg_duration
 
+            # Crossfade transitions compress the video timeline: each of the
+            # (N-1) dissolves overlaps adjacent segments by TRANSITION_SEC.
+            n_transitions = len(segment_durations) - 1
+            if n_transitions > 0 and TRANSITION_SEC > 0:
+                total_planned_duration -= n_transitions * TRANSITION_SEC
+                logger.info(
+                    "Assembly: xfade dissolves across %d transition(s) → %.3f s total.",
+                    n_transitions, total_planned_duration,
+                )
+
         captions_for_render = _captions_for_render(captions, shots_by_beat)
+        # Shift caption video-clock timestamps to stay in sync with the xfade-
+        # compressed video timeline (no-op when TRANSITION_SEC=0 or single shot).
+        captions_for_render = _adjust_captions_for_transitions(captions_for_render, segments)
         out_local = _mktemp(".mp4", prefix="assembly_mastercut_")
         caption_text_paths = await asyncio.to_thread(
             _render_master_cut, segment_paths, canvas_w, canvas_h, captions_for_render, audio_local, out_local,
             total_duration_hint=total_planned_duration,
+            segment_durations=segment_durations if segment_durations else None,
         )
 
         final_probe = await asyncio.to_thread(probe, out_local)
@@ -1009,6 +1135,8 @@ async def assembly_agent_node(
 
 __all__ = [
     "FPS",
+    "LEAKAGE_TRIM_SEC",
+    "TRANSITION_SEC",
     "DEFAULT_CANVAS",
     "STRETCH_MAX_RATIO",
     "DEFAULT_CAPTION_FONT_PATH",

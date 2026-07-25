@@ -314,7 +314,12 @@ _IDENTITY_PROTECTION_CLAUSE = (
 # to depart from it -- NeurIPS 2024 "Conditional Image Leakage in I2V
 # Diffusion," arXiv:2406.15735) plus mid-motion endings -- appended to every
 # human-interaction shot's Action/Motion text.
-_ACTION_URGENCY_CLAUSE = " The action begins immediately and completes before the clip ends."
+_ACTION_URGENCY_CLAUSE = (
+    " The action begins immediately and reaches a full, resolved completion"
+    " well before the clip ends -- if the described action has multiple"
+    " stages, show only its first stage and let that stage fully resolve,"
+    " rather than attempting the whole sequence and stopping partway through."
+)
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -460,6 +465,14 @@ MAX_INFRA_RETRIES = int(os.getenv("VIDEO_GEN_MAX_INFRA_RETRIES", "7"))
 # error on Python 3.10+.
 WAN_MAX_CONCURRENCY = int(os.getenv("VIDEO_GEN_WAN_CONCURRENCY", "2"))
 
+# Extra seconds requested from Wan beyond the shot's planned duration so the
+# assembler always has content to TRIM rather than having to freeze-pad. The
+# assembled output is still trimmed to the real VO window, so the final ad
+# duration is unchanged — this only eliminates the freeze. If the budget cannot
+# cover the buffered duration even at 720p, the buffer is silently dropped and
+# the exact planned duration is requested (current behavior, no regression).
+WAN_CLIP_BUFFER_SEC = 1.0
+
 # When True (default), a budget_exceeded shot is force-generated at minimum
 # quality (MIN_SHOT_DURATION_SEC, 720p) rather than handed off to Ken-Burns.
 # The shot goes over its allocated_budget but the job gets a real clip instead
@@ -545,13 +558,22 @@ def _resolve_generation_params(shot: Shot) -> tuple[Optional[float], Optional[st
     """
     allocated = shot["allocated_budget"]
     duration = shot["duration_sec"]
+    buffered = duration + WAN_CLIP_BUFFER_SEC
+    cost_1080p = buffered * RATE_1080P
+    cost_720p = buffered * RATE_720P
+
+    if allocated >= cost_1080p:
+        return buffered, "1080P", None
+    if allocated >= cost_720p:
+        return buffered, "720P", None  # resolution clamped, duration untouched
+    # Buffer unaffordable — fall back to exact planned duration (no freeze
+    # elimination, but no budget overrun either).
     cost_1080p = duration * RATE_1080P
     cost_720p = duration * RATE_720P
-
     if allocated >= cost_1080p:
         return duration, "1080P", None
     if allocated >= cost_720p:
-        return duration, "720P", None  # resolution clamped, duration untouched
+        return duration, "720P", None
 
     feasible_duration = (allocated / RATE_720P) if RATE_720P > 0 else 0.0
     if feasible_duration < MIN_SHOT_DURATION_SEC:

@@ -42,6 +42,7 @@ from graph.state import ProductTruth, Treatment, WinningScript
 VIOLATION_QUOTE_MISMATCH = "quote_mismatch"
 VIOLATION_UNKNOWN_TRUTH_ID = "unknown_truth_id"
 VIOLATION_TREATMENT_REF_INVALID = "treatment_ref_invalid"
+VIOLATION_TREATMENT_REF_DUPLICATE = "treatment_ref_duplicate -- this beat_index is already used by another shot; pick a different treatment_ref from the valid list"
 VIOLATION_STOPLIST_HIT = "stoplist_hit"
 VIOLATION_INVALID_BEAT_FUNCTION = "invalid_beat_function"
 
@@ -125,6 +126,7 @@ def validate_justifications(
     truth_ids = {t["truth_id"] for t in product_truths}
     treatment_refs = {bt["beat_index"] for bt in treatment["beat_treatments"]} if treatment else set()
     script_text = winning_script["text"]
+    seen_treatment_refs: set = set()
 
     results: list[ValidationResult] = []
     for j in justifications:
@@ -140,8 +142,11 @@ def validate_justifications(
                 violation = VIOLATION_UNKNOWN_TRUTH_ID
 
         if violation is None and "treatment_ref" in j:
-            if j.get("treatment_ref") not in treatment_refs:
+            ref = j.get("treatment_ref")
+            if ref not in treatment_refs:
                 violation = VIOLATION_TREATMENT_REF_INVALID
+            elif ref in seen_treatment_refs:
+                violation = VIOLATION_TREATMENT_REF_DUPLICATE
 
         if violation is None and "beat_function" in j:
             if j.get("beat_function") not in BEAT_FUNCTIONS:
@@ -154,6 +159,8 @@ def validate_justifications(
                     violation = VIOLATION_STOPLIST_HIT
                     break
 
+        if violation is None and "treatment_ref" in j:
+            seen_treatment_refs.add(j.get("treatment_ref"))
         results.append(
             ValidationResult(
                 shot_id_or_beat_index=identifier,

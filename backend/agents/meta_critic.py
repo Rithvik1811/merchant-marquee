@@ -100,6 +100,11 @@ class AuditionFinding(BaseModel):
     hook_body_seam: str = Field(..., min_length=1)
     body_cta_seam: str = Field(..., min_length=1)
     trigger_continuity: str = Field(..., min_length=1)
+    # BUYER CLARITY: does the script convey meaning to a real buyer?
+    # One sentence answering "what would a first-time viewer take away?" —
+    # fails if no concrete benefit is stated, or the CTA leaves no clear action.
+    buyer_clarity: str = Field(..., min_length=1)
+    buyer_clarity_passed: StrictBool
     passed: StrictBool
     # Smoothable register shifts are RISKS carried forward (the Copy Editor can
     # polish them downstream) — they are NOT audition failures.
@@ -681,16 +686,27 @@ and by cta_score. Break near-ties by reading justifications first, then tone_sco
 composite. Emit one leaderboard per axis (axis one of: hook, completion, cta).
 
 STEP 4 — COMPATIBILITY AUDITION (do this BEFORE committing to any assembly). Take the \
-provisional #1-hook + #1-body + #1-CTA. Judge:
+provisional #1-hook + #1-body + #1-CTA. Judge ALL of:
  (a) promise-payoff: does the chosen BODY beat actually develop the chosen HOOK's SPECIFIC \
      claim (mechanism/evidence), not a different easier claim, not mere restatement?
  (b) seam read: quote the two literal seam junctions (hook->body, body->CTA) and judge \
      voice/register/energy continuity across each.
  (c) trigger continuity: do the hook's and body's emotional triggers escalate together or \
      collide?
+ (d) BUYER CLARITY (ask this as a first-time viewer, not a critic): in one sentence, what \
+     would a casual viewer take away from this script? Then ask three sub-questions and \
+     fail if ANY answer is "no": \
+     — Is at least one CONCRETE, SPECIFIC benefit (not just mood/vibe) stated explicitly? \
+       (e.g. "thick walls hold heat" is concrete; "makes you feel good" is not) \
+     — Would a viewer understand what the product IS by the end? \
+     — Does the CTA give the viewer a clear next step or at minimum a reason to act now? \
+     Write your answer in `buyer_clarity` (the one sentence + brief sub-question verdicts). \
+     Set `buyer_clarity_passed=false` if any sub-question is "no" — this flags the merged \
+     script as needing a body or CTA substitution before it can ship.
 A NOTICEABLE-BUT-SMOOTHABLE register shift is a RISK to flag forward (put it in \
 risks_to_flag_forward; the downstream Copy Editor can polish it) — it is NOT a failure. \
-A PROMISE-PAYOFF failure or a FRAMING CONTRADICTION IS a failure (passed=false).
+A PROMISE-PAYOFF failure, a FRAMING CONTRADICTION, or a buyer_clarity_passed=false \
+IS a failure (passed=false).
 
 STEP 5 — SWAP-DOWN (capped at 2 substitutions total). If the audition fails, substitute \
 the NEXT-ranked piece on the OFFENDING axis only. Prefer swapping the BODY before the HOOK \
@@ -718,6 +734,8 @@ Return ONLY a JSON object of EXACTLY this shape (no prose outside it):
   "audition": {
     "promise_payoff": "...", "hook_body_seam": "quote the seam + verdict",
     "body_cta_seam": "quote the seam + verdict", "trigger_continuity": "...",
+    "buyer_clarity": "one sentence of what a viewer takes away + sub-question verdicts",
+    "buyer_clarity_passed": true|false,
     "passed": true|false, "risks_to_flag_forward": ["..."]
   },
   "substitutions": [

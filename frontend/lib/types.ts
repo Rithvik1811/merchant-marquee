@@ -28,6 +28,24 @@ export interface Truth {
 }
 
 // ---------------------------------------------------------------------------
+// Research (ResearchPanel — research_complete C2 event, v13)
+// ---------------------------------------------------------------------------
+
+export interface ResearchFact {
+  fact_id: string;
+  claim: string;
+  category: string;
+  confidence: string;
+}
+
+export interface Research {
+  productName: string;
+  queries: string[];
+  factCount: number;
+  facts?: ResearchFact[];
+}
+
+// ---------------------------------------------------------------------------
 // Scripts / Critic scores
 // ---------------------------------------------------------------------------
 
@@ -177,6 +195,15 @@ export type JobEvent =
       payload: {
         truths: Array<{ truth_id: string; fact: string; category: TruthCategory; source: string }>;
         count: number;
+      };
+    }
+  | {
+      type: "research_complete";
+      payload: {
+        fact_count: number;
+        product_name: string;
+        queries: string[];
+        facts?: Array<{ fact_id: string; claim: string; category: string; confidence: string }>;
       };
     }
   | {

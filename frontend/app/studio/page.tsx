@@ -15,6 +15,7 @@ import type {
   InterruptResolution,
   JobEvent,
   MergeValidation,
+  Research,
   Script,
   Shot,
   Treatment,
@@ -26,6 +27,7 @@ import "./studio.css";
 
 const STEP_MS = 340;
 const HISTORY_KEY = "pc-job-history";
+const ACTIVE_JOB_KEY = "pc-active-job";
 
 const FINAL_RATIOS: Final["ratios"] = [
   { id: "9x16", label: "9:16", use: "TikTok / Reels", w: 9, h: 16 },
@@ -149,6 +151,24 @@ function hydrateFromSnapshot(st: Record<string, unknown>): SnapshotHydration {
   return { truths, scripts, winnerId, treatment, budget, shots, drift, driftThreshold: CONTINUITY_DEFAULT_THRESHOLD };
 }
 
+// Infers the furthest pipeline phase reached from which checkpoint state fields are populated.
+// Used on reconnect to restore the phase bar without waiting for new live events.
+function inferMaxPhaseIdxFromSnapshot(st: Record<string, unknown>): number {
+  if (st["master_cut_uri"]) return PHASES.length - 1;
+  const rawGenerated = st["generated_shots"] as Record<string, unknown> | undefined;
+  if (rawGenerated && Object.keys(rawGenerated).length) return PHASES.indexOf("Continuity");
+  const rawShotList = st["shot_list"] as unknown[] | undefined;
+  if (rawShotList?.length) return PHASES.indexOf("Shots");
+  if (st["budget_ledger"]) return PHASES.indexOf("Budget");
+  if (st["treatment"]) return PHASES.indexOf("Treatment");
+  const rawCriticScores = st["critic_scores"] as Record<string, unknown> | undefined;
+  if (rawCriticScores && Object.keys(rawCriticScores).length) return PHASES.indexOf("Scripts");
+  if (st["product_research"]) return PHASES.indexOf("Research");
+  const rawTruths = st["product_truths"] as unknown[] | undefined;
+  if (rawTruths?.length) return PHASES.indexOf("Truths");
+  return PHASES.indexOf("Ingest");
+}
+
 type Theme = "light" | "dark";
 type Status = "wizard" | "dashboard" | "library";
 
@@ -179,6 +199,7 @@ interface State {
   jobDone: boolean;
 
   truths: Truth[];
+  research: Research | null;
   scripts: Script[];
   activeScriptId: string | null;
   winnerId: string | null;
@@ -229,6 +250,7 @@ function initialState(): State {
     jobDone: false,
 
     truths: [],
+    research: null,
     scripts: [],
     activeScriptId: null,
     winnerId: null,
@@ -262,6 +284,22 @@ function getApiBase(): string {
 }
 function getWsBase(): string {
   return process.env.NEXT_PUBLIC_WS_BASE_URL ?? "ws://localhost:8000";
+}
+
+// Returns the browser's persistent anonymous session ID, creating one on first call.
+// Sent as X-Session-ID so the backend scopes GET /jobs to this browser only —
+// multiple simultaneous users each see only their own jobs.
+function getSessionId(): string {
+  try {
+    let id = localStorage.getItem("pc-session-id");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("pc-session-id", id);
+    }
+    return id;
+  } catch {
+    return "anonymous";
+  }
 }
 
 export default function StudioPage() {
@@ -314,7 +352,7 @@ export default function StudioPage() {
     } catch { /* ignore */ }
 
     // Bug 11: auto-reconnect + seed Library history from DB on startup
-    fetch(`${getApiBase()}/jobs`)
+    fetch(`${getApiBase()}/jobs`, { headers: { "X-Session-ID": getSessionId() } })
       .then((r) => r.ok ? r.json() : Promise.reject(r.status))
       .then((jobs: Array<{ job_id: string; status: string; brief?: string; created_at: string }>) => {
         // Merge DB jobs into history so badge count and Library are correct immediately
@@ -339,6 +377,18 @@ export default function StudioPage() {
         // above already set status to "library", so without this guard a
         // running job would silently clobber that back to "dashboard".
         if (wantsLibrary) return;
+        // Prefer the job this browser started (localStorage) for multi-user safety —
+        // a different user's running job should not hijack this tab's dashboard.
+        const savedJobId = (() => { try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; } })();
+        if (savedJobId) {
+          const savedJob = jobs.find((j) => j.job_id === savedJobId);
+          if (savedJob?.status === "running") {
+            setState({ status: "dashboard", jobId: savedJobId, jobDone: false });
+            return;
+          }
+          // Job finished or was deleted while we were away — clear the stale key.
+          try { localStorage.removeItem(ACTIVE_JOB_KEY); } catch { /* ignore */ }
+        }
         // N6: only reconnect to "running" — "ingested" means the WS was never opened
         const running = jobs.find((j) => j.status === "running");
         if (running) {
@@ -528,6 +578,25 @@ export default function StudioPage() {
           break;
         }
 
+        case "research_complete": {
+          // C2: {fact_count, product_name, queries, facts}
+          setState({
+            research: {
+              productName: payload.product_name,
+              queries: payload.queries,
+              factCount: payload.fact_count,
+              facts: (payload.facts ?? []).map((f: { fact_id: string; claim: string; category: string; confidence: string }) => ({
+                fact_id: f.fact_id,
+                claim: f.claim,
+                category: f.category,
+                confidence: f.confidence,
+              })),
+            },
+          });
+          bumpPhase(PHASES.indexOf("Research"));
+          break;
+        }
+
         case "critic_score": {
           // C2: {scores: Record<variant_id, CriticScore>, winning_variant_ids?}
           const newScripts: Script[] = Object.entries(payload.scores).map(([id, score], i) => ({
@@ -694,6 +763,11 @@ export default function StudioPage() {
             clearInterval(elapsedIntervalRef.current);
             elapsedIntervalRef.current = null;
           }
+          try {
+            const jid = jobIdRef.current;
+            localStorage.removeItem(ACTIVE_JOB_KEY);
+            if (jid) localStorage.removeItem(`pc-started-at-${jid}`);
+          } catch { /* ignore */ }
           const { master_cut_uri, exports: ex } = payload;
           const ratiosWithUrls: Final["ratios"] = [
             { ...FINAL_RATIOS[0], url: ex?.aspect_9x16 },
@@ -729,6 +803,11 @@ export default function StudioPage() {
             clearInterval(elapsedIntervalRef.current);
             elapsedIntervalRef.current = null;
           }
+          try {
+            const jid = jobIdRef.current;
+            localStorage.removeItem(ACTIVE_JOB_KEY);
+            if (jid) localStorage.removeItem(`pc-started-at-${jid}`);
+          } catch { /* ignore */ }
           noReconnectRef.current = true;
           setState({ error: payload.reason, jobDone: true });
           break;
@@ -788,20 +867,32 @@ export default function StudioPage() {
             });
             return;
           }
-          // Rehydrate truths so the panel isn't blank after reconnect. Raw
-          // checkpoint state uses ProductCutState's real field name
-          // (`product_truths`), not the C2 event's "truths" wrapper key.
-          const rawTruths = st["product_truths"] as Array<{ truth_id: string; fact: string; category: string }> | undefined;
-          if (rawTruths?.length) {
-            setState((s) => {
-              if (s.truths.length) return {};
-              const truths: Truth[] = rawTruths.map((t) => ({
-                id: t.truth_id,
-                category: t.category as Truth["category"],
-                fact_text: t.fact,
-              }));
-              return { truths };
-            });
+          // Full panel rehydration from checkpoint — all dashboard panels, not just truths.
+          // Live events arriving over the WS will still win via the "keep if already set" guards.
+          const hydrated = hydrateFromSnapshot(st);
+          const inferredPhaseIdx = inferMaxPhaseIdxFromSnapshot(st);
+          setState((s) => ({
+            truths: s.truths.length ? s.truths : hydrated.truths,
+            scripts: s.scripts.length ? s.scripts : hydrated.scripts,
+            winnerId: s.winnerId ?? hydrated.winnerId,
+            activeScriptId: s.activeScriptId ?? (hydrated.winnerId ? "__merged__" : null),
+            treatment: s.treatment ?? hydrated.treatment,
+            budget: hydrated.budget.shots.length ? hydrated.budget : s.budget,
+            shots: s.shots.length ? s.shots : hydrated.shots,
+            drift: Object.keys(s.drift).length ? s.drift : hydrated.drift,
+            driftThreshold: hydrated.driftThreshold,
+            maxPhaseIdx: Math.max(s.maxPhaseIdx, inferredPhaseIdx),
+          }));
+          // Restore elapsed timer from localStorage when reconnecting after navigation.
+          if (!elapsedIntervalRef.current && startedAtRef.current === 0) {
+            const savedAt = (() => { try { return Number(localStorage.getItem(`pc-started-at-${jobId}`)); } catch { return 0; } })();
+            if (savedAt > 0) {
+              startedAtRef.current = savedAt;
+              setState({ elapsed: Date.now() - savedAt });
+              const el = setInterval(() => setState({ elapsed: Date.now() - startedAtRef.current }), 500);
+              elapsedIntervalRef.current = el;
+              pushTimer(el);
+            }
           }
         })
         .catch(() => { /* best-effort */ });
@@ -871,11 +962,13 @@ export default function StudioPage() {
           }
 
           if (msg.type === "run.busy") {
-            // N4: don't permanently block — the existing handler may disconnect within
-            // seconds. Schedule a retry so the client catches up without user action.
-            // (noReconnectRef stays false so onclose's 2s retry still fires naturally,
-            // but add an extra 5s delay here in case the close hasn't happened yet.)
-            const t = setTimeout(() => openWebSocket(jobId), 5000);
+            // N4: suppress onclose's 2s retry so only this single 5s retry fires —
+            // otherwise run.busy + WS close each schedule a retry and they multiply.
+            noReconnectRef.current = true;
+            const t = setTimeout(() => {
+              noReconnectRef.current = false;
+              openWebSocket(jobId);
+            }, 5000);
             timersRef.current.push(t);
             return;
           }
@@ -922,7 +1015,7 @@ export default function StudioPage() {
 
     let jobId: string;
     try {
-      const res = await fetch(`${apiBase}/jobs`, { method: "POST", body: formData });
+      const res = await fetch(`${apiBase}/jobs`, { method: "POST", body: formData, headers: { "X-Session-ID": getSessionId() } });
       if (!res.ok) throw new Error(`POST /jobs returned ${res.status}`);
       const data = (await res.json()) as { job_id: string };
       jobId = data.job_id;
@@ -934,10 +1027,12 @@ export default function StudioPage() {
     }
 
     jobIdRef.current = jobId;
+    try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch { /* ignore */ }
     setState({ transitioning: true, jobId });
     const t = setTimeout(() => {
       setState({ transitioning: false, status: "dashboard", elapsed: 0, jobDone: false });
       startedAtRef.current = Date.now();
+      try { localStorage.setItem(`pc-started-at-${jobId}`, String(startedAtRef.current)); } catch { /* ignore */ }
       const el = setInterval(() => setState({ elapsed: Date.now() - startedAtRef.current }), 500);
       elapsedIntervalRef.current = el;
       pushTimer(el);
@@ -975,7 +1070,12 @@ export default function StudioPage() {
       jobRef.current = null;
     }
     noReconnectRef.current = false;
+    const prevJobId = jobIdRef.current;
     jobIdRef.current = null;
+    try {
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+      if (prevJobId) localStorage.removeItem(`pc-started-at-${prevJobId}`);
+    } catch { /* ignore */ }
     setState((s) => ({ ...initialState(), theme: s.theme, history: s.history }));
   }, [setState]);
 
@@ -983,7 +1083,7 @@ export default function StudioPage() {
   const openLibrary = useCallback(() => {
     setState({ status: "library" });
     // Fetch all jobs from DB and merge into history (DB is source of truth)
-    fetch(`${getApiBase()}/jobs`)
+    fetch(`${getApiBase()}/jobs`, { headers: { "X-Session-ID": getSessionId() } })
       .then((r) => r.ok ? r.json() : Promise.reject(r.status))
       .then((jobs: Array<{ job_id: string; brief?: string; status: string; created_at: string }>) => {
         setState((s) => {
@@ -1252,6 +1352,7 @@ export default function StudioPage() {
           truths={state.truths}
           hoveredTruthId={state.hoveredTruthId}
           onHoverTruth={(id) => setState({ hoveredTruthId: id })}
+          research={state.research}
           scripts={state.scripts}
           activeScriptId={state.activeScriptId}
           winnerId={state.winnerId}
@@ -1274,6 +1375,7 @@ export default function StudioPage() {
           onFallback={() => resolveInterrupt("accept_fallback")}
           final={state.final}
           jobId={state.jobId}
+          submittedPhotos={state.photos}
         />
       )}
 

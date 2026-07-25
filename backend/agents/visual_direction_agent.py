@@ -172,8 +172,13 @@ For each beat output:
 - human_action: ONLY include this field when human_presence is "yes".
   Write a 15-30 word action description using a decisive action verb, naming
   the EXACT contact part from the cited truth verbatim.
-  Example: "A hand grips the top handle and lifts the bag off a surface,
-  the stitching briefly catching the light."
+  Default to a SINGLE, short, physically-completable gesture that resolves
+  cleanly within 3-5 seconds (e.g. "A hand lifts the cup and sets it on the
+  table."). NEVER describe a multi-stage sequence (pick up → carry → drink →
+  set down) unless this is the hero shot and the treatment explicitly grants
+  an extended duration arc. For inherently multi-stage actions, describe only
+  the FIRST decisive beat and let it fully resolve (e.g. for drinking: just
+  the lift-to-lips moment, not the full drink-and-return arc).
   When human_presence is "no", DO NOT include human_action in the output at all.
 - shot_intent: 2-4 word free-text label of what kind of selling moment this
   beat realizes (e.g. "atmosphere / mood", "functional demo", "styled beauty

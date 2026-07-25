@@ -28,7 +28,11 @@ export const CATEGORY: Record<string, string> = {
 };
 
 export function categoryLabel(cat: string): string {
-  return CATEGORY[cat] ?? cat;
+  return (
+    CATEGORY[cat] ??
+    CATEGORY[cat.toLowerCase()] ??
+    cat.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  );
 }
 
 // Sections alternate this max-width + horizontal-padding wrapper; vertical
