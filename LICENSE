@@ -1,4 +1,4 @@
-MIT License
+MIT License (with Attribution)
 
 Copyright (c) 2026 Rithvik Ramdas and Roopesh Kumar Reddy Kaipa
 
@@ -9,8 +9,20 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+ATTRIBUTION REQUIREMENT: Any use, reproduction, modification, or distribution
+of the Software, in whole or in part — including derivative works, forks,
+rebranded versions, and products or services built substantially upon the
+Software — must give clear and reasonably prominent credit to the original
+authors, Rithvik Ramdas and Roopesh Kumar Reddy Kaipa, as the creators of the
+original work. This attribution must appear in at least one of the following:
+the source code repository, the project's README or documentation, or any
+publicly accessible interface (e.g., "About," "Credits," or "Acknowledgments"
+section) of a product or service derived from the Software. Removing,
+obscuring, or failing to provide this attribution constitutes a violation of
+this license and revokes the permissions granted herein.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
